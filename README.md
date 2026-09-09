@@ -20,8 +20,13 @@ Chat page (session cookie) → chat.selected.systems:
   Cloudflare edge (TLS + WAF + rate limit)
   → cloudflared (outbound-only tunnel)
   → Caddy :8080 (/api/* → backend :8081, else static www/)
-  → Go backend (magic-link auth + SQLite history + Ollama proxy) → Ollama :11434
+  → Go backend (magic-link auth + SQLite history + Ollama proxy)
+      web_search off → Ollama :11434 (streaming passthrough)
+      web_search on  → tool loop: Ollama (tool_calls) ↔ SearXNG :8080 (internal) → cited answer
   → SQLite on NVMe (users, conversations)
+
+  SearXNG :8080 (internal network only — never published) aggregates
+  Google/Bing/DuckDuckGo for the web_search tool.
 ```
 
 Endpoint: **`https://llm.selected.systems`** (OpenAI-compatible: `/v1/chat/completions`, `/v1/models`, `/v1/embeddings`) — pure API, bearer-token auth for the browser extension.
@@ -32,13 +37,14 @@ Chat UI: **`https://chat.selected.systems`** — a minimal streaming chat page (
 
 | File | Purpose |
 |------|---------|
-| `docker-compose.yml` | ollama (no `ports:`), caddy (`:8080`), backend (`:8081`, no `ports:`), cloudflared (`tunnel` profile) |
+| `docker-compose.yml` | ollama (no `ports:`), caddy (`:8080`), backend (`:8081`, no `ports:`), searxng (no `ports:`), cloudflared (`tunnel` profile) |
 | `Caddyfile` | `/v1/*` bearer auth + CORS for the API host; `/api/*` → backend for the chat host; static `www/` otherwise |
-| `backend/` | Go service: magic-link auth, SQLite history, Ollama proxy (Dockerfile builds a static binary) |
-| `.env.example` / `.env` | NAS access, volume, tunnel token, bearer token, model, CORS origin, session secret, Brevo key, allowlist |
+| `backend/` | Go service: magic-link auth, SQLite history, Ollama proxy, and the web_search tool loop (`search.go`; Dockerfile builds a static binary) |
+| `searxng/settings.yml` | SearXNG config — internal-only meta-search backend for the `web_search` tool (JSON output enabled, limiter off) |
+| `.env.example` / `.env` | NAS access, volume, tunnel token, bearer token, model, CORS origin, session secret, Brevo key, allowlist, SearXNG URL |
 | `scripts/deploy.sh` | sync the stack to the NAS and `docker compose up -d --build` |
 | `scripts/pull-models.sh` | `docker exec ollama ollama ...` over SSH |
-| `scripts/smoke-test.sh` | API auth/CORS/allowlist/port-isolation/streaming + chat `/api/*` 401 checks |
+| `scripts/smoke-test.sh` | API auth/CORS/allowlist/port-isolation/streaming + chat `/api/*` 401 + SearXNG internal JSON checks |
 | `ai/tasks.md` | phased task list |
 
 ## Chat login & history
@@ -53,8 +59,20 @@ that adds three things on top of the static page:
   `GET/POST/PUT/DELETE /api/conversations[/:id]`. Each conversation belongs to a
   user; the page saves after every turn, so a reload or a different browser
   resumes where you left off.
+- **Background generation.** A reply runs as a detached job on the backend, not
+  tied to the page: `POST /api/conversations/:id/generate` enqueues it and `GET
+  /api/conversations/:id/events` tails it over SSE. Switching chats, reloading,
+  or closing the tab does **not** cancel an in-progress reply — it keeps
+  generating on the NAS and the result lands in history; come back and it's
+  finished. One generation runs at a time (matching `OLLAMA_NUM_PARALLEL=1`);
+  a second request queues and shows “Queued”.
 - **Ollama proxy** `GET /api/models` and `POST /api/chat/completions` (streaming
   passthrough) so the page never needs the bearer token or cross-origin CORS.
+- **Web search (optional).** With the 🌐 toggle on, `/api/chat/completions` runs
+  a tool-calling loop in the backend: it gives the model a `web_search` tool,
+  executes the calls against the internal SearXNG, and streams back a cited
+  answer. Off by default; a plain passthrough when the toggle is off or
+  `SEARXNG_URL` is empty. See "Web search" below.
 
 `llm.selected.systems` is untouched and stays pure-API for the extension.
 
@@ -66,6 +84,35 @@ sender for `selected.systems`.
 Migrating to another NAS: back up the SQLite file along with the ollama/caddy
 data directories and restore it to the same path — users and conversations come
 with you.
+
+## Web search (optional)
+
+The chat page has a 🌐 toggle. When on, the backend gives the model a
+`web_search` tool and runs a small loop: the model emits a search query, the
+backend queries the internal SearXNG (`http://searxng:8080/search?format=json`,
+top 5 results, snippets trimmed to ~300 chars), feeds them back, and streams a
+cited answer — up to 3 search rounds. This rides the existing
+`chat.selected.systems` → backend path; the pure-API host
+`llm.selected.systems` is untouched and the extension is unaffected.
+
+The LLM itself never browses — Ollama is inference-only; the backend executes
+the search. "Local" means inference and summarization stay on the NAS, but the
+outbound search queries still leave your network (SearXNG aggregates/anonymizes
+across Google/Bing/DuckDuckGo so no single engine sees your full history, but
+it does not make queries invisible to those engines). Snippets-only keeps the
+prompt-injection surface low; the model is given no consequential tools.
+
+Requirements: a tool-calling model (`llama3.1:8b` — `deepseek-r1` is weak at
+tools) and the `searxng` service up. On 8 GB, shorten the 8B's context to
+~8192 (a custom Modelfile with `PARAMETER num_ctx 8192`, or lower
+`OLLAMA_CONTEXT_LENGTH` in `.env`) so it fits alongside SearXNG. During search
+rounds the backend flushes SSE keepalive comments so the Cloudflare 100 s edge
+timeout (524) never fires while the N100 thinks.
+
+SearXNG config: `searxng/settings.yml` enables JSON output (`search.formats`
+includes `json` — off by default, and without it every consumer silently gets
+HTML) and disables the rate limiter (no Redis). It is internal-only (no
+published port); rotate `server.secret_key` if you ever expose it.
 
 ## Prerequisites on the NAS (phase 1)
 
@@ -116,6 +163,18 @@ Spend leftover RAM on **context length**, not parameter count — the KV cache i
 what OOMs you, and a page-summarising extension needs long input more than a
 smarter model. Tune via `OLLAMA_CONTEXT_LENGTH`, `OLLAMA_MAX_LOADED_MODELS=1`,
 `OLLAMA_NUM_PARALLEL=1`, `OLLAMA_KEEP_ALIVE` in `.env`, then redeploy.
+
+For the optional **web search** feature, pull a tool-calling model —
+`llama3.1:8b` is recommended (`deepseek-r1` is weak at tool calling):
+
+```sh
+scripts/pull-models.sh pull llama3.1:8b
+```
+
+At ~5 GB RAM (Q4) alongside SearXNG, give the 8B a shorter context (~8192) —
+either lower `OLLAMA_CONTEXT_LENGTH` in `.env`, or create a custom Modelfile
+with `PARAMETER num_ctx 8192` so the 3B can keep 16k. The chat page lets you
+pick the model per conversation, so keep `llama3.2:3b` as the light fallback.
 
 ## Smoke test
 

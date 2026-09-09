@@ -85,12 +85,29 @@ CREATE TABLE IF NOT EXISTS folders (
 	created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_folders_email_pos ON folders(email, position);
+CREATE TABLE IF NOT EXISTS jobs (
+	id TEXT PRIMARY KEY,
+	conversation_id TEXT NOT NULL,
+	email TEXT NOT NULL,
+	status TEXT NOT NULL,
+	model TEXT NOT NULL,
+	web_search INTEGER NOT NULL DEFAULT 0,
+	content TEXT NOT NULL DEFAULT '',
+	error TEXT NOT NULL DEFAULT '',
+	created_at INTEGER NOT NULL,
+	started_at INTEGER,
+	finished_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_conv ON jobs(conversation_id);
 `
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("schema: %w", err)
 	}
 	if err := migrate(db); err != nil {
 		return nil, fmt.Errorf("migrate: %w", err)
+	}
+	if err := reconcileJobs(db); err != nil {
+		return nil, fmt.Errorf("reconcile jobs: %w", err)
 	}
 	return &store{db: db}, nil
 }
@@ -392,4 +409,84 @@ func (s *store) patchConversation(email, id string, title, folderID, model *stri
 		return nil, nil
 	}
 	return s.getConversation(email, id)
+}
+
+// --- Jobs (background generation) ---
+
+// updateConversationMessages replaces a conversation's model + messages without
+// touching the title (used by the generate endpoint to persist the user's turn).
+func (s *store) updateConversationMessages(email, id, model string, msgs []Message) error {
+	now := time.Now().UnixMilli()
+	j, err := json.Marshal(msgs)
+	if err != nil {
+		return err
+	}
+	res, err := s.db.Exec(`UPDATE conversations SET model = ?, messages = ?, updated_at = ? WHERE id = ? AND email = ?`,
+		model, string(j), now, id, email)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("conversation not found")
+	}
+	return nil
+}
+
+// appendAssistantMessage reads the current messages, appends one assistant
+// message, and writes them back. The title is preserved. Called by the job
+// worker when generation finishes.
+func (s *store) appendAssistantMessage(email, id string, msg Message) error {
+	var msgsJSON string
+	err := s.db.QueryRow(`SELECT messages FROM conversations WHERE id = ? AND email = ?`, id, email).Scan(&msgsJSON)
+	if err != nil {
+		return err
+	}
+	var msgs []Message
+	if err := json.Unmarshal([]byte(msgsJSON), &msgs); err != nil {
+		return err
+	}
+	msgs = append(msgs, msg)
+	j, err := json.Marshal(msgs)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`UPDATE conversations SET messages = ?, updated_at = ? WHERE id = ? AND email = ?`,
+		string(j), msg.Ts, id, email)
+	return err
+}
+
+func (s *store) createJob(j *job) error {
+	ws := 0
+	if j.webSearch {
+		ws = 1
+	}
+	_, err := s.db.Exec(`INSERT INTO jobs(id, conversation_id, email, status, model, web_search, content, error, created_at)
+		VALUES(?, ?, ?, 'queued', ?, ?, '', '', ?)`,
+		j.id, j.convID, j.email, j.model, ws, j.createdAt)
+	return err
+}
+
+func (s *store) setJobGenerating(id string) error {
+	_, err := s.db.Exec(`UPDATE jobs SET status = 'generating', started_at = ? WHERE id = ?`, time.Now().UnixMilli(), id)
+	return err
+}
+
+func (s *store) setJobContent(id, content string) error {
+	_, err := s.db.Exec(`UPDATE jobs SET content = ? WHERE id = ?`, content, id)
+	return err
+}
+
+func (s *store) finalizeJob(id, status, errMsg string, finishedAt int64) error {
+	_, err := s.db.Exec(`UPDATE jobs SET status = ?, error = ?, finished_at = ? WHERE id = ?`, status, errMsg, finishedAt, id)
+	return err
+}
+
+// reconcileJobs marks any jobs left queued/generating by a prior backend run as
+// errored. An in-memory job cannot survive a process restart, so partial work is
+// abandoned and the user re-sends.
+func reconcileJobs(db *sql.DB) error {
+	_, err := db.Exec(`UPDATE jobs SET status = 'error', error = 'backend restarted', finished_at = ?
+		WHERE status IN ('queued', 'generating')`, time.Now().UnixMilli())
+	return err
 }

@@ -71,6 +71,32 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${CHAT_HOST}" "${CHAT_BA
 code=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${CHAT_HOST}" "${CHAT_BASE}/api/models")
 [[ "$code" == 401 ]] && ok "chat /api/models rejects no session (401)" || bad "chat /api/models expected 401 got $code"
 
+# 7b. Background-generation endpoints are session-gated too (return 401 without
+#     a cookie; confirms the routes are registered + auth-protected). The full
+#     generate->events->job flow needs a session + a pulled model, so it stays a
+#     manual browser test (see ai/tasks.md).
+code=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${CHAT_HOST}" "${CHAT_BASE}/api/jobs/active")
+[[ "$code" == 401 ]] && ok "chat /api/jobs/active rejects no session (401)" || bad "chat /api/jobs/active expected 401 got $code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${CHAT_HOST}" "${CHAT_BASE}/api/conversations/fakeid/job")
+[[ "$code" == 401 ]] && ok "chat /api/conversations/{id}/job rejects no session (401)" || bad "chat /api/conversations/{id}/job expected 401 got $code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${CHAT_HOST}" "${CHAT_BASE}/api/conversations/fakeid/events")
+[[ "$code" == 401 ]] && ok "chat /api/conversations/{id}/events rejects no session (401)" || bad "chat /api/conversations/{id}/events expected 401 got $code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${CHAT_HOST}" -X POST -H 'Content-Type: application/json' -d '{}' "${CHAT_BASE}/api/conversations/fakeid/generate")
+[[ "$code" == 401 ]] && ok "chat /api/conversations/{id}/generate rejects no session (401)" || bad "chat /api/conversations/{id}/generate expected 401 got $code"
+
+# 8. SearXNG internal JSON search (no published port — reach it from the
+#    backend container on the internal network). LAN endpoint only; the
+#    full web_search tool loop needs a session + a pulled model, so it is a
+#    manual browser test (see ai/tasks.md Phase 10).
+if [[ "$ENDPOINT" == "http://${NAS_HOST}:8080" ]]; then
+  sx=$(ssh "${NAS_USER:-root}@${NAS_HOST}" "docker exec backend wget -q -O- 'http://searxng:8080/search?q=ollama&format=json' 2>/dev/null" 2>/dev/null || true)
+  if printf '%s' "$sx" | grep -q '"results"'; then
+    ok "SearXNG internal JSON search reachable from backend"
+  else
+    bad "SearXNG internal JSON search not usable from backend (searxng up? json format enabled in searxng/settings.yml?)"
+  fi
+fi
+
 echo
 echo "Results: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]

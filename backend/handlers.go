@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -349,5 +353,253 @@ func (s *server) handleModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
-	s.chatProxy.ServeHTTP(w, r)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		jsonError(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	r.Body.Close()
+
+	// Branch on the optional web_search flag. Flag off (or no SearXNG
+	// configured) -> the existing streaming passthrough to Ollama, unchanged.
+	var probe struct {
+		WebSearch bool `json:"web_search"`
+	}
+	_ = json.Unmarshal(body, &probe)
+	if !probe.WebSearch || s.cfg.searxngURL == "" {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.ContentLength = int64(len(body))
+		s.chatProxy.ServeHTTP(w, r)
+		return
+	}
+
+	s.handleChatWithSearch(w, r, body)
+}
+
+// --- Background generation (chat UI) ---
+
+type jobState struct {
+	ID        string `json:"id"`
+	Status    string `json:"status"`
+	Content   string `json:"content"`
+	Error     string `json:"error,omitempty"`
+	WebSearch bool   `json:"webSearch"`
+	CreatedAt int64  `json:"createdAt"`
+}
+
+func jobStateFrom(j *job) jobState {
+	st, content, errMsg := j.snapshot()
+	return jobState{ID: j.id, Status: st, Content: content, Error: errMsg, WebSearch: j.webSearch, CreatedAt: j.createdAt}
+}
+
+// handleGenerate persists the user's turn and enqueues a detached background
+// generation. 409 + the existing job's state if one is already active for the
+// conversation, so the client tails it instead of duplicating.
+func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
+	convID := r.PathValue("id")
+	email := emailFrom(r)
+
+	var body struct {
+		Model     string    `json:"model"`
+		Messages  []Message `json:"messages"`
+		WebSearch bool      `json:"web_search"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		jsonError(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	if body.Model == "" {
+		jsonError(w, "model is required", http.StatusBadRequest)
+		return
+	}
+
+	c, err := s.store.getConversation(email, convID)
+	if err != nil {
+		log.Printf("getConversation: %v", err)
+		jsonError(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	if c == nil {
+		jsonError(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	if err := s.store.updateConversationMessages(email, convID, body.Model, body.Messages); err != nil {
+		log.Printf("updateConversationMessages: %v", err)
+		jsonError(w, "server error", http.StatusInternalServerError)
+		return
+	}
+
+	if existing := s.jobs.get(convID); existing != nil {
+		w.WriteHeader(http.StatusConflict)
+		writeJSON(w, jobStateFrom(existing))
+		return
+	}
+
+	j := newJob(convID, email, body.Model, body.WebSearch)
+	if err := s.jobs.enqueue(j); err != nil {
+		if errors.Is(err, errJobActive) {
+			if existing := s.jobs.get(convID); existing != nil {
+				w.WriteHeader(http.StatusConflict)
+				writeJSON(w, jobStateFrom(existing))
+				return
+			}
+		}
+		log.Printf("enqueue: %v", err)
+		jsonError(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, jobStateFrom(j))
+}
+
+// handleJob reports the conversation's active job + partial content (for first
+// paint after a reload/reconnect). 204 when no job is active.
+func (s *server) handleJob(w http.ResponseWriter, r *http.Request) {
+	j := s.jobs.get(r.PathValue("id"))
+	if j == nil || j.email != emailFrom(r) {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	writeJSON(w, jobStateFrom(j))
+}
+
+// handleActiveJobs returns {conversationID: status} for the caller's active
+// jobs, so the sidebar can show which chats are generating.
+func (s *server) handleActiveJobs(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, s.jobs.activeByUser(emailFrom(r)))
+}
+
+// handleEvents is the SSE tail for a conversation's active job. It replays the
+// accumulated content as a "reset" event (so reconnects re-anchor the client's
+// accumulator), then streams live chunks/phases until the job finishes. A 5s
+// keepalive comment keeps Cloudflare's 100s edge timeout from firing while the
+// N100 thinks. With no active job it emits a terminal "done" so the client
+// closes cleanly instead of reconnecting.
+func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
+	j := s.jobs.get(r.PathValue("id"))
+	if j == nil || j.email != emailFrom(r) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "event: done\ndata: \n\n")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		return
+	}
+
+	flusher, _ := w.(http.Flusher)
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("X-Accel-Buffering", "no")
+	h.Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	if flusher != nil {
+		flusher.Flush()
+	}
+
+	ch, prefix := j.subscribe()
+	defer j.unsubscribe(ch)
+
+	var mu sync.Mutex
+	writeSSE := func(str string) {
+		mu.Lock()
+		_, _ = io.WriteString(w, str)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		mu.Unlock()
+	}
+
+	// Replay prefix as "reset"; the client sets acc = reset.data, then appends
+	// live chunks. This makes reconnects correct (no double-counting).
+	pdata, _ := json.Marshal(prefix)
+	writeSSE("event: reset\ndata: " + string(pdata) + "\n\n")
+	// If the job is still queued behind another, hint it so the UI can say so.
+	if st, _, _ := j.snapshot(); st == "queued" {
+		writeSSE("event: phase\ndata: queued\n\n")
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		t := time.NewTicker(keepaliveEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				writeSSE(":keep\n\n")
+			}
+		}
+	}()
+	defer func() {
+		close(stop)
+		wg.Wait()
+	}()
+
+	flushChunk := func(text string) {
+		d, _ := json.Marshal(text)
+		writeSSE("event: chunk\ndata: " + string(d) + "\n\n")
+	}
+	flushPhase := func(text string) {
+		writeSSE("event: phase\ndata: " + text + "\n\n")
+	}
+	flushError := func(text string) {
+		d, _ := json.Marshal(text)
+		writeSSE("event: joberror\ndata: " + string(d) + "\n\n")
+	}
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case ev := <-ch:
+			switch ev.kind {
+			case "chunk":
+				flushChunk(ev.text)
+			case "phase":
+				flushPhase(ev.text)
+			case "done":
+				writeSSE("event: done\ndata: \n\n")
+				return
+			case "error":
+				flushError(ev.text)
+				return
+			}
+		case <-j.finished:
+			// Backstop for a dropped terminal event: drain buffered events, then
+			// synthesize a terminal from the job's final status.
+			draining := true
+			for draining {
+				select {
+				case ev := <-ch:
+					switch ev.kind {
+					case "chunk":
+						flushChunk(ev.text)
+					case "phase":
+						flushPhase(ev.text)
+					case "done":
+						writeSSE("event: done\ndata: \n\n")
+						return
+					case "error":
+						flushError(ev.text)
+						return
+					}
+				default:
+					draining = false
+				}
+			}
+			st, _, msg := j.snapshot()
+			if st == "error" {
+				flushError(msg)
+			} else {
+				writeSSE("event: done\ndata: \n\n")
+			}
+			return
+		}
+	}
 }

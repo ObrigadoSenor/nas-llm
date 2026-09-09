@@ -58,6 +58,7 @@ services:
     restart: unless-stopped
     depends_on:
       - ollama
+      - searxng
     # No ports: — only Caddy reaches it over the internal network.
     environment:
       SESSION_SECRET: ${SESSION_SECRET}
@@ -67,8 +68,23 @@ services:
       ALLOWED_EMAILS: ${ALLOWED_EMAILS:-}
       DB_PATH: /data/nas-llm.db
       OLLAMA_URL: http://ollama:11434
+      SEARXNG_URL: ${SEARXNG_URL:-http://searxng:8080}
     volumes:
       - ${DOCKER_VOLUME}/docker/nas-llm/backend/data:/data
+    networks:
+      - internal
+
+  # SearXNG meta-search backend for the web_search tool. Internal-only:
+  # only the `backend` container reaches it (http://searxng:8080). Never
+  # published to the host/LAN. Pinned tag — `latest` breaks monthly.
+  searxng:
+    image: searxng/searxng:2026.9.8-3fdc6d753
+    container_name: searxng
+    restart: unless-stopped
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    environment:
+      - SEARXNG_BASE_URL=http://searxng:8080/
     networks:
       - internal
 

@@ -19,6 +19,7 @@ type config struct {
 	allowedEmails map[string]bool
 	dbPath        string
 	ollamaURL     string
+	searxngURL    string
 }
 
 type server struct {
@@ -28,6 +29,7 @@ type server struct {
 	mailer      mailer
 	modelsProxy http.Handler
 	chatProxy   http.Handler
+	jobs        *jobManager
 }
 
 type ctxKey int
@@ -43,6 +45,7 @@ func main() {
 		mailFrom:      env("MAIL_FROM", "noreply@selected.systems"),
 		dbPath:        env("DB_PATH", "/data/nas-llm.db"),
 		ollamaURL:     env("OLLAMA_URL", "http://ollama:11434"),
+		searxngURL:    env("SEARXNG_URL", ""),
 	}
 	cfg.cookieSecure = strings.HasPrefix(cfg.appBaseURL, "https://")
 	cfg.allowedEmails = parseAllowed(os.Getenv("ALLOWED_EMAILS"))
@@ -61,6 +64,7 @@ func main() {
 		modelsProxy: buildProxy(cfg.ollamaURL, "/v1/models"),
 		chatProxy:   buildProxy(cfg.ollamaURL, "/v1/chat/completions"),
 	}
+	srv.jobs = newJobManager(st, srv)
 
 	hs := &http.Server{
 		Addr:              cfg.addr,
@@ -112,12 +116,16 @@ func (s *server) routes() http.Handler {
 
 	mux.HandleFunc("GET /api/models", s.requireAuth(s.handleModels))
 	mux.HandleFunc("POST /api/chat/completions", s.requireAuth(s.handleChat))
+	mux.HandleFunc("GET /api/jobs/active", s.requireAuth(s.handleActiveJobs))
 	mux.HandleFunc("GET /api/conversations", s.requireAuth(s.handleListConversations))
 	mux.HandleFunc("GET /api/conversations/{id}", s.requireAuth(s.handleGetConversation))
 	mux.HandleFunc("POST /api/conversations", s.requireAuth(s.handleCreateConversation))
 	mux.HandleFunc("PUT /api/conversations/{id}", s.requireAuth(s.handleUpdateConversation))
 	mux.HandleFunc("PATCH /api/conversations/{id}", s.requireAuth(s.handlePatchConversation))
 	mux.HandleFunc("DELETE /api/conversations/{id}", s.requireAuth(s.handleDeleteConversation))
+	mux.HandleFunc("POST /api/conversations/{id}/generate", s.requireAuth(s.handleGenerate))
+	mux.HandleFunc("GET /api/conversations/{id}/events", s.requireAuth(s.handleEvents))
+	mux.HandleFunc("GET /api/conversations/{id}/job", s.requireAuth(s.handleJob))
 	mux.HandleFunc("GET /api/folders", s.requireAuth(s.handleListFolders))
 	mux.HandleFunc("POST /api/folders", s.requireAuth(s.handleCreateFolder))
 	mux.HandleFunc("PUT /api/folders/{id}", s.requireAuth(s.handleRenameFolder))
