@@ -7,70 +7,161 @@
 <style>
   :root {
     --bg:#0f1115; --panel:#171a21; --border:#262a33; --text:#e6e8eb;
-    --muted:#8b929e; --accent:#4c8dff; --user:#2a3344;
+    --muted:#8b929e; --accent:#4c8dff; --user:#2a3344; --hover:#1f242d;
   }
   *{box-sizing:border-box}
   html,body{height:100%;margin:0}
-  body{background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,system-ui,Segoe UI,sans-serif;display:flex;flex-direction:column}
-  header{padding:10px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px}
-  header h1{font-size:15px;font-weight:600;margin:0}
-  .gap{flex:1}
+  body{background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,system-ui,Segoe UI,sans-serif}
   select,button,input,textarea{font:inherit;color:var(--text);background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:6px 10px}
   button{cursor:pointer}
   button:hover:not(:disabled){border-color:var(--accent)}
   button:disabled{opacity:.45;cursor:default}
+  .hidden{display:none!important}
+  .gap{flex:1}
+  .cursor{opacity:.55}
+
+  /* --- Login --- */
+  #login{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:24px;width:360px;max-width:92vw}
+  .card h1{margin:0 0 6px;font-size:18px}
+  .card p{color:var(--muted);margin:0 0 14px;font-size:13px}
+  .card .row{display:flex;gap:8px}
+  .card input{flex:1}
+  #loginInfo{margin-top:12px;font-size:13px;color:var(--text)}
+
+  /* --- App layout --- */
+  #app{display:flex;height:100%}
+  #sidebar{width:248px;border-right:1px solid var(--border);display:flex;flex-direction:column;padding:10px;gap:8px;overflow:hidden;background:var(--bg)}
+  #sideHead{display:flex;align-items:center;gap:6px}
+  #newChat{padding:8px 10px;flex:1}
+  #newFolder{padding:8px 10px}
+  #closeSide{display:none}
+  #convList{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:6px;margin-top:4px}
+  .folder{display:flex;flex-direction:column;gap:2px}
+  .folder-head{display:flex;align-items:center;gap:4px;padding:4px 6px;border-radius:6px;user-select:none}
+  .folder-head:hover{background:var(--hover)}
+  .folder-chev{font-size:10px;color:var(--muted);width:12px;text-align:center}
+  .folder-name{flex:1;font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .folder-name input{font:inherit;font-size:12px;width:100%;padding:1px 4px}
+  .folder-act{background:transparent;border:none;padding:2px 5px;color:var(--muted);font-size:12px;border-radius:4px}
+  .folder-act:hover{color:var(--text);background:var(--user)}
+  .folder.collapsed .folder-body{display:none}
+  .folder-body{display:flex;flex-direction:column;gap:2px;padding-left:10px}
+  .conv{display:flex;align-items:center;padding:8px;border-radius:8px;cursor:pointer;gap:6px}
+  .conv:hover{background:var(--hover)}
+  .conv.active{background:var(--user)}
+  .conv-main{flex:1;min-width:0}
+  .conv-title{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .conv-title input{font:inherit;font-size:13px;width:100%;padding:1px 4px}
+  .conv-time{font-size:11px;color:var(--muted)}
+  .conv-act{background:transparent;border:none;padding:2px 6px;color:var(--muted);font-size:13px;border-radius:4px}
+  .conv-act:hover{color:var(--text);background:var(--user)}
+  #who{display:flex;align-items:center;gap:8px;padding-top:8px;border-top:1px solid var(--border);font-size:12px;color:var(--muted)}
+  #whoEmail{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+  main{flex:1;display:flex;flex-direction:column;min-width:0}
+  header{padding:10px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px}
+  header h1{font-size:15px;font-weight:600;margin:0}
+  #chatTitle{font-size:15px;font-weight:600;margin:0;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #chatMeta{font-size:11px;color:var(--muted);white-space:nowrap}
+  #menuBtn{display:none}
+
   #chat{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
   .msg{max-width:760px;width:100%;margin:0 auto}
-  .msg .role{font-size:12px;color:var(--muted);margin-bottom:3px}
+  .msg .role{font-size:12px;color:var(--muted);margin-bottom:3px;display:flex;gap:6px;align-items:baseline}
+  .msg .role .ts{font-size:11px;color:var(--muted);opacity:.7}
   .msg .bubble{padding:10px 14px;border-radius:10px;white-space:pre-wrap;word-wrap:break-word}
   .msg.user .bubble{background:var(--user)}
   .msg.assistant .bubble{background:var(--panel);border:1px solid var(--border)}
   .form{max-width:760px;width:100%;margin:0 auto;padding:12px 16px 16px;display:flex;gap:8px;align-items:flex-end}
   .form textarea{flex:1;resize:none;min-height:44px;max-height:200px}
-  .settings{max-width:760px;width:100%;margin:0 auto;padding:16px}
-  .settings p{color:var(--muted);margin:0 0 8px;font-size:13px}
-  .settings .row{display:flex;gap:8px}
-  .settings input{flex:1}
-  .hidden{display:none}
-  .cursor{opacity:.55}
+
+  /* row action menu */
+  .menu{position:fixed;z-index:40;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:4px;min-width:160px;box-shadow:0 6px 24px rgba(0,0,0,.4)}
+  .menu button{display:block;width:100%;text-align:left;background:transparent;border:none;padding:6px 8px;border-radius:6px;font-size:13px}
+  .menu button:hover{background:var(--hover)}
+  .menu .sep{height:1px;background:var(--border);margin:4px 2px}
+  .menu .sub{position:relative}
+  .menu .sub > .label{display:flex;justify-content:space-between}
+  .menu .sub > .panel{display:none;position:absolute;left:100%;top:0;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:4px;min-width:150px;box-shadow:0 6px 24px rgba(0,0,0,.4)}
+  .menu .sub:hover > .panel{display:block}
+  .menu .panel button{white-space:nowrap}
+
+  @media (max-width:680px){
+    #sidebar{position:fixed;left:0;top:0;bottom:0;z-index:30;transform:translateX(-100%);transition:transform .18s}
+    #sidebar.open{transform:none;box-shadow:2px 0 20px rgba(0,0,0,.5)}
+    #menuBtn{display:inline-block}
+    #closeSide{display:inline-block}
+    #scrim{position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.4)}
+    body.drawer-open{overflow:hidden}
+  }
 </style>
 </head>
 <body>
-<header>
-  <h1>nas-llm</h1>
-  <div class="gap"></div>
-  <select id="model" title="model"></select>
-  <button id="clear" title="clear conversation">Clear</button>
-</header>
-<div id="chat"></div>
-<div class="form">
-  <textarea id="input" placeholder="Message…  (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
-  <button id="send">Send</button>
-</div>
-<div class="settings hidden" id="settings">
-  <p>Enter your API bearer token. It is stored only in this browser (localStorage) and sent only to your endpoint.</p>
-  <div class="row">
-    <input id="token" type="password" placeholder="Bearer token">
-    <button id="save">Save</button>
+
+<div id="login" class="hidden">
+  <div class="card">
+    <h1>nas-llm</h1>
+    <p>Sign in with a one-time link emailed to you. No password.</p>
+    <div class="row">
+      <input id="loginEmail" type="email" placeholder="you@example.com" autocomplete="email">
+      <button id="loginBtn">Send link</button>
+    </div>
+    <div id="loginInfo"></div>
   </div>
 </div>
+
+<div id="app" class="hidden">
+  <aside id="sidebar">
+    <div id="sideHead">
+      <button id="newChat">+ New chat</button>
+      <button id="newFolder" title="New folder">＋</button>
+      <button id="closeSide" title="Close">✕</button>
+    </div>
+    <div id="convList"></div>
+    <div class="gap"></div>
+    <div id="who">
+      <span id="whoEmail"></span>
+      <button id="logout">Log out</button>
+    </div>
+  </aside>
+  <div id="scrim" class="hidden"></div>
+  <main>
+    <header>
+      <button id="menuBtn">☰</button>
+      <h1 id="chatTitle">nas-llm</h1>
+      <span id="chatMeta"></span>
+      <div class="gap"></div>
+      <select id="model" title="model"></select>
+    </header>
+    <div id="chat"></div>
+    <div class="form">
+      <textarea id="input" placeholder="Message…  (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
+      <button id="send">Send</button>
+    </div>
+  </main>
+</div>
+
 <script>
-const ENDPOINT = "https://llm.selected.systems"; // API host; page is on chat.selected.systems (cross-origin, CORS already configured)
 const $ = id => document.getElementById(id);
-const chat=$("chat"), input=$("input"), send=$("send"), modelSel=$("model"), clearBtn=$("clear");
-const settings=$("settings"), tokenEl=$("token"), saveBtn=$("save");
+const app=$("app"), loginView=$("login");
+const chat=$("chat"), input=$("input"), send=$("send"), modelSel=$("model");
+const convList=$("convList"), whoEmail=$("whoEmail");
+const chatTitle=$("chatTitle"), chatMeta=$("chatMeta");
+const loginEmail=$("loginEmail"), loginBtn=$("loginBtn"), loginInfo=$("loginInfo");
+const sidebar=$("sidebar"), scrim=$("scrim"), menuBtn=$("menuBtn"), closeSide=$("closeSide");
 
-let token = localStorage.getItem("nas-llm-token") || "";
-let models = JSON.parse(localStorage.getItem("nas-llm-models") || "[]");
-let selectedModel = localStorage.getItem("nas-llm-model") || "llama3.2:latest";
+let me = null;                 // {email} once logged in
+let models = [];
+let selectedModel = localStorage.getItem("nas-llm-model") || "";
+let conversations = [];
+let folders = [];
+let collapsedFolders = JSON.parse(localStorage.getItem("nas-llm-collapsed")||"{}");
+let activeId = null;           // null = new, unsaved chat
 let messages = [];
+let openMenu = null;           // currently shown row action menu element
 
-// --- Retry with exponential backoff ---------------------------------------
-// Cloudflare's rate-limit (429) responses carry NO Access-Control-Allow-Origin
-// header, so a cross-origin fetch() that hits 429 is rejected by the browser as
-// an opaque TypeError ("Load failed" / "Failed to fetch") — we never see the
-// 429. Treat those network errors as retryable (backoff lets the window clear).
-// Also retry 429/5xx we can see. Fail fast on 401 (bad token) / other 4xx.
+// --- Retry with exponential backoff (network/CORS/429/5xx are retryable) ----
 const MAX_RETRIES = 4, BASE_DELAY = 1000, MAX_DELAY = 16000;
 const sleep = ms => new Promise(r=>setTimeout(r,ms));
 function isRetryableErr(e){
@@ -83,90 +174,331 @@ function isRetryableErr(e){
 function errText(e){
   const t=String(e&&e.message||e);
   if(/load failed|failed to fetch|networkerror/i.test(t))
-    return "could not reach the API (network or CORS block — likely Cloudflare rate-limiting)";
+    return "could not reach the server (network or rate-limit)";
   return t;
 }
-// fetch() with backoff. onRetry(attempt, delayMs) fires before each retry.
 async function fetchRetry(url, opts, {onRetry, label="request"}={}){
   let lastErr;
   for(let attempt=0; attempt<=MAX_RETRIES; attempt++){
     let r, threw=false;
     try{ r=await fetch(url, opts); }
-    catch(e){ threw=true; lastErr=e; }               // network/CORS failure
+    catch(e){ threw=true; lastErr=e; }
     if(!threw){
       if(r.ok) return r;
-      const err=new Error("HTTP "+r.status+(r.status===401?" — bad token?":""));
+      const err=new Error("HTTP "+r.status+(r.status===401?" — session expired?":""));
       err.status=r.status;
       if(!isRetryableErr(err)) throw err;            // 401/4xx -> fail fast
       lastErr=err;
     }
     if(attempt===MAX_RETRIES) break;
-    const delay=Math.min(MAX_DELAY, BASE_DELAY*2**attempt) * (0.7+Math.random()*0.6); // 0.7–1.3x jitter
+    const delay=Math.min(MAX_DELAY, BASE_DELAY*2**attempt) * (0.7+Math.random()*0.6);
     if(onRetry) onRetry(attempt+1, Math.round(delay));
     await sleep(delay);
   }
   throw new Error(label+" failed after "+(MAX_RETRIES+1)+" attempts: "+errText(lastErr));
 }
 
-function needToken(){
-  if(!token){ settings.classList.remove("hidden"); send.disabled=true; return true; }
-  settings.classList.add("hidden"); send.disabled=false; return false;
+// --- Auth gate --------------------------------------------------------------
+async function boot(){
+  try{
+    const r=await fetch("/api/auth/me");
+    if(r.ok){ me=await r.json(); await showApp(); }
+    else showLogin();
+  }catch{ showLogin(); }
+}
+function showLogin(){
+  app.classList.add("hidden"); loginView.classList.remove("hidden");
+  loginInfo.textContent=""; loginEmail.focus();
+}
+async function showApp(){
+  loginView.classList.add("hidden"); app.classList.remove("hidden");
+  whoEmail.textContent=me.email;
+  await loadModels();
+  await loadConversations();
+  if(conversations.length) await openConversation(conversations[0].id);
+  else newChat();
+  input.focus();
+}
+
+loginBtn.addEventListener("click", async ()=>{
+  const email=loginEmail.value.trim().toLowerCase();
+  loginInfo.textContent=""; loginBtn.disabled=true;
+  if(!email || email.indexOf("@")<1){ loginInfo.textContent="Enter a valid email."; loginBtn.disabled=false; return; }
+  try{
+    const r=await fetch("/api/auth/request",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email})});
+    if(r.ok) loginInfo.textContent="Check your email for a sign-in link. It expires in 15 minutes.";
+    else if(r.status===429) loginInfo.textContent="Too many attempts. Wait a few minutes and try again.";
+    else { let j={}; try{j=await r.json()}catch{} loginInfo.textContent=j.error||"Could not send a link."; }
+  }catch{ loginInfo.textContent="Network error — could not reach the server."; }
+  finally{ loginBtn.disabled=false; }
+});
+loginEmail.addEventListener("keydown", e=>{ if(e.key==="Enter"){ e.preventDefault(); loginBtn.click(); } });
+
+async function logout(){
+  try{ await fetch("/api/auth/logout",{method:"POST"}); }catch{}
+  me=null; activeId=null; messages=[]; conversations=[]; selectedModel="";
+  showLogin();
+}
+$("logout").addEventListener("click", logout);
+$("newChat").addEventListener("click", ()=>{ newChat(); closeSidebar(); });
+
+// --- Models -----------------------------------------------------------------
+async function loadModels(){
+  try{
+    const r=await fetchRetry("/api/models",{},{label:"Load models"});
+    const j=await r.json();
+    models=(j.data||[]).map(m=>m.id);
+    if(models.length && !models.includes(selectedModel)) selectedModel=models[0];
+    renderModels();
+  }catch(e){ renderModels(); modelSel.title=String(e.message||e); }
 }
 function renderModels(){
   modelSel.innerHTML="";
   models.forEach(m=>{ const o=document.createElement("option"); o.value=o.textContent=m; modelSel.appendChild(o); });
-  if(models.length && !models.includes(selectedModel)) selectedModel=models[0];
-  modelSel.value=selectedModel;
+  if(models.length) modelSel.value=selectedModel;
 }
-modelSel.addEventListener("change", ()=>{ selectedModel=modelSel.value; localStorage.setItem("nas-llm-model",selectedModel); });
-saveBtn.addEventListener("click", ()=>{ token=tokenEl.value.trim(); localStorage.setItem("nas-llm-token",token); if(!needToken()) loadModels(); });
-clearBtn.addEventListener("click", ()=>{ messages=[]; chat.innerHTML=""; });
+modelSel.addEventListener("change", ()=>{
+  selectedModel=modelSel.value;
+  localStorage.setItem("nas-llm-model", selectedModel);
+  if(activeId) saveConversation();
+});
 
-function addMsg(role,text){
+// --- Sidebar / conversations ------------------------------------------------
+async function loadConversations(){
+  try{
+    const r=await fetch("/api/conversations");
+    conversations=r.ok ? await r.json() : [];
+  }catch{ conversations=[]; }
+  await loadFolders();
+  renderSidebar();
+  updateHeader();
+}
+async function loadFolders(){
+  try{
+    const r=await fetchRetry("/api/folders",{},{label:"Load folders"});
+    folders=r.ok ? await r.json() : [];
+  }catch{ folders=[]; }
+}
+function saveCollapsed(){ localStorage.setItem("nas-llm-collapsed", JSON.stringify(collapsedFolders)); }
+function renderSidebar(){
+  convList.innerHTML="";
+  const byFolder={};
+  conversations.forEach(c=>{ const key=c.folderId||""; (byFolder[key]=byFolder[key]||[]).push(c); });
+  folders.forEach(f=>{ if(byFolder[f.id]){ convList.appendChild(renderFolder(f, byFolder[f.id])); delete byFolder[f.id]; } });
+  if(byFolder[""]) convList.appendChild(renderFolder(null, byFolder[""]));
+}
+function renderFolder(f, convs){
+  const wrap=document.createElement("div"); wrap.className="folder"+(f&&collapsedFolders[f.id]?" collapsed":"");
+  const head=document.createElement("div"); head.className="folder-head";
+  const chev=document.createElement("span"); chev.className="folder-chev"; chev.textContent=f?(collapsedFolders[f.id]?"▸":"▾"):"";
+  const name=document.createElement("div"); name.className="folder-name";
+  if(f){
+    name.textContent=f.name;
+    head.appendChild(chev); head.appendChild(name);
+    const acts=document.createElement("div"); acts.style.display="flex"; acts.style.gap="2px";
+    const rn=document.createElement("button"); rn.className="folder-act"; rn.textContent="✎"; rn.title="Rename folder";
+    rn.addEventListener("click",e=>{ e.stopPropagation(); startFolderRename(f,name); });
+    const df=document.createElement("button"); df.className="folder-act"; df.textContent="🗑"; df.title="Delete folder";
+    df.addEventListener("click",async e=>{ e.stopPropagation(); await deleteFolder(f.id, f.name); });
+    acts.appendChild(rn); acts.appendChild(df); head.appendChild(acts);
+    head.addEventListener("click",()=>{ collapsedFolders[f.id]=!collapsedFolders[f.id]; saveCollapsed(); renderSidebar(); });
+  } else {
+    chev.style.visibility="hidden";
+    name.textContent="Unsorted";
+    head.appendChild(chev); head.appendChild(name);
+  }
+  wrap.appendChild(head);
+  const body=document.createElement("div"); body.className="folder-body";
+  convs.forEach(c=>body.appendChild(renderConv(c)));
+  wrap.appendChild(body);
+  return wrap;
+}
+function renderConv(c){
+  const row=document.createElement("div"); row.className="conv"+(c.id===activeId?" active":"");
+  const main=document.createElement("div"); main.className="conv-main";
+  const t=document.createElement("div"); t.className="conv-title"; t.id="ct-"+c.id; t.textContent=c.title||"New chat";
+  const tm=document.createElement("div"); tm.className="conv-time"; tm.textContent=absTime(c.updatedAt); tm.title=relTime(c.updatedAt);
+  main.appendChild(t); main.appendChild(tm);
+  row.appendChild(main);
+  const more=document.createElement("button"); more.className="conv-act"; more.textContent="⋯"; more.title="More";
+  more.addEventListener("click",e=>{ e.stopPropagation(); openConvMenu(c, more); });
+  row.appendChild(more);
+  row.addEventListener("click",()=>{ openConversation(c.id); closeSidebar(); });
+  return row;
+}
+// --- Row action menu (rename / move / delete) ---
+function closeMenu(){ if(openMenu){ openMenu.remove(); openMenu=null; document.removeEventListener("click",closeMenu); } }
+function openConvMenu(c, anchor){
+  closeMenu();
+  const m=document.createElement("div"); m.className="menu";
+  const rename=document.createElement("button"); rename.textContent="Rename";
+  rename.addEventListener("click",e=>{ e.stopPropagation(); closeMenu(); startConvRename(c); });
+  const move=document.createElement("div"); move.className="sub";
+  const moveLabel=document.createElement("button"); moveLabel.className="label"; moveLabel.textContent="Move to ▶";
+  const panel=document.createElement("div"); panel.className="panel";
+  const unsort=document.createElement("button"); unsort.textContent="Unsorted";
+  unsort.addEventListener("click",e=>{ e.stopPropagation(); closeMenu(); moveConversation(c, ""); });
+  panel.appendChild(unsort);
+  folders.forEach(f=>{ const b=document.createElement("button"); b.textContent=f.name; b.addEventListener("click",e=>{ e.stopPropagation(); closeMenu(); moveConversation(c, f.id); }); panel.appendChild(b); });
+  move.appendChild(moveLabel); move.appendChild(panel);
+  const del=document.createElement("button"); del.textContent="Delete";
+  del.addEventListener("click",e=>{ e.stopPropagation(); closeMenu(); deleteConversation(c.id); });
+  const sep1=document.createElement("div"); sep1.className="sep";
+  const sep2=document.createElement("div"); sep2.className="sep";
+  m.appendChild(rename); m.appendChild(sep1); m.appendChild(move); m.appendChild(sep2); m.appendChild(del);
+  document.body.appendChild(m);
+  const r=anchor.getBoundingClientRect();
+  m.style.left=Math.min(r.left, window.innerWidth-m.offsetWidth-8)+"px";
+  m.style.top=(r.bottom+4)+"px";
+  openMenu=m;
+  setTimeout(()=>document.addEventListener("click",closeMenu),0);
+}
+async function moveConversation(c, folderId){
+  if((c.folderId||"")===(folderId||"")) return;
+  try{
+    const r=await fetchRetry("/api/conversations/"+encodeURIComponent(c.id),{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({folderId})},{label:"Move chat"});
+    if(!r.ok) return;
+    await loadConversations();
+  }catch{}
+}
+function startConvRename(c){
+  const cell=$("ct-"+c.id); if(!cell) return;
+  cell.innerHTML="";
+  const inp=document.createElement("input"); inp.value=c.title||""; inp.maxLength=80;
+  cell.appendChild(inp); inp.focus(); inp.select();
+  let done=false;
+  const commit=async ()=>{ if(done) return; done=true;
+    const v=inp.value.trim(); if(!v||v===(c.title||"")){ renderSidebar(); return; }
+    try{ await fetchRetry("/api/conversations/"+encodeURIComponent(c.id),{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({title:v})},{label:"Rename chat"}); }catch{}
+    await loadConversations();
+  };
+  const cancel=()=>{ done=true; renderSidebar(); };
+  inp.addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault(); commit(); } else if(e.key==="Escape"){ e.preventDefault(); cancel(); } });
+  inp.addEventListener("blur",commit);
+}
+// --- Folder CRUD ---
+async function createFolder(){
+  const name=prompt("Folder name:"); if(!name) return;
+  try{ await fetchRetry("/api/folders",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:name.trim()})},{label:"Create folder"}); }catch{}
+  await loadConversations();
+}
+async function deleteFolder(id, name){
+  if(!confirm("Delete folder \""+name+"\"? Its chats move to Unsorted (not deleted).")) return;
+  try{ await fetchRetry("/api/folders/"+encodeURIComponent(id),{method:"DELETE"},{label:"Delete folder"}); }catch{}
+  await loadConversations();
+}
+function startFolderRename(f, cell){
+  cell.innerHTML="";
+  const inp=document.createElement("input"); inp.value=f.name; inp.maxLength=80;
+  cell.appendChild(inp); inp.focus(); inp.select();
+  let done=false;
+  const commit=async ()=>{ if(done) return; done=true;
+    const v=inp.value.trim(); if(!v||v===f.name){ renderSidebar(); return; }
+    try{ await fetchRetry("/api/folders/"+encodeURIComponent(f.id),{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:v})},{label:"Rename folder"}); }catch{}
+    await loadConversations();
+  };
+  const cancel=()=>{ done=true; renderSidebar(); };
+  inp.addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault(); commit(); } else if(e.key==="Escape"){ e.preventDefault(); cancel(); } });
+  inp.addEventListener("blur",commit);
+}
+async function openConversation(id){
+  try{
+    const r=await fetch("/api/conversations/"+encodeURIComponent(id));
+    if(!r.ok) return;
+    const c=await r.json();
+    activeId=c.id; messages=c.messages||[];
+    if(models.includes(c.model)) selectedModel=c.model;
+    renderModels();
+    rerenderChat();
+    renderSidebar();
+    updateHeader();
+  }catch{}
+}
+function newChat(){
+  activeId=null; messages=[]; chat.innerHTML=""; renderSidebar(); updateHeader(); input.focus();
+}
+async function deleteConversation(id){
+  if(!confirm("Delete this conversation?")) return;
+  try{ await fetch("/api/conversations/"+encodeURIComponent(id),{method:"DELETE"}); }catch{}
+  if(id===activeId) newChat();
+  await loadConversations();
+}
+async function saveConversation(){
+  if(!activeId) return;
+  const firstUser=messages.find(m=>m.role==="user");
+  const title=firstUser ? titleFrom(firstUser.content) : "New chat";
+  try{
+    await fetch("/api/conversations/"+encodeURIComponent(activeId),{
+      method:"PUT",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({title, model:selectedModel, messages})
+    });
+    await loadConversations();
+  }catch{}
+}
+
+// --- Chat rendering ---------------------------------------------------------
+function addMsg(role,text,ts){
   const d=document.createElement("div"); d.className="msg "+role;
-  const r=document.createElement("div"); r.className="role"; r.textContent=role==="user"?"you":"assistant";
+  const r=document.createElement("div"); r.className="role";
+  const lab=document.createElement("span"); lab.textContent=role==="user"?"you":"assistant";
+  r.appendChild(lab);
+  if(ts){ const t=document.createElement("span"); t.className="ts"; t.textContent=fmtTs(ts); r.appendChild(t); }
   const b=document.createElement("div"); b.className="bubble"; b.textContent=text;
   d.appendChild(r); d.appendChild(b); chat.appendChild(d);
   chat.scrollTop=chat.scrollHeight;
   return b;
 }
-
-async function loadModels(){
-  const status=addMsg("assistant","");
-  try{
-    const r=await fetchRetry(ENDPOINT+"/v1/models",{headers:{Authorization:"Bearer "+token}},{
-      label:"Load models",
-      onRetry:(a,d)=>{ status.textContent="⏳ Loading models… rate-limited or network blip. Retrying in "+(d/1000).toFixed(0)+"s (attempt "+a+"/"+MAX_RETRIES+")."; }
-    });
-    status.remove();
-    const j=await r.json();
-    models=(j.data||[]).map(m=>m.id);
-    localStorage.setItem("nas-llm-models",JSON.stringify(models));
-    renderModels();
-  }catch(e){ status.textContent=String(e.message||e); }
+function rerenderChat(){
+  chat.innerHTML="";
+  messages.forEach(m=>addMsg(m.role, m.content, m.ts));
+}
+function updateHeader(){
+  if(!activeId){ chatTitle.textContent="New chat"; chatMeta.textContent=""; return; }
+  const c=conversations.find(x=>x.id===activeId);
+  if(!c){ chatTitle.textContent="Chat"; chatMeta.textContent=""; return; }
+  chatTitle.textContent=c.title||"New chat";
+  chatMeta.textContent=c.updatedAt?("Updated "+absTimeFull(c.updatedAt)):"";
 }
 
+// --- Streaming --------------------------------------------------------------
 async function stream(){
-  if(needToken()) return;
   const text=input.value.trim();
-  if(!text||send.disabled) return;
+  if(!text || send.disabled) return;
   input.value=""; input.style.height="auto";
-  messages.push({role:"user",content:text});
-  addMsg("user",text);
-  const bubble=addMsg("assistant","");
+  const uTs=Date.now();
+  messages.push({role:"user",content:text,ts:uTs});
+  addMsg("user",text,uTs);
+
+  // Persist: create the conversation on first turn, else save the user turn.
+  if(!activeId){
+    try{
+      const r=await fetch("/api/conversations",{
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({title:titleFrom(text), model:selectedModel, messages})
+      });
+      if(r.ok){ const c=await r.json(); activeId=c.id; await loadConversations(); }
+    }catch{}
+  } else {
+    saveConversation();
+  }
+
+  const aTs=Date.now();
+  const bubble=addMsg("assistant","",aTs);
   const cursor=document.createElement("span"); cursor.className="cursor"; cursor.textContent="▍";
   bubble.appendChild(cursor);
   send.disabled=true;
   let acc="";
   try{
-    const r=await fetchRetry(ENDPOINT+"/v1/chat/completions",{
+    const r=await fetchRetry("/api/chat/completions",{
       method:"POST",
-      headers:{"Content-Type":"application/json",Authorization:"Bearer "+token},
-      body:JSON.stringify({model:selectedModel,stream:true,messages})
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({model:selectedModel, stream:true, messages})
     },{
       label:"Chat",
       onRetry:(a,d)=>{
-        bubble.textContent=(acc?acc+"\n":"")+"⏳ Rate-limited or network blip — retrying in "+(d/1000).toFixed(0)+"s (attempt "+a+"/"+MAX_RETRIES+")…";
+        bubble.textContent=(acc?acc+"\n":"")+"⏳ Retry in "+(d/1000).toFixed(0)+"s (attempt "+a+"/"+MAX_RETRIES+")…";
         bubble.appendChild(cursor);
       }
     });
@@ -188,9 +520,11 @@ async function stream(){
       chat.scrollTop=chat.scrollHeight;
     }
     if(!acc) bubble.textContent="(empty response)";
-    messages.push({role:"assistant",content:acc});
+    messages.push({role:"assistant",content:acc||"",ts:aTs});
+    await saveConversation();
   }catch(e){
     bubble.textContent=acc||String(e.message||e);
+    if(acc){ messages.push({role:"assistant",content:acc,ts:aTs}); await saveConversation(); }
   }finally{
     cursor.remove(); send.disabled=false; input.focus();
   }
@@ -200,8 +534,43 @@ send.addEventListener("click",stream);
 input.addEventListener("keydown",e=>{ if(e.key==="Enter"&&!e.shiftKey){ e.preventDefault(); stream(); } });
 input.addEventListener("input",()=>{ input.style.height="auto"; input.style.height=input.scrollHeight+"px"; });
 
-if(token){ tokenEl.value=token; needToken(); loadModels(); } else { needToken(); renderModels(); }
-input.focus();
+// --- Sidebar toggle (mobile) ------------------------------------------------
+function openSidebar(){ sidebar.classList.add("open"); scrim.classList.remove("hidden"); document.body.classList.add("drawer-open"); }
+function closeSidebar(){ sidebar.classList.remove("open"); scrim.classList.add("hidden"); document.body.classList.remove("drawer-open"); }
+menuBtn.addEventListener("click", ()=>{ sidebar.classList.contains("open")?closeSidebar():openSidebar(); });
+closeSide.addEventListener("click", closeSidebar);
+scrim.addEventListener("click", closeSidebar);
+document.addEventListener("keydown", e=>{ if(e.key==="Escape") closeSidebar(); });
+$("newFolder").addEventListener("click", createFolder);
+
+// --- Helpers ----------------------------------------------------------------
+function titleFrom(t){ t=(t||"").trim().replace(/\s+/g," "); return t ? (t.slice(0,40)+(t.length>40?"…":"")) : "New chat"; }
+function relTime(ms){
+  if(!ms) return "";
+  const s=(Date.now()-ms)/1000;
+  if(s<60) return "just now";
+  if(s<3600) return Math.floor(s/60)+"m ago";
+  if(s<86400) return Math.floor(s/3600)+"h ago";
+  if(s<604800) return Math.floor(s/86400)+"d ago";
+  return new Date(ms).toLocaleDateString();
+}
+function absTime(ms){
+  if(!ms) return "";
+  const d=new Date(ms), now=new Date();
+  if(d.toDateString()===now.toDateString()) return d.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"});
+  if(d.getFullYear()===now.getFullYear()) return d.toLocaleDateString([], {month:"short", day:"numeric"});
+  return d.toLocaleDateString([], {month:"short", day:"numeric", year:"numeric"});
+}
+function absTimeFull(ms){
+  if(!ms) return "";
+  return new Date(ms).toLocaleString([], {month:"short", day:"numeric", year:"numeric", hour:"2-digit", minute:"2-digit"});
+}
+function fmtTs(ms){
+  if(!ms) return "";
+  return new Date(ms).toLocaleString([], {month:"short", day:"numeric", hour:"2-digit", minute:"2-digit"});
+}
+
+boot();
 </script>
 </body>
 </html>

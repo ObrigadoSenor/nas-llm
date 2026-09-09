@@ -2,34 +2,70 @@
 
 A single secure **public OpenAI-compatible HTTPS API endpoint** running on a
 UGREEN NASync DXP2800 (Intel N100, 8 GB), called by a browser extension, with
-**no router ports opened**. There is no web chat page and no user accounts — the
-NAS serves an API only, and model management is done with the `ollama` CLI over
-SSH.
+**no router ports opened**. The API host (`llm.selected.systems`) is pure-API:
+o user accounts, no management routes. A second host (`chat.selected.systems`)
+runs a minimal streaming chat page backed by a small Go service for magic-link
+login and SQLite chat history. Model management is done with the `ollama` CLI
+over SSH.
 
 ```
-Browser extension (Bearer token)
-  → Cloudflare edge (TLS + WAF + rate limit)
+Browser extension (Bearer token) → llm.selected.systems:
+  Cloudflare edge (TLS + WAF + rate limit)
   → cloudflared (outbound-only tunnel, no open ports)
-  → Caddy :8080 (CORS preflight, bearer check, Host rewrite, stream flush)
+  → Caddy :8080 (/v1/*, bearer check, Host rewrite, stream flush)
   → Ollama :11434 (internal network only — never published)
   → Models on NVMe
+
+Chat page (session cookie) → chat.selected.systems:
+  Cloudflare edge (TLS + WAF + rate limit)
+  → cloudflared (outbound-only tunnel)
+  → Caddy :8080 (/api/* → backend :8081, else static www/)
+  → Go backend (magic-link auth + SQLite history + Ollama proxy) → Ollama :11434
+  → SQLite on NVMe (users, conversations)
 ```
 
-Endpoint: **`https://llm.selected.systems`** (OpenAI-compatible: `/v1/chat/completions`, `/v1/models`, `/v1/embeddings`).
+Endpoint: **`https://llm.selected.systems`** (OpenAI-compatible: `/v1/chat/completions`, `/v1/models`, `/v1/embeddings`) — pure API, bearer-token auth for the browser extension.
 
-Chat UI: **`https://chat.selected.systems`** — a minimal streaming chat page (static HTML in `www/`, no secrets baked in; the bearer token is entered in the browser and stored in localStorage). The page calls the API cross-origin (CORS is already configured on the API host). Both hostnames route through the same Cloudflare Tunnel to the same Caddy instance, which routes by Host header — this keeps `llm.selected.systems` pure-API.
+Chat UI: **`https://chat.selected.systems`** — a minimal streaming chat page (static HTML in `www/`, no secrets baked in). Sign-in is passwordless: enter your email, click a magic link, and a signed session cookie is set. Chat history lives server-side in SQLite on the NAS, so you can resume conversations from any browser. The page calls same-origin `/api/*` (auth, history, and an Ollama proxy) on the Go `backend` container; the bearer token never reaches the browser. Both hostnames route through the same Cloudflare Tunnel to the same Caddy instance, which routes by Host header — this keeps `llm.selected.systems` pure-API.
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `docker-compose.yml` | ollama (no `ports:`), caddy (`:8080`), cloudflared (`tunnel` profile) |
-| `Caddyfile` | CORS preflight bypass, bearer check, `/v1/*` allowlist, Host rewrite, streaming |
-| `.env.example` / `.env` | NAS access, volume, tunnel token, bearer token, model, CORS origin |
-| `scripts/deploy.sh` | rsync the stack to the NAS and `docker compose up -d` |
+| `docker-compose.yml` | ollama (no `ports:`), caddy (`:8080`), backend (`:8081`, no `ports:`), cloudflared (`tunnel` profile) |
+| `Caddyfile` | `/v1/*` bearer auth + CORS for the API host; `/api/*` → backend for the chat host; static `www/` otherwise |
+| `backend/` | Go service: magic-link auth, SQLite history, Ollama proxy (Dockerfile builds a static binary) |
+| `.env.example` / `.env` | NAS access, volume, tunnel token, bearer token, model, CORS origin, session secret, Brevo key, allowlist |
+| `scripts/deploy.sh` | sync the stack to the NAS and `docker compose up -d --build` |
 | `scripts/pull-models.sh` | `docker exec ollama ollama ...` over SSH |
-| `scripts/smoke-test.sh` | auth / CORS / allowlist / port-isolation / streaming checks |
+| `scripts/smoke-test.sh` | API auth/CORS/allowlist/port-isolation/streaming + chat `/api/*` 401 checks |
 | `ai/tasks.md` | phased task list |
+
+## Chat login & history
+
+`chat.selected.systems` is backed by a small Go service (the `backend` container)
+that adds three things on top of the static page:
+
+- **Magic-link sign-in.** `POST /api/auth/request {email}` emails a one-time,
+  15-minute link via Brevo. Clicking `GET /api/auth/verify?token=…` sets a
+  signed, HttpOnly session cookie (~30 days) and redirects to `/`. No passwords.
+- **Chat history** in SQLite on the NVMe (`${DOCKER_VOLUME}/docker/nas-llm/backend/data`):
+  `GET/POST/PUT/DELETE /api/conversations[/:id]`. Each conversation belongs to a
+  user; the page saves after every turn, so a reload or a different browser
+  resumes where you left off.
+- **Ollama proxy** `GET /api/models` and `POST /api/chat/completions` (streaming
+  passthrough) so the page never needs the bearer token or cross-origin CORS.
+
+`llm.selected.systems` is untouched and stays pure-API for the extension.
+
+Required env (`backend` container): `SESSION_SECRET`, `BREVO_API_KEY`,
+`APP_BASE_URL`, `MAIL_FROM`, `ALLOWED_EMAILS` (empty = open sign-up; set to your
+email for a personal NAS). The sender in `MAIL_FROM` must be a Brevo-verified
+sender for `selected.systems`.
+
+Migrating to another NAS: back up the SQLite file along with the ollama/caddy
+data directories and restore it to the same path — users and conversations come
+with you.
 
 ## Prerequisites on the NAS (phase 1)
 
@@ -62,8 +98,9 @@ openssl rand -hex 32
 ```sh
 scripts/deploy.sh
 ```
-With no `TUNNEL_TOKEN`, this starts **ollama + caddy** (LAN mode). Once
-`TUNNEL_TOKEN` is set it also starts **cloudflared**.
+With no `TUNNEL_TOKEN`, this starts **ollama + caddy + backend** (LAN mode). Once
+`TUNNEL_TOKEN` is set it also starts **cloudflared**. The backend image is built
+on the NAS (`--build`); no local Go toolchain is needed.
 
 ## Pull / swap models
 
@@ -103,6 +140,7 @@ deleting a line). Update the `@authed` matcher in the `Caddyfile` accordingly.
 ssh root@<nas-ip> "docker logs --tail 100 -f ollama"
 ssh root@<nas-ip> "docker logs --tail 100 -f caddy"
 ssh root@<nas-ip> "docker logs --tail 100 -f cloudflared"
+ssh root@<nas-ip> "docker logs --tail 100 -f backend"
 ```
 
 ## Phase 4 — DNS migration + Cloudflare Tunnel (user-driven)

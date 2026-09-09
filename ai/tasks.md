@@ -56,7 +56,30 @@ model management via `ollama` CLI over SSH.
 - [x] www/ mounted into caddy + synced by deploy.sh; Caddyfile + compose validated
 - [x] User added `chat.selected.systems` → `http://caddy:8080` as a second public hostname on the tunnel (orphan DNS record removed first)
 - [x] Deployed + verified: `https://chat.selected.systems/` returns 200 + HTML through the edge; `https://llm.selected.systems/v1/models` still 401 (API host pure)
-- [ ] Browser test: open https://chat.selected.systems, paste bearer token, stream a chat (user)
+
+## Phase 8 — Chat login + server-side history (backend) 🚧
+- [x] Plan approved: magic-link auth, Go backend, SQLite on NVMe, page calls same-origin /api/*
+- [x] `backend/` Go service (main, store, auth, email, handlers) + multi-stage Dockerfile (static binary, CGO off, modernc.org/sqlite)
+- [x] `docker-compose.yml`: `backend` service (:8081, no ports, internal network, SQLite volume); caddy depends_on backend
+- [x] `Caddyfile`: chat host routes `/api/*` → `backend:8081` (flush_interval -1), else serves `www/`; API host untouched
+- [x] `.env.example`: SESSION_SECRET, BREVO_API_KEY, APP_BASE_URL, MAIL_FROM, ALLOWED_EMAILS
+- [x] `scripts/deploy.sh`: sync `backend/`, mkdir `backend/data`, `up -d --build`
+- [x] `scripts/smoke-test.sh`: chat `/api/auth/me` + `/api/models` → 401 without session
+- [x] `www/index.html`: magic-link login screen, auth/me gate, sidebar history, same-origin /api/* with session cookie, persist after each turn
+- [ ] User: set SESSION_SECRET + BREVO_API_KEY + ALLOWED_EMAILS in `.env`; verify MAIL_FROM is a Brevo-verified sender
+- [ ] Deploy + browser test: request magic link, sign in, create chats across models, reload / second device → history resumes; delete + logout work
+- [ ] (Optional) Cloudflare WAF rate-limit rule on `chat.selected.systems` (mirror the llm host rule)
+
+## Phase 9 — Chat UI: folders, rename, timestamps, mobile drawer ✅
+- [x] Backend `store.go`: `folders` table + `conversations.folder_id` / `title_custom` columns; idempotent `migrate()` (PRAGMA table_info) upgrades existing DBs in place; `Folder` struct, `Message.Ts`, `Conversation.FolderID`/`TitleCustom`
+- [x] Backend store methods: `listFolders`/`createFolder`/`renameFolder`/`deleteFolder` (delete unassigns chats, never deletes them); `patchConversation` (title → title_custom=1, folderId "" → NULL, model); `updateConversation` now preserves a custom title across per-turn saves; list/get return folderId + titleCustom
+- [x] Backend handlers + routes: `GET/POST/PUT/DELETE /api/folders[/:id]`, `PATCH /api/conversations/{id}` (Caddy `/api/*` passes PATCH through; same-origin so no preflight)
+- [x] Frontend `www/index.html`: sidebar groups chats by folder with collapsible headers (state in localStorage) + an "Unsorted" group; new / rename / delete folder; per-chat `⋯` menu (Rename, Move to ▶, Delete)
+- [x] Frontend rename: inline `<input>` on the row title; Enter/blur saves via PATCH, Esc cancels
+- [x] Frontend timestamps: each new user/assistant message gets `ts=Date.now()`; `addMsg` renders an absolute timestamp by the role label; header shows the active chat's last-updated time; sidebar shows compact absolute time (today→HH:MM, this year→Sep 9, older→Sep 9, 2024) with the relative string as tooltip. Legacy messages have no ts and show none.
+- [x] Frontend mobile drawer: `☰` toggles open/close, `✕` button + scrim + Escape close, "+ New chat" and selecting a chat close it, body scroll locked while open
+- [x] Validated: backend Docker build (`go build`) clean; frontend JS `node --check` clean
+- [ ] User: redeploy via `scripts/deploy.sh` (new backend binary + static page); browser-test folders/rename/timestamps/drawer on mobile + desktop
 
 ---
 Phases 1–3 are fully reversible and touch nothing outside the NAS.

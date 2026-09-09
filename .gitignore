@@ -1,6 +1,12 @@
 # Secrets — never commit. Generate your own from .env.example.
 .env
 
+# Backend SQLite (chat history + users) — created at runtime, never commit.
+backend/data/
+*.db
+*.db-wal
+*.db-shm
+
 # macOS
 .DS_Store
 

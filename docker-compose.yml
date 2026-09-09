@@ -35,6 +35,7 @@ services:
     restart: unless-stopped
     depends_on:
       - ollama
+      - backend
     # Host port 8080 for LAN verification (phase 2). Avoid 9000 (UGOS console).
     # Optional hardening (phase 7): drop this mapping once the tunnel is up so
     # Caddy is reachable only by cloudflared over the internal network.
@@ -48,6 +49,26 @@ services:
       - ./www:/srv/chat:ro   # minimal chat UI
       - ${DOCKER_VOLUME}/docker/nas-llm/caddy/data:/data
       - ${DOCKER_VOLUME}/docker/nas-llm/caddy/config:/config
+    networks:
+      - internal
+
+  backend:
+    build: ./backend
+    container_name: backend
+    restart: unless-stopped
+    depends_on:
+      - ollama
+    # No ports: — only Caddy reaches it over the internal network.
+    environment:
+      SESSION_SECRET: ${SESSION_SECRET}
+      BREVO_API_KEY: ${BREVO_API_KEY}
+      APP_BASE_URL: ${APP_BASE_URL:-https://chat.selected.systems}
+      MAIL_FROM: ${MAIL_FROM:-noreply@selected.systems}
+      ALLOWED_EMAILS: ${ALLOWED_EMAILS:-}
+      DB_PATH: /data/nas-llm.db
+      OLLAMA_URL: http://ollama:11434
+    volumes:
+      - ${DOCKER_VOLUME}/docker/nas-llm/backend/data:/data
     networks:
       - internal
 

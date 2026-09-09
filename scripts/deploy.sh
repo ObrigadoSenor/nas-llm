@@ -22,10 +22,10 @@ REMOTE_DIR="${DOCKER_VOLUME}/docker/nas-llm"
 REMOTE="${NAS_USER}@${NAS_HOST}"
 
 echo "==> Syncing stack to ${REMOTE}:${REMOTE_DIR}"
-ssh "$REMOTE" "mkdir -p ${REMOTE_DIR}/ollama ${REMOTE_DIR}/caddy/data ${REMOTE_DIR}/caddy/config"
+ssh "$REMOTE" "mkdir -p ${REMOTE_DIR}/ollama ${REMOTE_DIR}/caddy/data ${REMOTE_DIR}/caddy/config ${REMOTE_DIR}/backend/data"
 # UGOS Pro ships a restricted rsync wrapper (ug_start_server) that rejects
 # /volume1/docker paths, so pipe the files over plain SSH with tar instead.
-tar -cf - -C "$ROOT_DIR" docker-compose.yml Caddyfile .env www \
+tar -cf - -C "$ROOT_DIR" docker-compose.yml Caddyfile .env www backend \
   | ssh "$REMOTE" "tar -xf - -C '${REMOTE_DIR}'"
 ssh "$REMOTE" "chmod 600 ${REMOTE_DIR}/.env"
 
@@ -33,11 +33,11 @@ COMPOSE=(docker compose --project-directory "$REMOTE_DIR" -f "$REMOTE_DIR/docker
 if [[ -n "${TUNNEL_TOKEN:-}" ]]; then
   # --profile must precede the subcommand on older compose (v2.26).
   COMPOSE+=(--profile tunnel)
-  echo "==> TUNNEL_TOKEN set: starting ollama + caddy + cloudflared"
+  echo "==> TUNNEL_TOKEN set: starting ollama + caddy + backend + cloudflared"
 else
-  echo "==> No TUNNEL_TOKEN: starting ollama + caddy only (LAN mode)"
+  echo "==> No TUNNEL_TOKEN: starting ollama + caddy + backend only (LAN mode)"
 fi
-COMPOSE+=(up -d)
+COMPOSE+=(up -d --build)
 
 echo "==> Bringing stack up on the NAS"
 ssh "$REMOTE" "${COMPOSE[*]}"

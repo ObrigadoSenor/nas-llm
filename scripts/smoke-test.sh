@@ -13,6 +13,8 @@ set -a; . "$SCRIPT_DIR/../.env"; set +a
 : "${OLLAMA_MODEL:=llama3.2:3b}"
 
 ENDPOINT="${ENDPOINT:-http://${NAS_HOST}:8080}"
+CHAT_BASE="${CHAT_BASE:-http://${NAS_HOST}:8080}"
+CHAT_HOST="${CHAT_HOST:-chat.selected.systems}"
 AUTH="Authorization: Bearer ${API_BEARER_TOKEN}"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 pass=0; fail=0
@@ -62,6 +64,12 @@ if [[ "$nmodels" -gt 0 ]]; then
 else
   echo "SKIP: streaming test (no models yet — run: scripts/pull-models.sh pull $OLLAMA_MODEL)"
 fi
+
+# 7. Chat /api/* requires a session -> 401 without a cookie
+code=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${CHAT_HOST}" "${CHAT_BASE}/api/auth/me")
+[[ "$code" == 401 ]] && ok "chat /api/auth/me rejects no session (401)" || bad "chat /api/auth/me expected 401 got $code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${CHAT_HOST}" "${CHAT_BASE}/api/models")
+[[ "$code" == 401 ]] && ok "chat /api/models rejects no session (401)" || bad "chat /api/models expected 401 got $code"
 
 echo
 echo "Results: $pass passed, $fail failed"

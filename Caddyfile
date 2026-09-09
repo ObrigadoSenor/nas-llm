@@ -54,14 +54,23 @@
 	}
 }
 
-	# Minimal chat UI — its own hostname through the tunnel, keeping
-# llm.selected.systems pure-API. The `http://` scheme disables Caddy's
-# automatic HTTPS (Cloudflare terminates TLS at the edge; Caddy only needs
-# plain HTTP for cloudflared, and auto-HTTPS would flip :8080 to TLS and break
-# the API listener). The page calls the API cross-origin; CORS (preflight bypass
-# + Access-Control-Allow-Origin: *) is configured on the :8080 block above.
-# The bearer token is entered in the browser (localStorage), never baked in.
+	# Chat UI + auth/history backend — its own hostname through the tunnel,
+	# keeping llm.selected.systems pure-API. The `http://` scheme disables Caddy's
+	# automatic HTTPS (Cloudflare terminates TLS at the edge; Caddy only needs
+	# plain HTTP for cloudflared, and auto-HTTPS would flip :8080 to TLS and break
+	# the API listener). Static files (www/) are served for everything except
+	# /api/*, which reverse-proxies to the Go backend (magic-link auth, SQLite
+	# chat history, and an Ollama proxy). The page calls /api/* same-origin with a
+	# session cookie, so the bearer token never reaches the browser.
 http://chat.selected.systems:8080 {
-	root * /srv/chat
-	file_server
+	@api path /api/*
+	handle @api {
+		reverse_proxy backend:8081 {
+			flush_interval -1
+		}
+	}
+	handle {
+		root * /srv/chat
+		file_server
+	}
 }
