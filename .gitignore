@@ -1,0 +1,8 @@
+# Secrets — never commit. Generate your own from .env.example.
+.env
+
+# macOS
+.DS_Store
+
+# Local scratch
+*.local

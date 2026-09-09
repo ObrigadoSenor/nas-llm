@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nas-llm</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#171a21; --border:#262a33; --text:#e6e8eb;
+    --muted:#8b929e; --accent:#4c8dff; --user:#2a3344;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,system-ui,Segoe UI,sans-serif;display:flex;flex-direction:column}
+  header{padding:10px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px}
+  header h1{font-size:15px;font-weight:600;margin:0}
+  .gap{flex:1}
+  select,button,input,textarea{font:inherit;color:var(--text);background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:6px 10px}
+  button{cursor:pointer}
+  button:hover:not(:disabled){border-color:var(--accent)}
+  button:disabled{opacity:.45;cursor:default}
+  #chat{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
+  .msg{max-width:760px;width:100%;margin:0 auto}
+  .msg .role{font-size:12px;color:var(--muted);margin-bottom:3px}
+  .msg .bubble{padding:10px 14px;border-radius:10px;white-space:pre-wrap;word-wrap:break-word}
+  .msg.user .bubble{background:var(--user)}
+  .msg.assistant .bubble{background:var(--panel);border:1px solid var(--border)}
+  .form{max-width:760px;width:100%;margin:0 auto;padding:12px 16px 16px;display:flex;gap:8px;align-items:flex-end}
+  .form textarea{flex:1;resize:none;min-height:44px;max-height:200px}
+  .settings{max-width:760px;width:100%;margin:0 auto;padding:16px}
+  .settings p{color:var(--muted);margin:0 0 8px;font-size:13px}
+  .settings .row{display:flex;gap:8px}
+  .settings input{flex:1}
+  .hidden{display:none}
+  .cursor{opacity:.55}
+</style>
+</head>
+<body>
+<header>
+  <h1>nas-llm</h1>
+  <div class="gap"></div>
+  <select id="model" title="model"></select>
+  <button id="clear" title="clear conversation">Clear</button>
+</header>
+<div id="chat"></div>
+<div class="form">
+  <textarea id="input" placeholder="Message…  (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
+  <button id="send">Send</button>
+</div>
+<div class="settings hidden" id="settings">
+  <p>Enter your API bearer token. It is stored only in this browser (localStorage) and sent only to your endpoint.</p>
+  <div class="row">
+    <input id="token" type="password" placeholder="Bearer token">
+    <button id="save">Save</button>
+  </div>
+</div>
+<script>
+const ENDPOINT = "https://llm.selected.systems"; // API host; page is on chat.selected.systems (cross-origin, CORS already configured)
+const $ = id => document.getElementById(id);
+const chat=$("chat"), input=$("input"), send=$("send"), modelSel=$("model"), clearBtn=$("clear");
+const settings=$("settings"), tokenEl=$("token"), saveBtn=$("save");
+
+let token = localStorage.getItem("nas-llm-token") || "";
+let models = JSON.parse(localStorage.getItem("nas-llm-models") || "[]");
+let selectedModel = localStorage.getItem("nas-llm-model") || "llama3.2:latest";
+let messages = [];
+
+// --- Retry with exponential backoff ---------------------------------------
+// Cloudflare's rate-limit (429) responses carry NO Access-Control-Allow-Origin
+// header, so a cross-origin fetch() that hits 429 is rejected by the browser as
+// an opaque TypeError ("Load failed" / "Failed to fetch") — we never see the
+// 429. Treat those network errors as retryable (backoff lets the window clear).
+// Also retry 429/5xx we can see. Fail fast on 401 (bad token) / other 4xx.
+const MAX_RETRIES = 4, BASE_DELAY = 1000, MAX_DELAY = 16000;
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
+function isRetryableErr(e){
+  const t=String(e&&e.message||e);
+  if(/load failed|failed to fetch|networkerror|network request failed/i.test(t)) return true;
+  if(e&&e.status===429) return true;
+  if(e&&e.status>=500 && e.status<600) return true;
+  return false;
+}
+function errText(e){
+  const t=String(e&&e.message||e);
+  if(/load failed|failed to fetch|networkerror/i.test(t))
+    return "could not reach the API (network or CORS block — likely Cloudflare rate-limiting)";
+  return t;
+}
+// fetch() with backoff. onRetry(attempt, delayMs) fires before each retry.
+async function fetchRetry(url, opts, {onRetry, label="request"}={}){
+  let lastErr;
+  for(let attempt=0; attempt<=MAX_RETRIES; attempt++){
+    let r, threw=false;
+    try{ r=await fetch(url, opts); }
+    catch(e){ threw=true; lastErr=e; }               // network/CORS failure
+    if(!threw){
+      if(r.ok) return r;
+      const err=new Error("HTTP "+r.status+(r.status===401?" — bad token?":""));
+      err.status=r.status;
+      if(!isRetryableErr(err)) throw err;            // 401/4xx -> fail fast
+      lastErr=err;
+    }
+    if(attempt===MAX_RETRIES) break;
+    const delay=Math.min(MAX_DELAY, BASE_DELAY*2**attempt) * (0.7+Math.random()*0.6); // 0.7–1.3x jitter
+    if(onRetry) onRetry(attempt+1, Math.round(delay));
+    await sleep(delay);
+  }
+  throw new Error(label+" failed after "+(MAX_RETRIES+1)+" attempts: "+errText(lastErr));
+}
+
+function needToken(){
+  if(!token){ settings.classList.remove("hidden"); send.disabled=true; return true; }
+  settings.classList.add("hidden"); send.disabled=false; return false;
+}
+function renderModels(){
+  modelSel.innerHTML="";
+  models.forEach(m=>{ const o=document.createElement("option"); o.value=o.textContent=m; modelSel.appendChild(o); });
+  if(models.length && !models.includes(selectedModel)) selectedModel=models[0];
+  modelSel.value=selectedModel;
+}
+modelSel.addEventListener("change", ()=>{ selectedModel=modelSel.value; localStorage.setItem("nas-llm-model",selectedModel); });
+saveBtn.addEventListener("click", ()=>{ token=tokenEl.value.trim(); localStorage.setItem("nas-llm-token",token); if(!needToken()) loadModels(); });
+clearBtn.addEventListener("click", ()=>{ messages=[]; chat.innerHTML=""; });
+
+function addMsg(role,text){
+  const d=document.createElement("div"); d.className="msg "+role;
+  const r=document.createElement("div"); r.className="role"; r.textContent=role==="user"?"you":"assistant";
+  const b=document.createElement("div"); b.className="bubble"; b.textContent=text;
+  d.appendChild(r); d.appendChild(b); chat.appendChild(d);
+  chat.scrollTop=chat.scrollHeight;
+  return b;
+}
+
+async function loadModels(){
+  const status=addMsg("assistant","");
+  try{
+    const r=await fetchRetry(ENDPOINT+"/v1/models",{headers:{Authorization:"Bearer "+token}},{
+      label:"Load models",
+      onRetry:(a,d)=>{ status.textContent="⏳ Loading models… rate-limited or network blip. Retrying in "+(d/1000).toFixed(0)+"s (attempt "+a+"/"+MAX_RETRIES+")."; }
+    });
+    status.remove();
+    const j=await r.json();
+    models=(j.data||[]).map(m=>m.id);
+    localStorage.setItem("nas-llm-models",JSON.stringify(models));
+    renderModels();
+  }catch(e){ status.textContent=String(e.message||e); }
+}
+
+async function stream(){
+  if(needToken()) return;
+  const text=input.value.trim();
+  if(!text||send.disabled) return;
+  input.value=""; input.style.height="auto";
+  messages.push({role:"user",content:text});
+  addMsg("user",text);
+  const bubble=addMsg("assistant","");
+  const cursor=document.createElement("span"); cursor.className="cursor"; cursor.textContent="▍";
+  bubble.appendChild(cursor);
+  send.disabled=true;
+  let acc="";
+  try{
+    const r=await fetchRetry(ENDPOINT+"/v1/chat/completions",{
+      method:"POST",
+      headers:{"Content-Type":"application/json",Authorization:"Bearer "+token},
+      body:JSON.stringify({model:selectedModel,stream:true,messages})
+    },{
+      label:"Chat",
+      onRetry:(a,d)=>{
+        bubble.textContent=(acc?acc+"\n":"")+"⏳ Rate-limited or network blip — retrying in "+(d/1000).toFixed(0)+"s (attempt "+a+"/"+MAX_RETRIES+")…";
+        bubble.appendChild(cursor);
+      }
+    });
+    const reader=r.body.getReader(), dec=new TextDecoder();
+    let buf="";
+    while(true){
+      const {value,done}=await reader.read();
+      if(done) break;
+      buf+=dec.decode(value,{stream:true});
+      const lines=buf.split("\n"); buf=lines.pop();
+      for(const ln of lines){
+        const s=ln.trim();
+        if(!s.startsWith("data: ")) continue;
+        const data=s.slice(6);
+        if(data==="[DONE]") continue;
+        try{ const o=JSON.parse(data); const d=o.choices?.[0]?.delta?.content; if(d) acc+=d; }catch{}
+      }
+      bubble.textContent=acc; bubble.appendChild(cursor);
+      chat.scrollTop=chat.scrollHeight;
+    }
+    if(!acc) bubble.textContent="(empty response)";
+    messages.push({role:"assistant",content:acc});
+  }catch(e){
+    bubble.textContent=acc||String(e.message||e);
+  }finally{
+    cursor.remove(); send.disabled=false; input.focus();
+  }
+}
+
+send.addEventListener("click",stream);
+input.addEventListener("keydown",e=>{ if(e.key==="Enter"&&!e.shiftKey){ e.preventDefault(); stream(); } });
+input.addEventListener("input",()=>{ input.style.height="auto"; input.style.height=input.scrollHeight+"px"; });
+
+if(token){ tokenEl.value=token; needToken(); loadModels(); } else { needToken(); renderModels(); }
+input.focus();
+</script>
+</body>
+</html>

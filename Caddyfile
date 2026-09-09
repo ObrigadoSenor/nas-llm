@@ -1,0 +1,67 @@
+# nas-llm Caddyfile — the entire security boundary in front of Ollama.
+#
+# Four load-bearing jobs (see notebook gotchas):
+#   1. Answer the CORS preflight BEFORE the bearer check (OPTIONS -> 204).
+#   2. Require `Authorization: Bearer <token>` -> 401 otherwise.
+#   3. Only proxy /v1/*; everything else 404s (Ollama mgmt routes unreachable).
+#   4. Rewrite Host -> localhost:11434, strip Origin, and disable buffering.
+
+(cors_headers) {
+	header {
+		Access-Control-Allow-Origin "{env.EXTENSION_ORIGIN}"
+		Access-Control-Allow-Methods "GET, POST, OPTIONS"
+		Access-Control-Allow-Headers "Authorization, Content-Type"
+		Access-Control-Max-Age "86400"
+	}
+}
+
+:8080 {
+	# 1. CORS preflight for the OpenAI surface. No auth, no proxy.
+	@preflight {
+		path /v1/*
+		method OPTIONS
+	}
+	handle @preflight {
+		import cors_headers
+		respond 204
+	}
+
+	# 2 + 3. /v1/* with a valid bearer token -> Ollama; else 401.
+	@openai path /v1/*
+	handle @openai {
+		@authed header Authorization "Bearer {env.API_BEARER_TOKEN}"
+		handle @authed {
+			import cors_headers
+			reverse_proxy ollama:11434 {
+				# Ollama 403s any Host that isn't localhost.
+				header_up Host localhost:11434
+				# Strip the inbound Origin so Ollama's own CORS check never fires.
+				header_up -Origin
+				# Stream tokens instead of buffering (also avoids Cloudflare 524).
+				flush_interval -1
+			}
+		}
+		handle {
+			import cors_headers
+			respond 401
+		}
+	}
+
+	# Everything else -> 404. Keeps /api/pull|create|delete|push off the internet.
+	handle {
+		import cors_headers
+		respond 404
+	}
+}
+
+	# Minimal chat UI — its own hostname through the tunnel, keeping
+# llm.selected.systems pure-API. The `http://` scheme disables Caddy's
+# automatic HTTPS (Cloudflare terminates TLS at the edge; Caddy only needs
+# plain HTTP for cloudflared, and auto-HTTPS would flip :8080 to TLS and break
+# the API listener). The page calls the API cross-origin; CORS (preflight bypass
+# + Access-Control-Allow-Origin: *) is configured on the :8080 block above.
+# The bearer token is entered in the browser (localStorage), never baked in.
+http://chat.selected.systems:8080 {
+	root * /srv/chat
+	file_server
+}

@@ -1,0 +1,70 @@
+# nas-llm — single secure public OpenAI-compatible endpoint for the
+# UGREEN NASync DXP2800 (Intel N100, 8 GB).
+#
+# Three containers on one internal Docker network. Ollama is NEVER published
+# to the host: only Caddy can reach it, and only /v1/* is exposed.
+#
+# Phased deploy:
+#   - Phase 2 (LAN):  `docker compose up -d`              -> ollama + caddy
+#   - Phase 4 (tunnel): set TUNNEL_TOKEN in .env, then
+#                       `docker compose --profile tunnel up -d`  -> + cloudflared
+# deploy.sh enables the tunnel profile automatically when TUNNEL_TOKEN is set.
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    # NO `ports:` mapping. Port 11434 is reachable only inside the `internal`
+    # network. OLLAMA_HOST=0.0.0.0 binds inside the container namespace only;
+    # because nothing is published, the host and LAN cannot reach it.
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+      OLLAMA_MAX_LOADED_MODELS: 1
+      OLLAMA_NUM_PARALLEL: 1
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-24h}
+      OLLAMA_CONTEXT_LENGTH: ${OLLAMA_CONTEXT_LENGTH:-16384}
+    volumes:
+      - ${DOCKER_VOLUME}/docker/nas-llm/ollama:/root/.ollama
+    networks:
+      - internal
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    restart: unless-stopped
+    depends_on:
+      - ollama
+    # Host port 8080 for LAN verification (phase 2). Avoid 9000 (UGOS console).
+    # Optional hardening (phase 7): drop this mapping once the tunnel is up so
+    # Caddy is reachable only by cloudflared over the internal network.
+    ports:
+      - "8080:8080"
+    environment:
+      API_BEARER_TOKEN: ${API_BEARER_TOKEN}
+      EXTENSION_ORIGIN: ${EXTENSION_ORIGIN:-*}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./www:/srv/chat:ro   # minimal chat UI
+      - ${DOCKER_VOLUME}/docker/nas-llm/caddy/data:/data
+      - ${DOCKER_VOLUME}/docker/nas-llm/caddy/config:/config
+    networks:
+      - internal
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    restart: unless-stopped
+    # Only started with `--profile tunnel` (phase 4, once TUNNEL_TOKEN is set).
+    profiles: ["tunnel"]
+    command: ["--no-autoupdate", "tunnel", "run"]
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN}
+    depends_on:
+      - caddy
+    networks:
+      - internal
+
+networks:
+  internal:
+    driver: bridge
