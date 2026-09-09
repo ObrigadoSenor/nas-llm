@@ -136,7 +136,7 @@
     </header>
     <div id="chat"></div>
     <div class="form">
-      <textarea id="input" placeholder="Message…  (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
+      <textarea id="input" placeholder="" rows="1"></textarea>
       <button id="send">Send</button>
     </div>
   </main>
@@ -295,12 +295,9 @@ function renderFolder(f, convs){
   if(f){
     name.textContent=f.name;
     head.appendChild(chev); head.appendChild(name);
-    const acts=document.createElement("div"); acts.style.display="flex"; acts.style.gap="2px";
-    const rn=document.createElement("button"); rn.className="folder-act"; rn.textContent="✎"; rn.title="Rename folder";
-    rn.addEventListener("click",e=>{ e.stopPropagation(); startFolderRename(f,name); });
-    const df=document.createElement("button"); df.className="folder-act"; df.textContent="🗑"; df.title="Delete folder";
-    df.addEventListener("click",async e=>{ e.stopPropagation(); await deleteFolder(f.id, f.name); });
-    acts.appendChild(rn); acts.appendChild(df); head.appendChild(acts);
+    const more=document.createElement("button"); more.className="folder-act"; more.textContent="⋯"; more.title="More";
+    more.addEventListener("click",e=>{ e.stopPropagation(); openFolderMenu(f, more, name); });
+    head.appendChild(more);
     head.addEventListener("click",()=>{ collapsedFolders[f.id]=!collapsedFolders[f.id]; saveCollapsed(); renderSidebar(); });
   } else {
     chev.style.visibility="hidden";
@@ -346,6 +343,22 @@ function openConvMenu(c, anchor){
   const sep1=document.createElement("div"); sep1.className="sep";
   const sep2=document.createElement("div"); sep2.className="sep";
   m.appendChild(rename); m.appendChild(sep1); m.appendChild(move); m.appendChild(sep2); m.appendChild(del);
+  document.body.appendChild(m);
+  const r=anchor.getBoundingClientRect();
+  m.style.left=Math.min(r.left, window.innerWidth-m.offsetWidth-8)+"px";
+  m.style.top=(r.bottom+4)+"px";
+  openMenu=m;
+  setTimeout(()=>document.addEventListener("click",closeMenu),0);
+}
+function openFolderMenu(f, anchor, name){
+  closeMenu();
+  const m=document.createElement("div"); m.className="menu";
+  const rename=document.createElement("button"); rename.textContent="Rename";
+  rename.addEventListener("click",e=>{ e.stopPropagation(); closeMenu(); startFolderRename(f, name); });
+  const sep=document.createElement("div"); sep.className="sep";
+  const del=document.createElement("button"); del.textContent="Delete";
+  del.addEventListener("click",async e=>{ e.stopPropagation(); closeMenu(); await deleteFolder(f.id, f.name); });
+  m.appendChild(rename); m.appendChild(sep); m.appendChild(del);
   document.body.appendChild(m);
   const r=anchor.getBoundingClientRect();
   m.style.left=Math.min(r.left, window.innerWidth-m.offsetWidth-8)+"px";
