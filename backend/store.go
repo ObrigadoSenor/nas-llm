@@ -15,7 +15,18 @@ import (
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
-	Ts      int64  `json:"ts,omitempty"`
+	// Images holds base64 data URLs attached to a vision turn (e.g. gemma3:4b).
+	// Empty for text-only messages, so existing stored conversations round-trip
+	// unchanged. Persisted inline in the messages JSON blob.
+	Images []string    `json:"images,omitempty"`
+	Ts     int64       `json:"ts,omitempty"`
+	Search *searchMeta `json:"search,omitempty"`
+	// Clarify, when set on an assistant turn, marks it as a clarifying question
+	// from the agent loop and carries the structured question/options card for
+	// the UI. The question text is also stored in Content so the model has
+	// context for the user's follow-up answer on the next round. Rides in the
+	// messages JSON blob; omitempty keeps existing rows byte-identical.
+	Clarify *clarifyMeta `json:"clarify,omitempty"`
 }
 
 type Conversation struct {
@@ -99,6 +110,13 @@ CREATE TABLE IF NOT EXISTS jobs (
 	finished_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_conv ON jobs(conversation_id);
+CREATE TABLE IF NOT EXISTS model_benchmarks (
+	model TEXT PRIMARY KEY,
+	tok_per_sec REAL NOT NULL DEFAULT 0,
+	prompt_tok_per_sec REAL NOT NULL DEFAULT 0,
+	load_ms INTEGER NOT NULL DEFAULT 0,
+	evaluated_at INTEGER NOT NULL DEFAULT 0
+);
 `
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("schema: %w", err)
@@ -110,6 +128,34 @@ CREATE INDEX IF NOT EXISTS idx_jobs_conv ON jobs(conversation_id);
 		return nil, fmt.Errorf("reconcile jobs: %w", err)
 	}
 	return &store{db: db}, nil
+}
+
+// upsertBenchmark records (or replaces) the last measured benchmark for a model.
+func (s *store) upsertBenchmark(model string, tokPerSec, promptTokPerSec float64, loadMs int64) error {
+	_, err := s.db.Exec(`INSERT INTO model_benchmarks(model, tok_per_sec, prompt_tok_per_sec, load_ms, evaluated_at)
+		VALUES(?, ?, ?, ?, ?)
+		ON CONFLICT(model) DO UPDATE SET tok_per_sec=excluded.tok_per_sec,
+			prompt_tok_per_sec=excluded.prompt_tok_per_sec, load_ms=excluded.load_ms,
+			evaluated_at=excluded.evaluated_at`,
+		model, tokPerSec, promptTokPerSec, loadMs, time.Now().UnixMilli())
+	return err
+}
+
+// getBenchmark returns the last measured benchmark for a model, or nil if none.
+func (s *store) getBenchmark(model string) *benchmark {
+	var b benchmark
+	var tok, ptok float64
+	var loadMs int64
+	err := s.db.QueryRow(`SELECT tok_per_sec, prompt_tok_per_sec, load_ms, evaluated_at FROM model_benchmarks WHERE model = ?`, model).
+		Scan(&tok, &ptok, &loadMs, &b.EvaluatedAt)
+	if err != nil {
+		return nil
+	}
+	b.Model = model
+	b.TokPerSec = tok
+	b.PromptTokPerSec = ptok
+	b.LoadMs = loadMs
+	return &b
 }
 
 // migrate adds columns to pre-existing conversations tables (a no-op for fresh

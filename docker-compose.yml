@@ -69,6 +69,11 @@ services:
       DB_PATH: /data/nas-llm.db
       OLLAMA_URL: http://ollama:11434
       SEARXNG_URL: ${SEARXNG_URL:-http://searxng:8080}
+      # Model-management fit/perf guidance. OLLAMA_CONTEXT_LENGTH must mirror the
+      # ollama service value above so the backend estimates KV-cache RAM correctly.
+      OLLAMA_CONTEXT_LENGTH: ${OLLAMA_CONTEXT_LENGTH:-16384}
+      NAS_RAM_GB: ${NAS_RAM_GB:-8}
+      NAS_SYSTEM_RESERVE_GB: ${NAS_SYSTEM_RESERVE_GB:-1.5}
     volumes:
       - ${DOCKER_VOLUME}/docker/nas-llm/backend/data:/data
     networks:

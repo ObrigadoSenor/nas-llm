@@ -348,9 +348,7 @@ func buildProxy(rawurl, path string) http.Handler {
 	}
 }
 
-func (s *server) handleModels(w http.ResponseWriter, r *http.Request) {
-	s.modelsProxy.ServeHTTP(w, r)
-}
+// handleModels and the model-management routes live in models.go.
 
 func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
@@ -379,17 +377,27 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 // --- Background generation (chat UI) ---
 
 type jobState struct {
-	ID        string `json:"id"`
-	Status    string `json:"status"`
-	Content   string `json:"content"`
-	Error     string `json:"error,omitempty"`
-	WebSearch bool   `json:"webSearch"`
-	CreatedAt int64  `json:"createdAt"`
+	ID        string        `json:"id"`
+	Status    string        `json:"status"`
+	Content   string        `json:"content"`
+	Error     string        `json:"error,omitempty"`
+	WebSearch bool          `json:"webSearch"`
+	Clarify   bool          `json:"clarify,omitempty"`
+	CreatedAt int64         `json:"createdAt"`
+	Searches  []searchEntry `json:"searches,omitempty"`
+	Questions *clarifyMeta  `json:"questions,omitempty"`
 }
 
 func jobStateFrom(j *job) jobState {
 	st, content, errMsg := j.snapshot()
-	return jobState{ID: j.id, Status: st, Content: content, Error: errMsg, WebSearch: j.webSearch, CreatedAt: j.createdAt}
+	cq := j.clarifySnapshot()
+	// For a clarifying turn, surface the question text as content (matches what
+	// gets persisted) so a /job first paint shows the question, not streamed
+	// preamble.
+	if cq != nil {
+		content = clarifyAsContent(cq)
+	}
+	return jobState{ID: j.id, Status: st, Content: content, Error: errMsg, WebSearch: j.webSearch, Clarify: cq != nil, CreatedAt: j.createdAt, Searches: j.searchSnapshot(), Questions: cq}
 }
 
 // handleGenerate persists the user's turn and enqueues a detached background
@@ -403,6 +411,7 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		Model     string    `json:"model"`
 		Messages  []Message `json:"messages"`
 		WebSearch bool      `json:"web_search"`
+		Clarify   bool      `json:"clarify"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, "invalid request", http.StatusBadRequest)
@@ -436,7 +445,7 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	j := newJob(convID, email, body.Model, body.WebSearch)
+	j := newJob(convID, email, body.Model, body.WebSearch, body.Clarify)
 	if err := s.jobs.enqueue(j); err != nil {
 		if errors.Is(err, errJobActive) {
 			if existing := s.jobs.get(convID); existing != nil {
@@ -526,8 +535,24 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// live chunks. This makes reconnects correct (no double-counting).
 	pdata, _ := json.Marshal(prefix)
 	writeSSE("event: reset\ndata: " + string(pdata) + "\n\n")
-	// If the job is still queued behind another, hint it so the UI can say so.
-	if st, _, _ := j.snapshot(); st == "queued" {
+	// Replay any web-search evidence accumulated so far as one "searches" event
+	// so a reconnect/reload re-paints the query + source links.
+	if searches := j.searchSnapshot(); len(searches) > 0 {
+		sdata, _ := json.Marshal(searches)
+		writeSSE("event: searches\ndata: " + string(sdata) + "\n\n")
+	}
+	// Replay any clarifying question(s) stashed so far so a reconnect/reload
+	// re-paints the clickable option card.
+	if cq := j.clarifySnapshot(); cq != nil {
+		qdata, _ := json.Marshal(cq)
+		writeSSE("event: questions\ndata: " + string(qdata) + "\n\n")
+	}
+	// Replay the current phase hint. A queued job reports "queued"; a generating
+	// web-search job may have already fired "searching" before this stream opened,
+	// so replay the stored phase so the UI shows the right waiting state on connect.
+	if ph := j.phaseSnapshot(); ph != "" {
+		writeSSE("event: phase\ndata: " + ph + "\n\n")
+	} else if st, _, _ := j.snapshot(); st == "queued" {
 		writeSSE("event: phase\ndata: queued\n\n")
 	}
 
@@ -559,6 +584,12 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	flushPhase := func(text string) {
 		writeSSE("event: phase\ndata: " + text + "\n\n")
 	}
+	flushSearch := func(text string) {
+		writeSSE("event: search\ndata: " + text + "\n\n")
+	}
+	flushQuestions := func(text string) {
+		writeSSE("event: questions\ndata: " + text + "\n\n")
+	}
 	flushError := func(text string) {
 		d, _ := json.Marshal(text)
 		writeSSE("event: joberror\ndata: " + string(d) + "\n\n")
@@ -574,6 +605,10 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 				flushChunk(ev.text)
 			case "phase":
 				flushPhase(ev.text)
+			case "search":
+				flushSearch(ev.text)
+			case "questions":
+				flushQuestions(ev.text)
 			case "done":
 				writeSSE("event: done\ndata: \n\n")
 				return
@@ -593,6 +628,10 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 						flushChunk(ev.text)
 					case "phase":
 						flushPhase(ev.text)
+					case "search":
+						flushSearch(ev.text)
+					case "questions":
+						flushQuestions(ev.text)
 					case "done":
 						writeSSE("event: done\ndata: \n\n")
 						return
