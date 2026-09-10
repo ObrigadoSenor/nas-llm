@@ -166,26 +166,19 @@ picked up by `up -d` — restart the container after a deploy that changes it:
 ssh root@<nas-ip> "docker restart searxng"
 ```
 
-### Pending: web-search speedup + Stop button (commits 2131e9a, b1949e3)
+### Deployed: web-search speedup + Stop button (commits 2131e9a, b1949e3)
 
-These are committed but **not yet deployed/verified** (NAS SSH was unstable
-during the session). Once SSH is back up:
+Deployed and smoke-tested (16/16, incl. a new `/api/conversations/{id}/cancel`
+401 check). The rebuilt backend, updated `www/`, and SearXNG `outgoing` timeout
+bounds are live. Remaining is a manual browser test on
+https://chat.selected.systems (needs a magic-link session, so it can't run from
+the CLI):
 
-```sh
-# 1. Deploy the rebuilt backend + new www/ + updated searxng settings
-scripts/deploy.sh
-ssh root@<nas-ip> "docker restart searxng"   # settings.yml changed
-
-# 2. Smoke test — expect 16/16 (added a /cancel 401 check)
-scripts/smoke-test.sh
-
-# 3. Browser test on https://chat.selected.systems (hard-refresh first):
-#    a) Speed: 🌐 on, ask a time-sensitive question — expect 🔍 searching: <query>
-#       then a cited answer sooner than before (one round, not up to three).
-#    b) Stop: send a question, click ⏹ Stop mid-generation — the reply halts and
-#       the partial text is saved; send again → works normally.
-#    c) Confirm https://llm.selected.systems/v1/models still 401 (pure-API host).
-```
+- **Speed:** 🌐 on, ask a time-sensitive question — expect `🔍 searching: <query>`
+  then a cited answer sooner than before (one round, not up to three).
+- **Stop:** send a question, click ⏹ Stop mid-generation — the reply halts and
+  the partial text is saved; send again → works normally.
+- Confirm https://llm.selected.systems/v1/models still 401 (pure-API host).
 
 Optional: set `MAX_SEARCH_ROUNDS=2` in `.env` + redeploy if single-round answers
 feel too shallow for multi-part questions.
