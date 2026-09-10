@@ -96,8 +96,11 @@ with you.
 The chat page has a 🌐 toggle. When on, the backend gives the model a
 `web_search` tool and runs a small loop: the model emits one search query, the
 backend queries the internal SearXNG (`http://searxng:8080/search?format=json`,
-top 3 results, snippets trimmed to ~200 chars), feeds them back, and streams a
-cited answer — one search round (env-tunable: `MAX_SEARCH_ROUNDS`, default 1).
+top 3 results, snippets trimmed to ~200 chars), feeds them back, and streams
+back a cited answer. The whole loop is streamed, including the first model pass
+that decides whether to search — so the model's thinking and any direct
+(no-search) answer reach the page as they're produced, not after the pass
+completes (PR #4). One search round (env-tunable: `MAX_SEARCH_ROUNDS`, default 1).
 The query is echoed to the page as `🔍 searching: <query>` while it runs. This
 rides the existing `chat.selected.systems` → backend path; the pure-API host
 `llm.selected.systems` is untouched and the extension is unaffected.
@@ -193,6 +196,32 @@ Remaining (manual, needs a magic-link session on https://chat.selected.systems):
 
 Optional: set `MAX_SEARCH_ROUNDS=2` in `.env` + redeploy if single-round answers
 feel too shallow for multi-part questions.
+
+### Shipped: streamed web_search tool-call pass (PR #4, merged to `main`)
+
+The tool-calling pass previously ran non-streaming, so nothing reached the page
+until that whole response completed. It now streams
+(`streamOllamaChatWithTools` in `search.go`): the model's preamble — or a full
+answer when it decides **not** to search — reaches the UI as it is produced.
+Time-to-first-token drops to ~first token instead of full-response. The
+searching path's *total* latency is unchanged: Ollama buffers the tool-call JSON
+and emits it only once that pass completes, so the search fires at the same
+moment as before; the SSE keepalive guarding against the Cloudflare 100 s edge
+timeout (524) is unchanged.
+
+Tool calls are accumulated by id/arrival order, not by `index`, so accumulation
+stays correct even when Ollama emits `index:0` for every call in a multi-call
+response. The two model passes can't be parallelized: the answer pass needs the
+tool-call pass's search results in context, and `OLLAMA_NUM_PARALLEL=1`
+serializes Ollama requests regardless; per-round searches were already
+concurrent.
+
+Verified on the NAS (🌐 on, `qwen3:1.7b`, "latest stable Python version"):
+587 content chunks streamed incrementally — first token 7.36 s, spread across
+7.36 s → 83 s; SearXNG fanned the query to Google/Bing/DuckDuckGo and the cited
+answer referenced a Python version beyond the model's training cutoff.
+`llama3.1:8b` works too but is slow to demonstrate on the N100 (≈28 s cold load
++ CPU-rate generation); the streaming is model-independent.
 
 ## Model management
 
