@@ -225,6 +225,34 @@ reload or tab close — reopen the panel and it reattaches. The pure-API host
 `llm.selected.systems` and the browser extension are unaffected; everything
 rides the existing session-cookie `/api/*` surface.
 
+### Performance metrics (benchmarking)
+
+Every pull **auto-benchmarks**: once the download finishes, the backend runs a
+short 64-token generation against the new model and persists the measured
+tok/s before signaling "done" — so the Installed card shows real performance
+immediately, with no extra click. The progress bar shows a "Benchmarking…"
+phase while this runs. A benchmark failure (e.g. an unloadable model) is
+non-fatal: the pull still succeeds. You can re-benchmark any installed model
+at any time with the **Benchmark** button.
+
+The measured tok/s (`eval_count / eval_duration × 1e⁹`), prompt tok/s, and
+load time are stored in SQLite (`model_benchmarks`) and surfaced on the
+Installed card, the Details panel, and `GET /api/models`.
+
+The catalog's **estimated tok/s ranges are calibrated from measured N100
+benchmarks** (not vendor specs), so the pre-download "will it run slow"
+guidance is realistic. Measured sample (Q4_K_M, 8192-token context):
+
+| Model | Est. tok/s | Measured |
+|-------|------------|----------|
+| `llama3.2:1b` | — | ~16 tok/s |
+| `qwen3:1.7b` | 10–16 | ~12–16 tok/s |
+| `llama3.2:3b` | 7–11 | ~8–10 tok/s |
+| `llama3.1:8b` | 2–4 | ~3 tok/s |
+
+Estimates are deliberately conservative (a range, not a point) — always
+benchmark for the definitive number on your specific hardware and load.
+
 Fit guidance env (`.env`, with safe defaults so existing deploys keep working):
 
 | Var | Default | Purpose |
