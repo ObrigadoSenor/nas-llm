@@ -466,8 +466,12 @@ func (s *server) runGeneration(j *job) error {
 	}
 
 	msgs := make([]oaiMessage, len(conv.Messages))
+	hasImages := false
 	for i, m := range conv.Messages {
 		msgs[i] = oaiMessage{Role: m.Role, Content: messageContent(m)}
+		if len(m.Images) > 0 {
+			hasImages = true
+		}
 	}
 
 	if j.webSearch {
@@ -475,11 +479,29 @@ func (s *server) runGeneration(j *job) error {
 			// Toggle was on but no SearXNG backend configured: surface it instead
 			// of silently answering as if search were off.
 			j.emitSearch(searchEntry{Skipped: true, Reason: "web search not configured"})
+			j.emitPhase(phaseForImages(hasImages))
 			return s.runStreamPass(ctx, j.model, msgs, j.emitChunk)
 		}
 		return s.runSearchLoop(ctx, j.model, msgs, j.emitChunk, j.emitPhase, j.emitSearch)
 	}
+	// Plain turn: emit an honest phase so a connect-time "queued" hint clears as
+	// soon as the worker starts the job. A vision turn reports "vision" — the
+	// SigLIP encoder runs before the first token, which takes tens of seconds on
+	// the N100, so without this the stale "queued" label (set at enqueue) would
+	// mislead the user into thinking another reply is blocking. A text turn
+	// reports "answering". The web-search path emits its own "searching" phase.
+	j.emitPhase(phaseForImages(hasImages))
 	return s.runStreamPass(ctx, j.model, msgs, j.emitChunk)
+}
+
+// phaseForImages returns the generation phase hint for a non-search turn:
+// "vision" when the turn carries images (the vision encoder runs before the
+// first token), otherwise "answering".
+func phaseForImages(hasImages bool) string {
+	if hasImages {
+		return "vision"
+	}
+	return "answering"
 }
 
 // runStreamPass streams a plain (no-tools) completion from Ollama, emitting

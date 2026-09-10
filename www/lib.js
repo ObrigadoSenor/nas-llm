@@ -32,6 +32,7 @@ const ICONS = {
   'stop':        '<rect width="13" height="13" x="5.5" y="5.5" rx="2" fill="currentColor" stroke="none"/>',
   'plus':        '<path d="M5 12h14"/><path d="M12 5v14"/>',
   'paperclip':   '<path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 17.93 8.83l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/>',
+  'image':       '<rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/>',
 };
 
 // Render an icon by name. Returns an SVG string (currentColor stroke).
@@ -290,14 +291,22 @@ export class StreamRenderer {
   }
 
   _statusEl() {
-    // The bubble's waiting state shows only generic thinking dots. Search-
-    // specific "Searching the web…" text lives in the evidence block above
-    // (showSearchPending), so we don't duplicate it here.
+    // The bubble's waiting state reflects the job's phase hint. "queued" is the
+    // only true wait (another reply holds the single generation slot); "vision"
+    // means the model is encoding an attached image before the first token
+    // (slow on the N100). Search-specific "Searching the web…" text lives in
+    // the evidence block above (showSearchPending), not here.
     const wrap = document.createElement('span');
     wrap.className = 'status';
     if (this.phase === 'queued') {
       const ic = document.createElement('span'); ic.className = 'status-ic'; ic.innerHTML = icon('clock', 15);
       const t = document.createElement('span'); t.textContent = 'Queued — another reply is generating…';
+      wrap.appendChild(ic); wrap.appendChild(t);
+      return wrap;
+    }
+    if (this.phase === 'vision') {
+      const ic = document.createElement('span'); ic.className = 'status-ic'; ic.innerHTML = icon('image', 15);
+      const t = document.createElement('span'); t.textContent = 'Analyzing image…';
       wrap.appendChild(ic); wrap.appendChild(t);
       return wrap;
     }
