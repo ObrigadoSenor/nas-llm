@@ -45,6 +45,7 @@
       <span id="chatMeta"></span>
       <div class="gap"></div>
       <select id="model" title="model"></select>
+      <button id="manageModels" title="Manage models"></button>
     </header>
     <div id="chat"></div>
     <div class="form">
@@ -53,6 +54,24 @@
       <button id="send"></button>
     </div>
   </main>
+</div>
+
+<div id="modelsModal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h2>Models</h2>
+      <div class="gap"></div>
+      <button id="closeModels" title="Close"></button>
+    </div>
+    <div class="modal-tabs">
+      <button id="tabInstalled" class="modal-tab active">Installed</button>
+      <button id="tabBrowse" class="modal-tab">Browse</button>
+    </div>
+    <div class="modal-body">
+      <div id="pullStatus" class="pull-status hidden"></div>
+      <div id="tabBody"></div>
+    </div>
+  </div>
 </div>
 
 <script type="module" src="app.js"></script>

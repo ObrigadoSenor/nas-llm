@@ -348,9 +348,7 @@ func buildProxy(rawurl, path string) http.Handler {
 	}
 }
 
-func (s *server) handleModels(w http.ResponseWriter, r *http.Request) {
-	s.modelsProxy.ServeHTTP(w, r)
-}
+// handleModels and the model-management routes live in models.go.
 
 func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)

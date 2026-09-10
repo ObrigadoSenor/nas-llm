@@ -1,6 +1,6 @@
 // nas-llm chat UI — app logic, split out of the old single-file index.html.
 // Imports UI helpers (icons, markdown rendering) from lib.js. No build step.
-import { icon, setIcon, renderMessage, escapeHtml, StreamRenderer } from './lib.js';
+import { icon, setIcon, renderMessage, escapeHtml, StreamRenderer, thinkingDots } from './lib.js';
 
 const $ = id => document.getElementById(id);
 const app=$("app"), loginView=$("login");
@@ -20,6 +20,8 @@ setIcon($("menuBtn"), "menu", 18);
 setIcon($("searchToggle"), "globe", 18);
 setIcon($("send"), "send", 16); $("send").setAttribute("aria-label", "Send");
 setIcon($("logout"), "logout", 15); $("logout").insertAdjacentHTML("beforeend", '<span>Log out</span>');
+setIcon($("manageModels"), "boxes", 16); $("manageModels").setAttribute("aria-label", "Manage models");
+setIcon($("closeModels"), "close", 18);
 
 let me = null;                 // {email} once logged in
 let models = [];
@@ -637,6 +639,288 @@ function absTimeFull(ms){
 function fmtTs(ms){
   if(!ms) return "";
   return new Date(ms).toLocaleString([], {month:"short", day:"numeric", hour:"2-digit", minute:"2-digit"});
+}
+
+// --- Models panel (download / remove / benchmark / fit guidance) --------------
+let modelsTab = "installed";
+let pullES = null;       // EventSource tail for the active pull
+let pullEls = null;      // {fill, phase, bytes, cancel} refs into #pullStatus
+let pullJobModel = null; // model name of the active pull (for UI)
+
+$("manageModels").addEventListener("click", openModelsPanel);
+$("closeModels").addEventListener("click", closeModelsPanel);
+$("tabInstalled").addEventListener("click", ()=>switchTab("installed"));
+$("tabBrowse").addEventListener("click", ()=>switchTab("browse"));
+$("modelsModal").addEventListener("click", e=>{ if(e.target===$("modelsModal")) closeModelsPanel(); });
+document.addEventListener("keydown", e=>{ if(e.key==="Escape" && !$("modelsModal").classList.contains("hidden")) closeModelsPanel(); });
+
+function openModelsPanel(){ $("modelsModal").classList.remove("hidden"); switchTab(modelsTab, true); }
+function closeModelsPanel(){
+  $("modelsModal").classList.add("hidden");
+  if(pullES){ pullES.close(); pullES=null; } // pull keeps running on the NAS; reattach on reopen
+  pullEls=null;
+}
+async function switchTab(tab){
+  modelsTab=tab;
+  $("tabInstalled").classList.toggle("active", tab==="installed");
+  $("tabBrowse").classList.toggle("active", tab==="browse");
+  if(tab==="installed") await renderInstalledTab(); else await renderBrowseTab();
+}
+
+async function renderInstalledTab(){
+  const body=$("tabBody"); body.innerHTML="";
+  let data;
+  try{ const r=await fetchRetry("/api/models",{},{label:"Load models"}); data=await r.json(); }
+  catch(e){ body.appendChild(mutedNote("Could not load models: "+errText(e))); await resumePullIfActive(); return; }
+  const list=data.data||[];
+  models=list.map(m=>m.id); renderModels();           // keep the header selector in sync
+  if(!list.length){ body.appendChild(mutedNote("No models installed yet. Go to Browse to download one.")); }
+  else list.forEach(m=>body.appendChild(renderInstalledCard(m)));
+  await resumePullIfActive();
+}
+
+function renderInstalledCard(m){
+  const card=document.createElement("div"); card.className="mcard";
+  const d=m.details||{};
+  const head=document.createElement("div"); head.className="mcard-head";
+  const title=document.createElement("div"); title.className="mcard-title"; title.textContent=m.name;
+  const sub=document.createElement("div"); sub.className="mcard-sub";
+  const bits=[d.parameter_size, d.quantization_level, d.family].filter(Boolean);
+  if(m.sizeGB) bits.push(m.sizeGB.toFixed(1)+" GB");
+  sub.textContent=bits.join(" · ");
+  head.appendChild(title); head.appendChild(sub); card.appendChild(head);
+
+  const meta=document.createElement("div"); meta.className="mcard-meta";
+  if(m.benchmark && m.benchmark.tokPerSec>0){
+    meta.appendChild(badge(`${m.benchmark.tokPerSec.toFixed(1)} tok/s (measured)`, "speed-fast"));
+    const s=document.createElement("span"); s.className="muted bench-sub";
+    s.textContent=`load ${m.benchmark.loadMs||0}ms · prompt ${(m.benchmark.promptTokPerSec||0).toFixed(1)} tok/s`;
+    meta.appendChild(s);
+  } else {
+    meta.appendChild(badge("not benchmarked", ""));
+  }
+  card.appendChild(meta);
+
+  const actions=document.createElement("div"); actions.className="mcard-actions";
+  const use=document.createElement("button"); use.textContent="Use"; use.addEventListener("click",()=>useModel(m.name));
+  const bench=document.createElement("button"); bench.textContent="Benchmark"; bench.addEventListener("click",()=>benchmarkModel(m.name, meta));
+  const det=document.createElement("button"); det.textContent="Details"; det.addEventListener("click",()=>toggleDetails(m.name, card));
+  const rm=document.createElement("button"); rm.textContent="Remove"; rm.className="danger";
+  rm.addEventListener("click",()=>deleteModel(m.name, card));
+  if(activeId && generatingIds.has(activeId) && selectedModel===m.name) rm.disabled=true;
+  actions.appendChild(use); actions.appendChild(bench); actions.appendChild(det); actions.appendChild(rm);
+  card.appendChild(actions);
+  return card;
+}
+
+async function renderBrowseTab(){
+  const body=$("tabBody"); body.innerHTML="";
+  const pbn=document.createElement("div"); pbn.className="pullbyname";
+  const hint=document.createElement("span"); hint.className="muted"; hint.textContent="Pull any model by name (e.g. mistral:7b, llama3.2:1b):";
+  const row=document.createElement("div"); row.className="row";
+  const inp=document.createElement("input"); inp.placeholder="model:tag";
+  const go=document.createElement("button"); go.textContent="Download";
+  go.addEventListener("click",()=>{ const v=inp.value.trim(); if(v) startPull(v); });
+  inp.addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault(); go.click(); } });
+  row.appendChild(inp); row.appendChild(go); pbn.appendChild(hint); pbn.appendChild(row); body.appendChild(pbn);
+
+  let data;
+  try{ const r=await fetchRetry("/api/models/catalog",{},{label:"Load catalog"}); data=await r.json(); }
+  catch(e){ body.appendChild(mutedNote("Could not load catalog.")); await resumePullIfActive(); return; }
+  const nas=data.nas||{};
+  const note=document.createElement("div"); note.className="catalog-note muted";
+  note.textContent=`Fit is estimated for ${nas.ramGB||8} GB RAM · ${(nas.contextLength||16384).toLocaleString()}-tok context (reserve ${(nas.reserveGB||1.5).toFixed(1)} GB). Benchmark after download for real tok/s.`;
+  body.appendChild(note);
+  (data.models||[]).forEach(m=>body.appendChild(renderBrowseCard(m)));
+  await resumePullIfActive();
+}
+
+function renderBrowseCard(m){
+  const card=document.createElement("div"); card.className="mcard";
+  const v=m.verdict||{};
+  const head=document.createElement("div"); head.className="mcard-head";
+  const title=document.createElement("div"); title.className="mcard-title"; title.textContent=m.name;
+  const sub=document.createElement("div"); sub.className="mcard-sub";
+  const bits=[m.params, m.quant, m.family].filter(Boolean);
+  if(m.sizeGB) bits.push("~"+m.sizeGB.toFixed(1)+" GB");
+  sub.textContent=bits.join(" · ");
+  head.appendChild(title); head.appendChild(sub); card.appendChild(head);
+  if(m.blurb){ const b=document.createElement("div"); b.className="mcard-blurb muted"; b.textContent=m.blurb; card.appendChild(b); }
+  const caps=document.createElement("div"); caps.className="badges";
+  (m.capabilities||[]).forEach(c=>caps.appendChild(badge(capLabel(c), "cap")));
+  if(m.recommendedFor) caps.appendChild(badge(m.recommendedFor, "rec"));
+  if(caps.childNodes.length) card.appendChild(caps);
+  const meta=document.createElement("div"); meta.className="mcard-meta";
+  meta.appendChild(fitBadge(v)); meta.appendChild(speedBadge(m, v));
+  card.appendChild(meta);
+  const actions=document.createElement("div"); actions.className="mcard-actions";
+  if(m.installed){
+    const tag=document.createElement("span"); tag.className="installed-tag"; tag.textContent="Installed";
+    const use=document.createElement("button"); use.textContent="Use"; use.addEventListener("click",()=>useModel(m.name));
+    actions.appendChild(tag); actions.appendChild(use);
+  } else {
+    const dl=document.createElement("button"); dl.innerHTML=icon("download",15)+" Download";
+    if(v.fit==="no") dl.title="Likely won't fit in 8 GB RAM — expect swapping/very slow";
+    dl.addEventListener("click",()=>startPull(m.name));
+    actions.appendChild(dl);
+  }
+  card.appendChild(actions);
+  return card;
+}
+
+// --- Pull flow (enqueue a background pull, tail progress over SSE) ----------
+async function startPull(model){
+  try{
+    const r=await fetchRetry("/api/models/pull",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model})},{label:"Start pull"});
+    const j=await r.json().catch(()=>({}));
+    if(r.status===409){ attachPull(j); return; }       // a pull is already running — tail it
+    if(!r.ok){ alert(j.error||"Could not start pull"); return; }
+    attachPull(j);
+  }catch(e){ alert(errText(e)); }
+}
+
+function attachPull(job){
+  pullJobModel=job.model||null;
+  renderPullStatus(job);
+  tailPull(job.jobId);
+}
+
+async function resumePullIfActive(){
+  try{
+    const r=await fetch("/api/models/pulls/active");
+    if(!r.ok) return;
+    const map=await r.json();
+    const keys=Object.keys(map||{});
+    if(!keys.length) return;
+    attachPull(map[keys[0]]);                       // pull survived a modal reopen/reload
+  }catch{}
+}
+
+function renderPullStatus(job){
+  const ps=$("pullStatus"); ps.classList.remove("hidden"); ps.innerHTML="";
+  const top=document.createElement("div"); top.className="pull-top";
+  const label=document.createElement("div"); label.className="pull-label";
+  label.innerHTML=icon("download",15)+`<span>Downloading <b>${escapeHtml(job.model||"")}</b></span>`;
+  const cancel=document.createElement("button"); cancel.className="pull-cancel"; cancel.textContent="Cancel";
+  cancel.addEventListener("click",()=>cancelPull(job.jobId));
+  top.appendChild(label); top.appendChild(cancel);
+  const wrap=document.createElement("div"); wrap.className="bar-wrap";
+  const bar=document.createElement("div"); bar.className="bar";
+  const fill=document.createElement("div"); fill.className="bar-fill"; fill.style.width=(job.percent||0)+"%";
+  bar.appendChild(fill);
+  const m=document.createElement("div"); m.className="bar-meta";
+  const phase=document.createElement("span"); phase.className="pull-phase"; phase.textContent=prettyPhase(job.phase||job.status||"queued");
+  const bytes=document.createElement("span"); bytes.className="pull-bytes"; bytes.textContent=fmtPullBytes(job.completed, job.total);
+  m.appendChild(phase); m.appendChild(bytes);
+  wrap.appendChild(bar); wrap.appendChild(m);
+  ps.appendChild(top); ps.appendChild(wrap);
+  pullEls={fill, phase, bytes, cancel};
+}
+
+function tailPull(jobId){
+  if(pullES){ pullES.close(); pullES=null; }
+  let closed=false;
+  const es=new EventSource("/api/models/pull/"+encodeURIComponent(jobId)+"/events");
+  pullES=es;
+  es.addEventListener("reset", e=>{ let s={}; try{s=JSON.parse(e.data)}catch{}; if(pullEls){ pullEls.fill.style.width=(s.percent||0)+"%"; pullEls.phase.textContent=prettyPhase(s.phase||s.status||""); pullEls.bytes.textContent=fmtPullBytes(s.completed,s.total); } });
+  es.addEventListener("phase", e=>{ if(pullEls) pullEls.phase.textContent=prettyPhase(e.data); });
+  es.addEventListener("progress", e=>{ let p={}; try{p=JSON.parse(e.data)}catch{}; if(pullEls){ pullEls.fill.style.width=(p.percent||0)+"%"; pullEls.bytes.textContent=fmtPullBytes(p.completed,p.total); } });
+  es.addEventListener("done", ()=>{ closed=true; es.close(); pullES=null; onPullDone(); });
+  es.addEventListener("joberror", e=>{ closed=true; es.close(); pullES=null; let m=e.data; try{m=JSON.parse(e.data)}catch{}; onPullError(m); });
+  es.onerror=()=>{ if(closed) return; }; // transport drop: EventSource auto-reconnects; reset re-anchors
+}
+
+async function onPullDone(){
+  if(pullEls){ pullEls.fill.style.width="100%"; pullEls.phase.textContent="Installed ✓"; pullEls.cancel.disabled=true; }
+  setTimeout(async ()=>{
+    $("pullStatus").classList.add("hidden"); pullEls=null;
+    await loadModels();                              // refresh the header selector
+    await switchTab(modelsTab);                      // re-render current tab (marks installed)
+  }, 900);
+}
+
+function onPullError(msg){
+  if(pullEls) pullEls.phase.textContent="Error";
+  alert(String(msg||"pull failed"));
+}
+
+async function cancelPull(jobId){
+  try{ await fetchRetry("/api/models/pull/"+encodeURIComponent(jobId)+"/cancel",{method:"POST"},{label:"Cancel pull"}); }catch{} }
+
+// --- Per-model actions ------------------------------------------------------
+function useModel(name){
+  selectedModel=name; localStorage.setItem("nas-llm-model", selectedModel);
+  renderModels();
+  if(activeId && !generatingIds.has(activeId)) saveConversation();
+  closeModelsPanel();
+}
+
+async function benchmarkModel(name, metaEl){
+  metaEl.replaceChildren(thinkingDots());
+  const t=document.createElement("span"); t.className="muted"; t.textContent=" benchmarking…"; metaEl.appendChild(t);
+  try{
+    const r=await fetchRetry("/api/models/"+encodeURIComponent(name)+"/benchmark",{method:"POST"},{label:"Benchmark"});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok){ metaEl.replaceChildren(badge("not benchmarked","")); alert(j.error||"Benchmark failed"); return; }
+    metaEl.replaceChildren();
+    metaEl.appendChild(badge(`${(j.tokPerSec||0).toFixed(1)} tok/s (measured)`, "speed-fast"));
+    const s=document.createElement("span"); s.className="muted bench-sub";
+    s.textContent=`load ${j.loadMs||0}ms · prompt ${(j.promptTokPerSec||0).toFixed(1)} tok/s`;
+    metaEl.appendChild(s);
+  }catch(e){ metaEl.replaceChildren(badge("not benchmarked","")); alert(errText(e)); }
+}
+
+async function deleteModel(name, card){
+  if(!confirm(`Remove "${name}" from the NAS? This frees disk space.`)) return;
+  try{
+    const r=await fetchRetry("/api/models/"+encodeURIComponent(name),{method:"DELETE"},{label:"Remove model"});
+    if(r.status===404){ alert("Model not found."); }
+    else if(!r.ok && r.status!==204){ let j={}; try{j=await r.json()}catch{}; alert(j.error||"Could not remove model"); return; }
+    card.remove();
+    await loadModels(); renderModels();
+    if(modelsTab==="browse") await renderBrowseTab();
+  }catch(e){ alert(errText(e)); }
+}
+
+async function toggleDetails(name, card){
+  let det=card.querySelector(".mcard-details");
+  if(det){ det.remove(); return; }
+  det=document.createElement("div"); det.className="mcard-details muted"; det.textContent="Loading…";
+  card.appendChild(det);
+  try{
+    const r=await fetchRetry("/api/models/"+encodeURIComponent(name)+"/info",{},{label:"Model info"});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok){ det.textContent=j.error||"Could not load details"; return; }
+    det.replaceChildren();
+    const caps=document.createElement("div"); caps.className="badges";
+    (j.capabilities||[]).forEach(c=>caps.appendChild(badge(capLabel(c),"cap")));
+    if(caps.childNodes.length) det.appendChild(caps);
+    const facts=document.createElement("div"); facts.className="details-facts";
+    const rows=[["Context", `${(j.contextLength||0).toLocaleString()} tok`],["RAM fit", `${(j.ramUsedGB||0).toFixed(1)} / ${(j.availableGB||0).toFixed(1)} GB`],["KV cache", `${(j.kvCacheGB||0).toFixed(2)} GB`]];
+    if(j.details&&j.details.parameter_size) rows.push(["Params", j.details.parameter_size]);
+    if(j.details&&j.details.quantization_level) rows.push(["Quant", j.details.quantization_level]);
+    rows.forEach(([k,v])=>{ const row=document.createElement("div"); const kk=document.createElement("span"); kk.textContent=k; const vv=document.createElement("span"); vv.textContent=String(v); row.appendChild(kk); row.appendChild(vv); facts.appendChild(row); });
+    det.appendChild(facts);
+    if(j.fit) det.appendChild(badge(j.fit==="fits"?"Fits this NAS":j.fit==="tight"?"Tight — shorten context":"Won't fit", j.fit==="fits"?"fit-good":j.fit==="tight"?"fit-tight":"fit-bad"));
+  }catch(e){ det.textContent=errText(e); }
+}
+
+// --- Small panel helpers ----------------------------------------------------
+function badge(label, cls){ const b=document.createElement("span"); b.className="badge "+(cls||""); b.textContent=label; return b; }
+function mutedNote(text){ const d=document.createElement("div"); d.className="muted"; d.textContent=text; return d; }
+function capLabel(c){ return {completion:"chat",tools:"tools",vision:"vision",thinking:"thinking",embedding:"embeddings"}[c]||c; }
+function fmtPullBytes(completed, total){ if(!total) return ""; return `${(completed/1e9).toFixed(2)} / ${(total/1e9).toFixed(2)} GB`; }
+function prettyPhase(p){ const m={queued:"Queued…","pulling manifest":"Pulling manifest…","verifying sha256 digest":"Verifying…","writing manifest":"Writing manifest…","removing any unused layers":"Cleaning up…",success:"Installed",pulling:"Pulling…"}; return m[p]||p; }
+function fitBadge(v){
+  const cls=v.fit==="fits"?"fit-good":v.fit==="tight"?"fit-tight":"fit-bad";
+  const label=v.fit==="fits"?"Fits":v.fit==="tight"?"Tight":"Won't fit";
+  return badge(`${label} · ~${(v.ramUsedGB||0).toFixed(1)}/${(v.availableGB||0).toFixed(1)} GB`, cls);
+}
+function speedBadge(m, v){
+  const lo=(m.estTokPerSec&&m.estTokPerSec[0])||0, hi=(m.estTokPerSec&&m.estTokPerSec[1])||0;
+  if(lo<=0 && hi<=0) return badge("est. speed n/a", "");
+  const cls=v.speed==="fast"?"speed-fast":v.speed==="usable"?"speed-ok":"speed-slow";
+  return badge(`≈ ${lo}–${hi} tok/s`, cls);
 }
 
 boot();

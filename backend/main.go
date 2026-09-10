@@ -22,6 +22,12 @@ type config struct {
 	ollamaURL       string
 	searxngURL      string
 	maxSearchRounds int
+	// Model-management fit/perf guidance. contextLength mirrors the Ollama
+	// container's OLLAMA_CONTEXT_LENGTH so the backend can estimate the KV-cache
+	// RAM a model will consume at the configured context.
+	contextLength      int
+	nasRamGB           float64
+	nasSystemReserveGB float64
 }
 
 type server struct {
@@ -32,6 +38,7 @@ type server struct {
 	modelsProxy http.Handler
 	chatProxy   http.Handler
 	jobs        *jobManager
+	pulls       *pullManager
 }
 
 type ctxKey int
@@ -47,8 +54,11 @@ func main() {
 		mailFrom:        env("MAIL_FROM", "noreply@selected.systems"),
 		dbPath:          env("DB_PATH", "/data/nas-llm.db"),
 		ollamaURL:       env("OLLAMA_URL", "http://ollama:11434"),
-		searxngURL:      env("SEARXNG_URL", ""),
+		searxngURL:       env("SEARXNG_URL", ""),
 		maxSearchRounds: envInt("MAX_SEARCH_ROUNDS", 1),
+		contextLength:      envInt("OLLAMA_CONTEXT_LENGTH", 16384),
+		nasRamGB:           envFloat("NAS_RAM_GB", 8),
+		nasSystemReserveGB: envFloat("NAS_SYSTEM_RESERVE_GB", 1.5),
 	}
 	cfg.cookieSecure = strings.HasPrefix(cfg.appBaseURL, "https://")
 	cfg.allowedEmails = parseAllowed(os.Getenv("ALLOWED_EMAILS"))
@@ -68,6 +78,7 @@ func main() {
 		chatProxy:   buildProxy(cfg.ollamaURL, "/v1/chat/completions"),
 	}
 	srv.jobs = newJobManager(st, srv)
+	srv.pulls = newPullManager(srv)
 
 	hs := &http.Server{
 		Addr:              cfg.addr,
@@ -90,6 +101,15 @@ func env(k, def string) string {
 func envInt(k string, def int) int {
 	if v := os.Getenv(k); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
+func envFloat(k string, def float64) float64 {
+	if v := os.Getenv(k); v != "" {
+		if n, err := strconv.ParseFloat(v, 64); err == nil && n > 0 {
 			return n
 		}
 	}
@@ -127,6 +147,14 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /api/auth/logout", s.handleAuthLogout)
 
 	mux.HandleFunc("GET /api/models", s.requireAuth(s.handleModels))
+	mux.HandleFunc("GET /api/models/catalog", s.requireAuth(s.handleModelCatalog))
+	mux.HandleFunc("POST /api/models/pull", s.requireAuth(s.handleModelPull))
+	mux.HandleFunc("GET /api/models/pulls/active", s.requireAuth(s.handleActivePulls))
+	mux.HandleFunc("GET /api/models/pull/{jobId}/events", s.requireAuth(s.handlePullEvents))
+	mux.HandleFunc("POST /api/models/pull/{jobId}/cancel", s.requireAuth(s.handlePullCancel))
+	mux.HandleFunc("DELETE /api/models/{name}", s.requireAuth(s.handleModelDelete))
+	mux.HandleFunc("POST /api/models/{name}/benchmark", s.requireAuth(s.handleModelBenchmark))
+	mux.HandleFunc("GET /api/models/{name}/info", s.requireAuth(s.handleModelInfo))
 	mux.HandleFunc("POST /api/chat/completions", s.requireAuth(s.handleChat))
 	mux.HandleFunc("GET /api/jobs/active", s.requireAuth(s.handleActiveJobs))
 	mux.HandleFunc("GET /api/conversations", s.requireAuth(s.handleListConversations))
