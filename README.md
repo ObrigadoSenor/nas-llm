@@ -5,8 +5,8 @@ UGREEN NASync DXP2800 (Intel N100, 8 GB), called by a browser extension, with
 **no router ports opened**. The API host (`llm.selected.systems`) is pure-API:
 o user accounts, no management routes. A second host (`chat.selected.systems`)
 runs a minimal streaming chat page backed by a small Go service for magic-link
-login and SQLite chat history. Model management is done with the `ollama` CLI
-over SSH.
+login and SQLite chat history. Models are managed from the chat UI (download,
+remove, benchmark) with the `ollama` CLI over SSH as a fallback.
 
 ```
 Browser extension (Bearer token) → llm.selected.systems:
@@ -39,9 +39,9 @@ Chat UI: **`https://chat.selected.systems`** — a minimal streaming chat page (
 |------|---------|
 | `docker-compose.yml` | ollama (no `ports:`), caddy (`:8080`), backend (`:8081`, no `ports:`), searxng (no `ports:`), cloudflared (`tunnel` profile) |
 | `Caddyfile` | `/v1/*` bearer auth + CORS for the API host; `/api/*` → backend for the chat host; static `www/` otherwise |
-| `backend/` | Go service: magic-link auth, SQLite history, Ollama proxy, and the web_search tool loop (`search.go`; Dockerfile builds a static binary) |
+| `backend/` | Go service: magic-link auth, SQLite history, Ollama proxy, web_search tool loop (`search.go`), and in-UI model management — pull/remove/benchmark/catalog (`models.go`; Dockerfile builds a static binary) |
 | `searxng/settings.yml` | SearXNG config — internal-only meta-search backend for the `web_search` tool (JSON output enabled, limiter off) |
-| `.env.example` / `.env` | NAS access, volume, tunnel token, bearer token, model, CORS origin, session secret, Brevo key, allowlist, SearXNG URL |
+| `.env.example` / `.env` | NAS access, volume, tunnel token, bearer token, model, CORS origin, session secret, Brevo key, allowlist, SearXNG URL, NAS RAM/reserve for fit guidance |
 | `scripts/deploy.sh` | sync the stack to the NAS and `docker compose up -d --build` |
 | `scripts/pull-models.sh` | `docker exec ollama ollama ...` over SSH |
 | `scripts/smoke-test.sh` | API auth/CORS/allowlist/port-isolation/streaming + chat `/api/*` 401 + SearXNG internal JSON checks |
@@ -194,17 +194,58 @@ Remaining (manual, needs a magic-link session on https://chat.selected.systems):
 Optional: set `MAX_SEARCH_ROUNDS=2` in `.env` + redeploy if single-round answers
 feel too shallow for multi-part questions.
 
-## Pull / swap models
+## Model management
 
-The chat UI has a **Manage models** panel (the grid icon next to the model
-selector in the header) that is the primary way to download, remove, and
-benchmark models. **Browse** shows a curated set with a per-model fit verdict
-(est. RAM vs. your NAS at the configured context) and an estimated tok/s range,
-plus a free-text "Pull by name" for any `model:tag`. **Installed** lists what's
-on the NAS with a one-tap **Benchmark** that measures real tok/s (`eval_count /
-eval_duration`). Downloads stream live progress over SSE and survive a page
-reload (they run detached on the NAS, like chat generation). Set `NAS_RAM_GB`
-and `NAS_SYSTEM_RESERVE_GB` in `.env` to tune the fit guidance.
+Models are managed from the chat UI — no SSH required. Click the grid icon
+(⊞) next to the model selector in the header to open the **Manage models**
+panel, which has two tabs:
+
+- **Browse** — a curated set of N100/8 GB-friendly models, each with:
+  - a **fit verdict** (Fits / Tight / Won't fit) estimating RAM use as the
+    model's on-disk size plus its KV cache at your configured context length,
+    compared against `NAS_RAM_GB − NAS_SYSTEM_RESERVE_GB`;
+  - an **estimated tok/s range** (labelled an estimate — benchmark after
+    download for the real number);
+  - capability badges (chat, tools, vision, thinking, embeddings) and a
+    one-line blurb. **Download** starts a background pull with a live progress
+    bar. A free-text **Pull by name** field downloads any `model:tag`.
+- **Installed** — every model on the NAS, with size, quant, family, capability
+  badges, and the last measured tok/s (or "not benchmarked"). Actions:
+  - **Use** — switch the current conversation to this model.
+  - **Benchmark** — runs a short 64-token generation and reports the real
+    tok/s (`eval_count / eval_duration × 1e⁹`), prompt tok/s, and load time.
+    The result is persisted in SQLite and shown across browsers/reloads.
+  - **Details** — architecture dims (layers, KV heads, head dim), context
+    length, capabilities, and the computed RAM fit.
+  - **Remove** — deletes the model from the NAS to free disk space.
+
+Downloads run as detached jobs on the NAS (one at a time, mirroring the
+generation job system) and stream progress over SSE, so they survive a page
+reload or tab close — reopen the panel and it reattaches. The pure-API host
+`llm.selected.systems` and the browser extension are unaffected; everything
+rides the existing session-cookie `/api/*` surface.
+
+Fit guidance env (`.env`, with safe defaults so existing deploys keep working):
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `NAS_RAM_GB` | `8` | Total RAM on the NAS, used to judge model fit. |
+| `NAS_SYSTEM_RESERVE_GB` | `1.5` | RAM reserved for OS + containers, subtracted before comparing. |
+| `OLLAMA_CONTEXT_LENGTH` | `16384` | Mirrors the ollama container value; drives the KV-cache estimate. |
+
+Backend routes (all session-auth-gated, registered in `backend/main.go`):
+
+| Route | Purpose |
+|-------|---------|
+| `GET /api/models` | Installed models with size/details + last benchmark (OpenAI `{data:[{id}]}` shape, selector-compatible). |
+| `GET /api/models/catalog` | Curated catalog with per-model fit + speed verdicts and NAS RAM info. |
+| `POST /api/models/pull` | Enqueue a background pull (one at a time); 202 + job state, 409 if one is active. |
+| `GET /api/models/pulls/active` | Active pull(s) for reconnect (mirrors `/api/jobs/active`). |
+| `GET /api/models/pull/{jobId}/events` | SSE progress (reset/phase/progress/done/joberror) with keepalive. |
+| `POST /api/models/pull/{jobId}/cancel` | Cancel an in-flight pull via its context. |
+| `DELETE /api/models/{name}` | Remove a model (Ollama `DELETE /api/delete`); 404 if absent. |
+| `POST /api/models/{name}/benchmark` | Run a 64-token generation; returns measured tok/s, persisted. |
+| `GET /api/models/{name}/info` | `/api/show` details (dims, capabilities) + size + KV-cache estimate + benchmark. |
 
 The `ollama` CLI over SSH remains as a fallback/ops tool:
 
