@@ -1,0 +1,3 @@
+# Compiled backend binary (e.g. from a local or dockerized `go build`).
+# Never commit; the Dockerfile builds its own inside the image.
+/backend

@@ -1,6 +1,6 @@
 // nas-llm chat UI — app logic, split out of the old single-file index.html.
 // Imports UI helpers (icons, markdown rendering) from lib.js. No build step.
-import { icon, setIcon, renderMessage, escapeHtml, StreamRenderer, thinkingDots } from './lib.js';
+import { icon, setIcon, renderMessage, escapeHtml, StreamRenderer, thinkingDots, renderSearchBlock, appendSearchEntry, showSearchPending, clearSearchPending, renderSourceLinks, appendSourceLinks } from './lib.js';
 
 const $ = id => document.getElementById(id);
 const app=$("app"), loginView=$("login");
@@ -9,7 +9,8 @@ const convList=$("convList"), whoEmail=$("whoEmail");
 const chatTitle=$("chatTitle"), chatMeta=$("chatMeta");
 const loginEmail=$("loginEmail"), loginBtn=$("loginBtn"), loginInfo=$("loginInfo");
 const sidebar=$("sidebar"), scrim=$("scrim"), menuBtn=$("menuBtn"), closeSide=$("closeSide");
-const searchToggle=$("searchToggle");
+const plusBtn=$("plusBtn"), plusPopup=$("plusPopup"), pills=$("pills");
+const attachBtn=$("attachBtn"), fileInput=$("fileInput"), imgPills=$("imgPills");
 
 // Static button icons (set once; the buttons live inside #app, which is hidden
 // until auth, so there's no flash of unstyled content).
@@ -17,8 +18,9 @@ setIcon($("newChat"), "new-chat", 16); $("newChat").insertAdjacentHTML("beforeen
 setIcon($("newFolder"), "folder-plus", 18);
 setIcon($("closeSide"), "close", 18);
 setIcon($("menuBtn"), "menu", 18);
-setIcon($("searchToggle"), "globe", 18);
-setIcon($("send"), "send", 16); $("send").setAttribute("aria-label", "Send");
+setIcon($("plusBtn"), "plus", 18);
+setIcon($("send"),"send",16); $("send").setAttribute("aria-label","Send");
+setIcon(attachBtn,"paperclip",16);
 setIcon($("logout"), "logout", 15); $("logout").insertAdjacentHTML("beforeend", '<span>Log out</span>');
 setIcon($("manageModels"), "boxes", 16); $("manageModels").setAttribute("aria-label", "Manage models");
 setIcon($("closeModels"), "close", 18);
@@ -32,17 +34,164 @@ let collapsedFolders = JSON.parse(localStorage.getItem("nas-llm-collapsed")||"{}
 let activeId = null;           // null = new, unsaved chat
 let messages = [];
 let openMenu = null;           // currently shown row action menu element
-let webSearch = localStorage.getItem("nas-llm-search") === "1";
+let dragConv = null;           // conversation being dragged onto a folder
+// Extras: add-ons the user toggles via the + menu. Active ones ride along on
+// the next generate request and show as removable pills above the input.
+const EXTRA_DEFS = [ { id:"web", label:"Web search", icon:"globe" } ];
+let activeExtras = loadExtras();
+function loadExtras(){
+  let ids=[]; try{ ids=JSON.parse(localStorage.getItem("nas-llm-extras")||"[]")||[]; }catch{}
+  // Web search is opt-in via the + menu and persists in nas-llm-extras. Drop the
+  // legacy single-toggle key so it can't re-add the pill on every refresh.
+  try{ localStorage.removeItem("nas-llm-search"); }catch{}
+  return new Set(ids.filter(id=>EXTRA_DEFS.some(d=>d.id===id)));
+}
+function saveExtras(){ localStorage.setItem("nas-llm-extras", JSON.stringify([...activeExtras])); }
+function webSearchOn(){ return activeExtras.has("web"); }
 let generatingIds = new Set(); // conversation IDs with an active background job
 let activeES = null;           // the current EventSource tail (active conversation)
 let activeJobConvId = null;    // conversation whose tail is currently open
 let inputHistory = loadInputHistory(); // sent questions, oldest→newest
 let histIndex = inputHistory.length;   // pointer; ==length means "current draft"
 let draft = "";                        // in-progress text saved on first ArrowUp
+let pendingImages = [];                // staged data URLs for the next send
+const visionModels = new Set();        // model names confirmed vision-capable
+const visionChecked = new Set();       // model names already queried via /info
 
-function renderSearchToggle(){ searchToggle.classList.toggle("on", webSearch); searchToggle.setAttribute("aria-pressed", String(webSearch)); }
-searchToggle.addEventListener("click", ()=>{ webSearch=!webSearch; localStorage.setItem("nas-llm-search", webSearch?"1":"0"); renderSearchToggle(); });
-renderSearchToggle();
+function renderPills(){
+  pills.innerHTML="";
+  activeExtras.forEach(id=>{
+    const def=EXTRA_DEFS.find(d=>d.id===id); if(!def) return;
+    const pill=document.createElement("span"); pill.className="pill";
+    pill.innerHTML=icon(def.icon,13)+'<span>'+escapeHtml(def.label)+'</span>';
+    const x=document.createElement("button"); x.type="button"; x.className="pill-x"; x.setAttribute("aria-label","Remove "+def.label);
+    x.innerHTML=icon("close",12);
+    x.addEventListener("click",e=>{ e.stopPropagation(); activeExtras.delete(id); saveExtras(); renderExtras(); });
+    pill.appendChild(x); pills.appendChild(pill);
+  });
+  pills.classList.toggle("hidden", activeExtras.size===0);
+}
+function renderPlusPopup(){
+  plusPopup.innerHTML="";
+  EXTRA_DEFS.forEach(def=>{
+    const on=activeExtras.has(def.id);
+    const b=document.createElement("button"); b.type="button"; b.className="plus-item"+(on?" on":"");
+    b.setAttribute("role","menuitemcheckbox"); b.setAttribute("aria-checked",String(on));
+    b.innerHTML=icon(def.icon,16)+'<span>'+escapeHtml(def.label)+'</span>'+(on?icon("check",14):'');
+    b.addEventListener("click",e=>{ e.stopPropagation(); if(activeExtras.has(def.id)) activeExtras.delete(def.id); else activeExtras.add(def.id); saveExtras(); renderExtras(); });
+    plusPopup.appendChild(b);
+  });
+}
+function renderExtras(){ renderPills(); renderPlusPopup(); }
+function setPlusPopup(open){ plusPopup.classList.toggle("hidden", !open); plusBtn.classList.toggle("on", open); plusBtn.setAttribute("aria-expanded", String(open)); }
+plusBtn.addEventListener("click", e=>{ e.stopPropagation(); setPlusPopup(plusPopup.classList.contains("hidden")); });
+document.addEventListener("click", e=>{ if(plusPopup.classList.contains("hidden")) return; if(!plusPopup.contains(e.target) && !plusBtn.contains(e.target)) setPlusPopup(false); });
+document.addEventListener("keydown", e=>{ if(e.key==="Escape" && !plusPopup.classList.contains("hidden")) setPlusPopup(false); });
+renderExtras();
+
+// --- Image attachments (vision models only) --------------------------------
+// The backend stores per-message images as base64 data URLs and turns them into
+// OpenAI image_url parts for vision-capable models (e.g. gemma3:4b). The UI
+// stages them as removable thumbnails above the input and sends them with the
+// next user turn. Attach is only offered when the selected model reports the
+// "vision" capability, queried lazily from /api/models/:name/info.
+function isVisionModel(name){ return visionModels.has(name); }
+async function ensureVision(name){
+  if(!name || visionChecked.has(name)) return;
+  visionChecked.add(name);
+  try{
+    const r=await fetchRetry("/api/models/"+encodeURIComponent(name)+"/info",{},{label:"Model info"});
+    if(!r.ok) return;
+    const j=await r.json();
+    if((j.capabilities||[]).includes("vision")) visionModels.add(name);
+  }catch{}
+}
+async function syncVision(){ renderComposer(); await ensureVision(selectedModel); renderComposer(); }
+function renderComposer(){
+  const vision=isVisionModel(selectedModel);
+  attachBtn.classList.toggle("hidden", !vision);
+  document.querySelector(".input-wrap").classList.toggle("has-attach", vision);
+  input.placeholder = vision ? "Message, or paste / drop an image" : "";
+  if(!vision && pendingImages.length){ pendingImages=[]; }
+  renderImgPills();
+}
+function renderImgPills(){
+  imgPills.innerHTML="";
+  pendingImages.forEach((src,i)=>{
+    const pill=document.createElement("div"); pill.className="img-pill";
+    const im=document.createElement("img"); im.src=src; im.alt="attachment"; pill.appendChild(im);
+    const x=document.createElement("button"); x.type="button"; x.className="img-x"; x.setAttribute("aria-label","Remove image");
+    x.innerHTML=icon("close",12);
+    x.addEventListener("click",e=>{ e.stopPropagation(); pendingImages.splice(i,1); renderImgPills(); autosize(); });
+    pill.appendChild(x); imgPills.appendChild(pill);
+  });
+  imgPills.classList.toggle("hidden", pendingImages.length===0);
+}
+function readAsDataURL(file){ return new Promise((res,rej)=>{ const r=new FileReader(); r.onload=()=>res(String(r.result)); r.onerror=()=>rej(r.error); r.readAsDataURL(file); }); }
+// Downscale large uploads (phone photos) so multi-MB base64 blobs aren't stored
+// in SQLite or pushed to the N100. Longest edge capped at max; smaller passes.
+function downscaleImage(dataURL, max=1280){
+  return new Promise(resolve=>{
+    const img=new Image();
+    img.onload=()=>{
+      const w=img.naturalWidth, h=img.naturalHeight;
+      if(!w||!h||Math.max(w,h)<=max){ resolve(dataURL); return; }
+      const s=max/Math.max(w,h);
+      const c=document.createElement("canvas"); c.width=Math.round(w*s); c.height=Math.round(h*s);
+      const ctx=c.getContext("2d"); ctx.drawImage(img,0,0,c.width,c.height);
+      try{ resolve(c.toDataURL("image/jpeg",0.82)); }catch{ resolve(dataURL); }
+    };
+    img.onerror=()=>resolve(dataURL);
+    img.src=dataURL;
+  });
+}
+async function addImageFiles(files){
+  if(!isVisionModel(selectedModel)) return;
+  for(const file of files){
+    if(!file.type.startsWith("image/")) continue;
+    try{ let url=await readAsDataURL(file); url=await downscaleImage(url); pendingImages.push(url); }catch{}
+  }
+  renderImgPills(); autosize();
+}
+attachBtn.addEventListener("click",()=>{ if(isVisionModel(selectedModel)) fileInput.click(); });
+fileInput.addEventListener("change",()=>{ if(fileInput.files && fileInput.files.length){ addImageFiles([...fileInput.files]); } fileInput.value=""; });
+input.addEventListener("paste",e=>{
+  if(!isVisionModel(selectedModel)) return;
+  const items=e.clipboardData && e.clipboardData.items; if(!items) return;
+  const files=[];
+  for(const it of items){ if(it.kind==="file" && it.type.startsWith("image/")){ const f=it.getAsFile(); if(f) files.push(f); } }
+  if(files.length){ e.preventDefault(); addImageFiles(files); }
+});
+const composer=document.querySelector(".composer");
+composer.addEventListener("dragover",e=>{
+  if(!isVisionModel(selectedModel)) return;
+  if(e.dataTransfer && [...e.dataTransfer.types].includes("Files")){ e.preventDefault(); composer.classList.add("drag-over"); }
+});
+composer.addEventListener("dragleave",e=>{ if(!composer.contains(e.relatedTarget)) composer.classList.remove("drag-over"); });
+composer.addEventListener("drop",e=>{
+  composer.classList.remove("drag-over");
+  if(!isVisionModel(selectedModel)) return;
+  if(e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length){
+    const imgs=[...e.dataTransfer.files].filter(f=>f.type.startsWith("image/"));
+    if(imgs.length){ e.preventDefault(); addImageFiles(imgs); }
+  }
+});
+renderComposer();
+
+// The Send button becomes Stop while the open conversation is generating.
+function renderSend(){
+  const gen = activeJobConvId !== null && activeJobConvId === activeId;
+  if(gen){ setIcon(send,"stop",16); send.classList.add("stop"); send.setAttribute("aria-label","Stop"); send.disabled=false; }
+  else { setIcon(send,"send",16); send.classList.remove("stop"); send.setAttribute("aria-label","Send"); send.disabled=false; }
+}
+async function stopActive(){
+  if(activeJobConvId !== activeId) return;
+  send.disabled=true;
+  try{ await fetch("/api/conversations/"+encodeURIComponent(activeId)+"/cancel",{method:"POST"}); }catch{}
+  // The SSE "done" event from the cancelled job finalizes the UI; if it never
+  // arrives (e.g. the job already finished), fall back after a short delay.
+  setTimeout(()=>{ if(activeJobConvId === activeId){ activeJobConvId=null; renderSend(); } }, 4000);
+}
 
 // --- Retry with exponential backoff (network/CORS/429/5xx are retryable) ----
 const MAX_RETRIES = 4, BASE_DELAY = 1000, MAX_DELAY = 16000;
@@ -125,7 +274,7 @@ async function logout(){
   closeTail(); activeJobConvId=null; generatingIds=new Set();
   try{ await fetch("/api/auth/logout",{method:"POST"}); }catch{}
   me=null; activeId=null; messages=[]; conversations=[]; selectedModel="";
-  showLogin();
+  showLogin(); renderSend();
 }
 $("logout").addEventListener("click", logout);
 $("newChat").addEventListener("click", ()=>{ newChat(); closeSidebar(); });
@@ -138,6 +287,7 @@ async function loadModels(){
     models=(j.data||[]).map(m=>m.id);
     if(models.length && !models.includes(selectedModel)) selectedModel=models[0];
     renderModels();
+    syncVision();
   }catch(e){ renderModels(); modelSel.title=String(e.message||e); }
 }
 function renderModels(){
@@ -148,6 +298,7 @@ function renderModels(){
 modelSel.addEventListener("change", ()=>{
   selectedModel=modelSel.value;
   localStorage.setItem("nas-llm-model", selectedModel);
+  syncVision();
   // Don't overwrite messages while a background job is mid-generation for this
   // conversation — the job finalizes by appending to the stored messages, and a
   // PUT here (which lacks the in-flight assistant reply) would clobber it.
@@ -175,8 +326,13 @@ function renderSidebar(){
   convList.innerHTML="";
   const byFolder={};
   conversations.forEach(c=>{ const key=c.folderId||""; (byFolder[key]=byFolder[key]||[]).push(c); });
-  folders.forEach(f=>{ if(byFolder[f.id]){ convList.appendChild(renderFolder(f, byFolder[f.id])); delete byFolder[f.id]; } });
+  folders.forEach(f=>{ convList.appendChild(renderFolder(f, byFolder[f.id]||[])); delete byFolder[f.id]; });
   if(byFolder[""]) convList.appendChild(renderFolder(null, byFolder[""]));
+}
+function makeFolderDropTarget(el, folderId){
+  el.addEventListener("dragover",e=>{ e.preventDefault(); try{e.dataTransfer.dropEffect="move";}catch{} el.classList.add("drag-over"); });
+  el.addEventListener("dragleave",e=>{ if(!el.contains(e.relatedTarget)) el.classList.remove("drag-over"); });
+  el.addEventListener("drop",e=>{ e.preventDefault(); el.classList.remove("drag-over"); if(dragConv) moveConversation(dragConv, folderId); dragConv=null; });
 }
 function renderFolder(f, convs){
   const wrap=document.createElement("div"); wrap.className="folder"+(f&&collapsedFolders[f.id]?" collapsed":"");
@@ -185,17 +341,20 @@ function renderFolder(f, convs){
   chev.innerHTML = f ? icon(collapsedFolders[f.id]?"chevron-right":"chevron-down", 14) : "";
   const name=document.createElement("div"); name.className="folder-name";
   if(f){
+    name.id="fn-"+f.id;
     name.textContent=f.name;
     head.appendChild(chev); head.appendChild(name);
-    const more=document.createElement("button"); more.className="folder-act"; more.title="More";
+    const more=document.createElement("button"); more.className="folder-act"; more.title="More"; more.draggable=false;
     more.innerHTML = icon("more", 16);
     more.addEventListener("click",e=>{ e.stopPropagation(); openFolderMenu(f, more, name); });
     head.appendChild(more);
-    head.addEventListener("click",()=>{ collapsedFolders[f.id]=!collapsedFolders[f.id]; saveCollapsed(); renderSidebar(); });
+    head.addEventListener("click",e=>{ if(e.target.closest("input")) return; collapsedFolders[f.id]=!collapsedFolders[f.id]; saveCollapsed(); renderSidebar(); });
+    makeFolderDropTarget(head, f.id);
   } else {
     chev.style.visibility="hidden";
     name.textContent="Unsorted";
     head.appendChild(chev); head.appendChild(name);
+    makeFolderDropTarget(head, "");
   }
   wrap.appendChild(head);
   const body=document.createElement("div"); body.className="folder-body";
@@ -204,17 +363,19 @@ function renderFolder(f, convs){
   return wrap;
 }
 function renderConv(c){
-  const row=document.createElement("div"); row.className="conv"+(c.id===activeId?" active":"")+(generatingIds.has(c.id)?" generating":"");
+  const row=document.createElement("div"); row.className="conv"+(c.id===activeId?" active":"")+(generatingIds.has(c.id)?" generating":""); row.draggable=true;
   const main=document.createElement("div"); main.className="conv-main";
   const t=document.createElement("div"); t.className="conv-title"; t.id="ct-"+c.id; t.textContent=c.title||"New chat";
   const tm=document.createElement("div"); tm.className="conv-time"; tm.textContent=absTime(c.updatedAt); tm.title=relTime(c.updatedAt);
   main.appendChild(t); main.appendChild(tm);
   row.appendChild(main);
-  const more=document.createElement("button"); more.className="conv-act"; more.title="More";
+  const more=document.createElement("button"); more.className="conv-act"; more.title="More"; more.draggable=false;
   more.innerHTML = icon("more", 16);
   more.addEventListener("click",e=>{ e.stopPropagation(); openConvMenu(c, more); });
   row.appendChild(more);
-  row.addEventListener("click",()=>{ openConversation(c.id); closeSidebar(); });
+  row.addEventListener("dragstart",e=>{ dragConv=c; row.classList.add("dragging"); try{e.dataTransfer.effectAllowed="move";e.dataTransfer.setData("text/plain",c.id);}catch{} });
+  row.addEventListener("dragend",()=>{ row.classList.remove("dragging"); dragConv=null; });
+  row.addEventListener("click",e=>{ if(e.target.closest("input")) return; openConversation(c.id); closeSidebar(); });
   return row;
 }
 // --- Row action menu (rename / move / delete) ---
@@ -223,6 +384,21 @@ function menuButton(iconName, label){
   const b=document.createElement("button");
   b.innerHTML = icon(iconName, 15) + '<span>'+escapeHtml(label)+'</span>';
   return b;
+}
+// Morph the open action menu into an inline yes/no confirm (replaces native
+// confirm(), which the browser can block via "prevent additional dialogs").
+function confirmInMenu(m, message, sub, onConfirm){
+  m.replaceChildren();
+  const msg=document.createElement("div"); msg.className="menu-msg"; msg.textContent=message; m.appendChild(msg);
+  if(sub){ const s=document.createElement("div"); s.className="menu-sub muted"; s.textContent=sub; m.appendChild(s); }
+  const sep=document.createElement("div"); sep.className="sep"; m.appendChild(sep);
+  const cancel=document.createElement("button"); cancel.textContent="Cancel";
+  cancel.addEventListener("click",e=>{ e.stopPropagation(); closeMenu(); });
+  const ok=document.createElement("button"); ok.className="danger"; ok.textContent="Delete";
+  ok.addEventListener("click",e=>{ e.stopPropagation(); closeMenu(); onConfirm(); });
+  m.appendChild(cancel); m.appendChild(ok);
+  const left=parseFloat(m.style.left)||0;                 // re-clip if the confirm is wider than the menu was
+  m.style.left=Math.min(left, window.innerWidth-m.offsetWidth-8)+"px";
 }
 function openConvMenu(c, anchor){
   closeMenu();
@@ -239,7 +415,7 @@ function openConvMenu(c, anchor){
   folders.forEach(f=>{ const b=document.createElement("button"); b.textContent=f.name; b.addEventListener("click",e=>{ e.stopPropagation(); closeMenu(); moveConversation(c, f.id); }); panel.appendChild(b); });
   move.appendChild(moveLabel); move.appendChild(panel);
   const del=menuButton("trash","Delete");
-  del.addEventListener("click",e=>{ e.stopPropagation(); closeMenu(); deleteConversation(c.id); });
+  del.addEventListener("click",e=>{ e.stopPropagation(); confirmInMenu(m, "Delete this conversation?", null, ()=>deleteConversation(c.id)); });
   const sep1=document.createElement("div"); sep1.className="sep";
   const sep2=document.createElement("div"); sep2.className="sep";
   m.appendChild(rename); m.appendChild(sep1); m.appendChild(move); m.appendChild(sep2); m.appendChild(del);
@@ -257,7 +433,7 @@ function openFolderMenu(f, anchor, name){
   rename.addEventListener("click",e=>{ e.stopPropagation(); closeMenu(); startFolderRename(f, name); });
   const sep=document.createElement("div"); sep.className="sep";
   const del=menuButton("trash","Delete");
-  del.addEventListener("click",async e=>{ e.stopPropagation(); closeMenu(); await deleteFolder(f.id, f.name); });
+  del.addEventListener("click",e=>{ e.stopPropagation(); confirmInMenu(m, 'Delete folder "'+f.name+'"?', "Its chats move to Unsorted (not deleted).", ()=>deleteFolder(f.id)); });
   m.appendChild(rename); m.appendChild(sep); m.appendChild(del);
   document.body.appendChild(m);
   const r=anchor.getBoundingClientRect();
@@ -276,8 +452,11 @@ async function moveConversation(c, folderId){
 }
 function startConvRename(c){
   const cell=$("ct-"+c.id); if(!cell) return;
+  const row=cell.closest(".conv"); if(row) row.draggable=false;   // don't start a drag while renaming
   cell.innerHTML="";
   const inp=document.createElement("input"); inp.value=c.title||""; inp.maxLength=80;
+  inp.addEventListener("click",e=>e.stopPropagation());
+  inp.addEventListener("mousedown",e=>e.stopPropagation());
   cell.appendChild(inp); inp.focus(); inp.select();
   let done=false;
   const commit=async ()=>{ if(done) return; done=true;
@@ -291,26 +470,36 @@ function startConvRename(c){
 }
 // --- Folder CRUD ---
 async function createFolder(){
-  const name=prompt("Folder name:"); if(!name) return;
-  try{ await fetchRetry("/api/folders",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:name.trim()})},{label:"Create folder"}); }catch{}
-  await loadConversations();
+  let f;
+  try{
+    const r=await fetchRetry("/api/folders",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:"New folder"})},{label:"Create folder"});
+    if(!r.ok) return;
+    f=await r.json();
+  }catch{ return; }
+  if(!f||!f.id) return;
+  await loadConversations();                 // show the new folder in the tree...
+  const cell=$("fn-"+f.id); if(cell) startFolderRename(f, cell, true);  // ...then rename it inline
 }
-async function deleteFolder(id, name){
-  if(!confirm('Delete folder "'+name+'"? Its chats move to Unsorted (not deleted).')) return;
+async function deleteFolder(id){
   try{ await fetchRetry("/api/folders/"+encodeURIComponent(id),{method:"DELETE"},{label:"Delete folder"}); }catch{}
   await loadConversations();
 }
-function startFolderRename(f, cell){
+function startFolderRename(f, cell, isNew){
   cell.innerHTML="";
   const inp=document.createElement("input"); inp.value=f.name; inp.maxLength=80;
+  inp.addEventListener("click",e=>e.stopPropagation());
+  inp.addEventListener("mousedown",e=>e.stopPropagation());
   cell.appendChild(inp); inp.focus(); inp.select();
   let done=false;
+  const removeNew=async ()=>{ try{ await fetchRetry("/api/folders/"+encodeURIComponent(f.id),{method:"DELETE"},{label:"Delete folder"}); }catch{} await loadConversations(); };
   const commit=async ()=>{ if(done) return; done=true;
-    const v=inp.value.trim(); if(!v||v===f.name){ renderSidebar(); return; }
+    const v=inp.value.trim();
+    if(isNew && !v){ await removeNew(); return; }      // cleared the new folder's name -> discard it
+    if(!v || v===f.name){ renderSidebar(); return; }   // unchanged -> keep
     try{ await fetchRetry("/api/folders/"+encodeURIComponent(f.id),{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:v})},{label:"Rename folder"}); }catch{}
     await loadConversations();
   };
-  const cancel=()=>{ done=true; renderSidebar(); };
+  const cancel=()=>{ done=true; if(isNew) removeNew(); else renderSidebar(); };
   inp.addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault(); commit(); } else if(e.key==="Escape"){ e.preventDefault(); cancel(); } });
   inp.addEventListener("blur",commit);
 }
@@ -319,7 +508,8 @@ async function openConversation(id){
   // NAS. We just stop listening; if this conversation has an active job we
   // reopen the tail below and resume live.
   closeTail();
-  activeJobConvId=null; send.disabled=false;
+  activeJobConvId=null; renderSend();
+  pendingImages=[]; renderImgPills();
   try{
     const r=await fetch("/api/conversations/" + encodeURIComponent(id));
     if(!r.ok) return;
@@ -327,6 +517,7 @@ async function openConversation(id){
     activeId=c.id; messages=c.messages||[];
     histIndex=inputHistory.length; draft="";
     if(models.includes(c.model)) selectedModel=c.model;
+    syncVision();
     renderModels();
     rerenderChat();
     renderSidebar();
@@ -375,10 +566,9 @@ async function resumeIfGenerating(id){
     return;
   }
   generatingIds.add(id); renderSidebar();
-  activeJobConvId=id; send.disabled=true;
-  const bubble=addMsg("assistant","",job.createdAt||Date.now());
-  const cursor=document.createElement("span"); cursor.className="cursor"; cursor.textContent="▍";
-  tailJob(id, bubble, cursor, job.content||"");
+  activeJobConvId=id; renderSend();
+  const {bubble, searchWrap, srcLinks}=addMsg("assistant","",job.createdAt||Date.now(), job.searches||null);
+  tailJob(id, bubble, job.content||"", searchWrap, srcLinks);
 }
 
 // tailJob opens an EventSource to /events and renders into bubble via a
@@ -386,16 +576,24 @@ async function resumeIfGenerating(id){
 // server sends a "reset" with the full prefix, which re-anchors acc so
 // reconnects never double-count. "done" reloads the conversation from the
 // server (source of truth — the assistant reply is persisted there).
-function tailJob(convId, bubble, cursor, initialAcc){
+function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks){
   closeTail();
-  const renderer = new StreamRenderer(bubble, cursor);
+  const renderer = new StreamRenderer(bubble);
   renderer.set(initialAcc);
   let esClosed=false;
   activeJobConvId=convId;
   const es=new EventSource("/api/conversations/"+encodeURIComponent(convId)+"/events");
   activeES=es;
   es.addEventListener("reset", e=>{ let acc=""; try{ acc=JSON.parse(e.data); }catch{} renderer.set(acc); });
-  es.addEventListener("phase", e=>{ renderer.setPhase(e.data); });
+  es.addEventListener("searches", e=>{ let arr=[]; try{ arr=JSON.parse(e.data)||[]; }catch{} renderSearchBlock(searchWrap, arr); renderSourceLinks(srcLinks, arr); });
+  es.addEventListener("search", e=>{ let entry=null; try{ entry=JSON.parse(e.data); }catch{} appendSearchEntry(searchWrap, entry); appendSourceLinks(srcLinks, entry); });
+  es.addEventListener("phase", e=>{
+    const p=e.data;
+    renderer.setPhase(p);
+    if(p==="searching") showSearchPending(searchWrap, null);
+    else if(p.startsWith("searching:")) showSearchPending(searchWrap, p.slice(10).trim());
+    else if(p==="answering") clearSearchPending(searchWrap);
+  });
   es.addEventListener("chunk", e=>{ let d=""; try{ d=JSON.parse(e.data); }catch{} renderer.append(d); });
   es.addEventListener("done", ()=>{ esClosed=true; es.close(); activeES=null; onGenerationDone(convId); });
   es.addEventListener("joberror", e=>{
@@ -403,9 +601,9 @@ function tailJob(convId, bubble, cursor, initialAcc){
     let msg=e.data; try{ msg=JSON.parse(e.data); }catch{}
     const acc = renderer.acc;
     if(acc) renderer.finalize(acc);
-    else bubbleError(bubble, msg, cursor);
+    else bubbleError(bubble, msg);
     generatingIds.delete(convId); renderSidebar();
-    activeJobConvId=null; send.disabled=false; input.focus();
+    activeJobConvId=null; renderSend(); input.focus();
   });
   es.onerror=()=>{ if(esClosed) return; /* transport drop: EventSource auto-reconnects; reset re-anchors acc */ };
 }
@@ -413,7 +611,7 @@ function tailJob(convId, bubble, cursor, initialAcc){
 async function onGenerationDone(convId){
   generatingIds.delete(convId); activeJobConvId=null;
   if(convId===activeId){
-    send.disabled=false;
+    renderSend();
     // Reload from the server: the assistant reply is persisted there now.
     try{
       const r=await fetch("/api/conversations/"+encodeURIComponent(convId));
@@ -424,11 +622,12 @@ async function onGenerationDone(convId){
   input.focus();
 }
 function newChat(){
-  closeTail(); activeJobConvId=null; send.disabled=false;
-  activeId=null; messages=[]; chat.innerHTML=""; histIndex=inputHistory.length; draft=""; renderSidebar(); updateHeader(); input.focus();
+  closeTail(); activeJobConvId=null; renderSend();
+  activeId=null; messages=[]; chat.innerHTML=""; histIndex=inputHistory.length; draft="";
+  pendingImages=[]; renderImgPills();
+  renderSidebar(); updateHeader(); input.focus();
 }
 async function deleteConversation(id){
-  if(!confirm("Delete this conversation?")) return;
   try{ await fetch("/api/conversations/"+encodeURIComponent(id),{method:"DELETE"}); }catch{}
   if(id===activeId) newChat();
   await loadConversations();
@@ -448,10 +647,9 @@ async function saveConversation(){
 }
 
 // --- Chat rendering ---------------------------------------------------------
-// Render an error line (icon + message) into an assistant bubble, dropping the
-// streaming cursor. Used when generation fails before any content lands.
-function bubbleError(bubble, msg, cursor){
-  if(cursor) cursor.remove();
+// Render an error line (icon + message) into an assistant bubble. Used when
+// generation fails before any content lands.
+function bubbleError(bubble, msg){
   bubble.replaceChildren();
   const s=document.createElement("span"); s.className="status";
   const ic=document.createElement("span"); ic.className="status-ic"; ic.innerHTML=icon("error",15);
@@ -460,25 +658,43 @@ function bubbleError(bubble, msg, cursor){
   bubble.appendChild(s);
 }
 
-function addMsg(role, text, ts){
+function addMsg(role, text, ts, searches, images){
   const d=document.createElement("div"); d.className="msg "+role;
-  const r=document.createElement("div"); r.className="role";
-  const ic=document.createElement("span"); ic.className="role-ic";
-  ic.innerHTML = icon(role==="user"?"user":"sparkles", 15);
-  const lab=document.createElement("span"); lab.className="role-label";
-  lab.textContent = role==="user"?"You":"Assistant";
-  r.appendChild(ic); r.appendChild(lab);
-  if(ts){ const t=document.createElement("span"); t.className="ts"; t.textContent=fmtTs(ts); r.appendChild(t); }
-  const b=document.createElement("div"); b.className="bubble";
   if(role==="user"){
-    b.textContent = text;                 // plain text, escaped, pre-wrapped
-  } else {
-    b.classList.add("prose");
-    if(text){ renderMessage(b, text); addCopyMsg(r, text); }
+    // Questions: text + any attached images — no header, right-aligned.
+    const b=document.createElement("div"); b.className="bubble";
+    if(images && images.length){
+      const imgs=document.createElement("div"); imgs.className="msg-images";
+      images.forEach(src=>{ const im=document.createElement("img"); im.src=src; im.alt="attached image"; im.loading="lazy"; imgs.appendChild(im); });
+      b.appendChild(imgs);
+    }
+    if(text) b.appendChild(document.createTextNode(text)); // escaped; pre-wrap inherits from .bubble
+    d.appendChild(b);
+    chat.appendChild(d);
+    chat.scrollTop=chat.scrollHeight;
+    return {bubble:b, searchWrap:null, srcLinks:null};
   }
-  d.appendChild(r); d.appendChild(b); chat.appendChild(d);
+  // Answers: search evidence (readable snippets) above, then the answer, then a
+  // meta row (date/time + source-link chips + copy icon) below. Left-aligned.
+  // The search wrap lives outside the StreamRenderer's container so streaming
+  // re-parses never wipe it; srcLinks is filled from searches or during stream.
+  let searchWrap=document.createElement("div"); searchWrap.className="msg-search";
+  if(searches && searches.length) renderSearchBlock(searchWrap, searches);
+  else searchWrap.classList.add("hidden");
+  d.appendChild(searchWrap);
+  const b=document.createElement("div"); b.className="bubble prose";
+  if(text) renderMessage(b, text);
+  d.appendChild(b);
+  const meta=document.createElement("div"); meta.className="msg-meta";
+  if(ts){ const t=document.createElement("span"); t.className="ts"; t.textContent=fmtTs(ts); meta.appendChild(t); }
+  const srcLinks=document.createElement("span"); srcLinks.className="src-links";
+  if(searches && searches.length) renderSourceLinks(srcLinks, searches);
+  meta.appendChild(srcLinks);
+  if(text) addCopyMsg(meta, text);
+  d.appendChild(meta);
+  chat.appendChild(d);
   chat.scrollTop=chat.scrollHeight;
-  return b;
+  return {bubble:b, searchWrap, srcLinks};
 }
 function addCopyMsg(roleRow, text){
   const btn=document.createElement("button"); btn.type="button";
@@ -495,7 +711,7 @@ function addCopyMsg(roleRow, text){
 }
 function rerenderChat(){
   chat.innerHTML="";
-  messages.forEach(m=>addMsg(m.role, m.content, m.ts));
+  messages.forEach(m=>addMsg(m.role, m.content, m.ts, m.search ? m.search.searches : null, m.images||null));
 }
 function updateHeader(){
   if(!activeId){ chatTitle.textContent="New chat"; chatMeta.textContent=""; return; }
@@ -508,13 +724,17 @@ function updateHeader(){
 // --- Streaming (enqueue a background job, then tail it over SSE) ------------
 async function stream(){
   const text=input.value.trim();
-  if(!text || send.disabled) return;
+  const images=pendingImages.slice();
+  if((!text && images.length===0) || send.disabled) return;
+  if(images.length){ pendingImages=[]; renderImgPills(); }
   recordHistory(text);
   histIndex=inputHistory.length; draft="";
   input.value=""; autosize();
   const uTs=Date.now();
-  messages.push({role:"user",content:text,ts:uTs});
-  addMsg("user",text,uTs);
+  const userMsg={role:"user",content:text,ts:uTs};
+  if(images.length) userMsg.images=images;
+  messages.push(userMsg);
+  addMsg("user",text,uTs,null,images);
 
   // Create the conversation on the first turn. The generate call below persists
   // the user turn for existing conversations, so no separate save is needed.
@@ -532,8 +752,7 @@ async function stream(){
   if(!activeId) return;
 
   const aTs=Date.now();
-  const bubble=addMsg("assistant","",aTs);
-  const cursor=document.createElement("span"); cursor.className="cursor"; cursor.textContent="▍";
+  const {bubble, searchWrap, srcLinks}=addMsg("assistant","",aTs);
   send.disabled=true;
   generatingIds.add(activeId); renderSidebar();
   activeJobConvId=activeId;
@@ -548,7 +767,7 @@ async function stream(){
       const r=await fetch("/api/conversations/"+encodeURIComponent(activeId)+"/generate",{
         method:"POST",
         headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({model:selectedModel, messages, web_search:webSearch})
+        body:JSON.stringify({model:selectedModel, messages, web_search:webSearchOn()})
       });
       if(r.ok || r.status===409){ job=await r.json(); break; }
       genErr=new Error("HTTP "+r.status);
@@ -557,24 +776,25 @@ async function stream(){
     if(attempt<MAX_RETRIES) await sleep(Math.min(MAX_DELAY, BASE_DELAY*2**attempt)*(0.7+Math.random()*0.6));
   }
   if(!job){
-    bubbleError(bubble, String((genErr&&genErr.message)||genErr||"generate failed"), cursor);
+    bubbleError(bubble, String((genErr&&genErr.message)||genErr||"generate failed"));
     generatingIds.delete(activeId); renderSidebar();
-    activeJobConvId=null; send.disabled=false; input.focus();
+    activeJobConvId=null; renderSend(); input.focus();
     return;
   }
   if(job.status==="error"){
-    bubbleError(bubble, job.error||"generation failed", cursor);
+    bubbleError(bubble, job.error||"generation failed");
     generatingIds.delete(activeId); renderSidebar();
-    activeJobConvId=null; send.disabled=false; input.focus();
+    activeJobConvId=null; renderSend(); input.focus();
     return;
   }
 
   // Tail the job. Generation keeps running on the NAS even if the user switches
   // chats; "done" reloads this conversation from the server (source of truth).
-  tailJob(activeId, bubble, cursor, job.content||"");
+  tailJob(activeId, bubble, job.content||"", searchWrap, srcLinks);
+  renderSend();
 }
 
-send.addEventListener("click",stream);
+send.addEventListener("click",()=>{ if(send.classList.contains("stop")) stopActive(); else stream(); });
 input.addEventListener("keydown",e=>{
   if(e.key==="Enter"&&!e.shiftKey){ e.preventDefault(); stream(); return; }
   if(e.key==="ArrowUp"||e.key==="ArrowDown"){
@@ -652,11 +872,11 @@ $("closeModels").addEventListener("click", closeModelsPanel);
 $("tabInstalled").addEventListener("click", ()=>switchTab("installed"));
 $("tabBrowse").addEventListener("click", ()=>switchTab("browse"));
 $("modelsModal").addEventListener("click", e=>{ if(e.target===$("modelsModal")) closeModelsPanel(); });
-document.addEventListener("keydown", e=>{ if(e.key==="Escape" && !$("modelsModal").classList.contains("hidden")) closeModelsPanel(); });
+document.addEventListener("keydown", e=>{ if(e.key==="Escape" && $("modelsModal").classList.contains("open")) closeModelsPanel(); });
 
-function openModelsPanel(){ $("modelsModal").classList.remove("hidden"); switchTab(modelsTab, true); }
+function openModelsPanel(){ $("modelsModal").classList.add("open"); switchTab(modelsTab, true); }
 function closeModelsPanel(){
-  $("modelsModal").classList.add("hidden");
+  $("modelsModal").classList.remove("open");
   if(pullES){ pullES.close(); pullES=null; } // pull keeps running on the NAS; reattach on reopen
   pullEls=null;
 }
@@ -706,7 +926,7 @@ function renderInstalledCard(m){
   const bench=document.createElement("button"); bench.textContent="Benchmark"; bench.addEventListener("click",()=>benchmarkModel(m.name, meta));
   const det=document.createElement("button"); det.textContent="Details"; det.addEventListener("click",()=>toggleDetails(m.name, card));
   const rm=document.createElement("button"); rm.textContent="Remove"; rm.className="danger";
-  rm.addEventListener("click",()=>deleteModel(m.name, card));
+  rm.addEventListener("click",()=>confirmRemoveModel(m.name, card));
   if(activeId && generatingIds.has(activeId) && selectedModel===m.name) rm.disabled=true;
   actions.appendChild(use); actions.appendChild(bench); actions.appendChild(det); actions.appendChild(rm);
   card.appendChild(actions);
@@ -774,9 +994,9 @@ async function startPull(model){
     const r=await fetchRetry("/api/models/pull",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model})},{label:"Start pull"});
     const j=await r.json().catch(()=>({}));
     if(r.status===409){ attachPull(j); return; }       // a pull is already running — tail it
-    if(!r.ok){ alert(j.error||"Could not start pull"); return; }
+    if(!r.ok){ flashError(j.error||"Could not start pull"); return; }
     attachPull(j);
-  }catch(e){ alert(errText(e)); }
+  }catch(e){ flashError(errText(e)); }
 }
 
 function attachPull(job){
@@ -841,7 +1061,7 @@ async function onPullDone(){
 
 function onPullError(msg){
   if(pullEls) pullEls.phase.textContent="Error";
-  alert(String(msg||"pull failed"));
+  flashError(String(msg||"pull failed"));
 }
 
 async function cancelPull(jobId){
@@ -850,6 +1070,7 @@ async function cancelPull(jobId){
 // --- Per-model actions ------------------------------------------------------
 function useModel(name){
   selectedModel=name; localStorage.setItem("nas-llm-model", selectedModel);
+  syncVision();
   renderModels();
   if(activeId && !generatingIds.has(activeId)) saveConversation();
   closeModelsPanel();
@@ -861,25 +1082,47 @@ async function benchmarkModel(name, metaEl){
   try{
     const r=await fetchRetry("/api/models/"+encodeURIComponent(name)+"/benchmark",{method:"POST"},{label:"Benchmark"});
     const j=await r.json().catch(()=>({}));
-    if(!r.ok){ metaEl.replaceChildren(badge("not benchmarked","")); alert(j.error||"Benchmark failed"); return; }
+    if(!r.ok){ metaEl.replaceChildren(badge("not benchmarked","")); const e=document.createElement("span"); e.className="err-note bench-sub"; e.textContent=j.error||"Benchmark failed"; metaEl.appendChild(e); return; }
     metaEl.replaceChildren();
     metaEl.appendChild(badge(`${(j.tokPerSec||0).toFixed(1)} tok/s (measured)`, "speed-fast"));
     const s=document.createElement("span"); s.className="muted bench-sub";
     s.textContent=`load ${j.loadMs||0}ms · prompt ${(j.promptTokPerSec||0).toFixed(1)} tok/s`;
     metaEl.appendChild(s);
-  }catch(e){ metaEl.replaceChildren(badge("not benchmarked","")); alert(errText(e)); }
+  }catch(e){ metaEl.replaceChildren(badge("not benchmarked","")); const er=document.createElement("span"); er.className="err-note bench-sub"; er.textContent=errText(e); metaEl.appendChild(er); }
 }
 
 async function deleteModel(name, card){
-  if(!confirm(`Remove "${name}" from the NAS? This frees disk space.`)) return;
   try{
     const r=await fetchRetry("/api/models/"+encodeURIComponent(name),{method:"DELETE"},{label:"Remove model"});
-    if(r.status===404){ alert("Model not found."); }
-    else if(!r.ok && r.status!==204){ let j={}; try{j=await r.json()}catch{}; alert(j.error||"Could not remove model"); return; }
+    if(r.status===404){ confirmRemoveModel(name, card, "Model not found."); return; }
+    if(!r.ok && r.status!==204){ let j={}; try{j=await r.json()}catch{}; confirmRemoveModel(name, card, j.error||"Could not remove model"); return; }
     card.remove();
     await loadModels(); renderModels();
     if(modelsTab==="browse") await renderBrowseTab();
-  }catch(e){ alert(errText(e)); }
+  }catch(e){ confirmRemoveModel(name, card, errText(e)); }
+}
+// Inline confirm inside a model card's action row (replaces native confirm).
+function confirmRemoveModel(name, card, err){
+  const actions=card.querySelector(".mcard-actions");
+  if(!actions) return;
+  actions.replaceChildren();
+  const msg=document.createElement("span");
+  msg.className = err ? "rm-msg err-note" : "rm-msg muted";
+  msg.textContent = err ? err : `Remove "${name}" from the NAS? This frees disk space.`;
+  const cancel=document.createElement("button"); cancel.textContent="Cancel";
+  cancel.addEventListener("click", async ()=>{ if(modelsTab==="installed") await renderInstalledTab(); else await renderBrowseTab(); });
+  const ok=document.createElement("button"); ok.className="danger"; ok.textContent="Remove";
+  ok.addEventListener("click",()=>deleteModel(name, card));
+  actions.appendChild(msg); actions.appendChild(cancel); actions.appendChild(ok);
+}
+// Transient inline error note at the top of the models panel (replaces alert).
+function flashError(text){
+  const body=$("tabBody");
+  if(!body) return;
+  const note=document.createElement("div"); note.className="err-note";
+  note.textContent=String(text||"error");
+  body.prepend(note);
+  setTimeout(()=>note.remove(), 6000);
 }
 
 async function toggleDetails(name, card){

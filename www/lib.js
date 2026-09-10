@@ -29,6 +29,9 @@ const ICONS = {
   'boxes':       '<rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/>',
   'download':    '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/>',
   'gauge':       '<path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/>',
+  'stop':        '<rect width="13" height="13" x="5.5" y="5.5" rx="2" fill="currentColor" stroke="none"/>',
+  'plus':        '<path d="M5 12h14"/><path d="M12 5v14"/>',
+  'paperclip':   '<path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 17.93 8.83l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/>',
 };
 
 // Render an icon by name. Returns an SVG string (currentColor stroke).
@@ -120,6 +123,125 @@ export function renderMessage(container, text) {
   addCopyButtons(container);
 }
 
+// --- Web-search evidence --------------------------------------------------
+// Render one search entry (a real query + readable result snippets, or a
+// "skipped" marker) as a DOM element. Source links are NOT included here —
+// they're rendered as mini chips next to the timestamp (see source-link
+// helpers). textContent / property assignment only, so no sanitizing needed.
+function buildSearchRow(entry) {
+  const row = document.createElement('div');
+  row.className = 'search-row';
+  if (entry && entry.skipped) {
+    row.classList.add('search-skipped');
+    const ic = document.createElement('span'); ic.className = 'status-ic'; ic.innerHTML = icon('globe', 14);
+    const t = document.createElement('span');
+    t.textContent = 'Web search on — ' + (entry.reason || 'model answered without searching');
+    row.appendChild(ic); row.appendChild(t);
+    return row;
+  }
+  const head = document.createElement('div'); head.className = 'search-head';
+  const ic = document.createElement('span'); ic.className = 'status-ic'; ic.innerHTML = icon('globe', 14);
+  const label = document.createElement('span'); label.textContent = 'Searched the web';
+  head.appendChild(ic); head.appendChild(label);
+  if (entry && entry.query) {
+    const q = document.createElement('span'); q.className = 'search-query'; q.textContent = entry.query;
+    head.appendChild(q);
+  }
+  row.appendChild(head);
+  const sources = (entry && entry.sources) || [];
+  const list = document.createElement('div'); list.className = 'search-snippets';
+  if (sources.length) {
+    sources.forEach((src, i) => {
+      const item = document.createElement('div'); item.className = 'search-src';
+      const title = document.createElement('div'); title.className = 'search-src-title';
+      title.textContent = (i + 1) + '. ' + (src.title || src.url || 'source');
+      item.appendChild(title);
+      if (src.snippet) {
+        const snip = document.createElement('div'); snip.className = 'search-src-snippet'; snip.textContent = src.snippet;
+        item.appendChild(snip);
+      }
+      list.appendChild(item);
+    });
+  } else {
+    list.classList.add('muted');
+    list.textContent = 'no results';
+  }
+  row.appendChild(list);
+  return row;
+}
+
+// --- Source-link mini chips (rendered next to the timestamp) ---
+// buildSourceLink makes one numbered chip; numbering follows the container's
+// existing children so chips stay sequential across multiple searches.
+function buildSourceLink(container, src) {
+  const a = document.createElement('a');
+  a.className = 'src-link';
+  a.target = '_blank'; a.rel = 'noopener noreferrer';
+  // Only link http(s) URLs; drop anything else to avoid javascript: etc.
+  if (/^https?:\/\//i.test(src.url || '')) a.href = src.url;
+  else { a.href = '#'; a.addEventListener('click', e => e.preventDefault()); }
+  a.textContent = String(container.children.length + 1);
+  a.title = src.title || src.url || 'source';
+  return a;
+}
+
+// Append one entry's source links as mini chips (used while streaming).
+export function appendSourceLinks(container, entry) {
+  if (!container || !entry || entry.skipped) return;
+  (entry.sources || []).forEach(src => container.appendChild(buildSourceLink(container, src)));
+}
+
+// Replace all source-link chips with the full set (used on SSE replay / reload).
+export function renderSourceLinks(container, searches) {
+  if (!container) return;
+  container.replaceChildren();
+  if (!searches || !searches.length) return;
+  searches.forEach(entry => appendSourceLinks(container, entry));
+}
+
+// Replace the evidence block with the full set (used on SSE replay / reload).
+export function renderSearchBlock(container, searches) {
+  if (!container) return;
+  container.replaceChildren();
+  if (!searches || !searches.length) { container.classList.add('hidden'); return; }
+  container.classList.remove('hidden');
+  searches.forEach(s => container.appendChild(buildSearchRow(s)));
+}
+
+// Append a single live search event (used while streaming).
+export function appendSearchEntry(container, entry) {
+  if (!container || !entry) return;
+  container.classList.remove('hidden');
+  const p = container.querySelector('.search-pending');
+  if (p) p.remove();
+  container.appendChild(buildSearchRow(entry));
+}
+
+// Show a live "Searching the web…" indicator in the evidence block while a
+// lookup is in flight (before results land). Replaces any existing pending
+// row; cleared by appendSearchEntry (results arrived) or clearSearchPending.
+export function showSearchPending(container, query) {
+  if (!container) return;
+  container.classList.remove('hidden');
+  const existing = container.querySelector('.search-pending');
+  if (existing) existing.remove();
+  const row = document.createElement('div');
+  row.className = 'search-row search-pending search-head';
+  const ic = document.createElement('span'); ic.className = 'status-ic'; ic.innerHTML = icon('globe', 14);
+  const label = document.createElement('span');
+  label.textContent = query ? ('Searching: ' + query) : 'Searching the web…';
+  row.appendChild(ic); row.appendChild(label); row.appendChild(thinkingDots());
+  container.appendChild(row);
+}
+
+// Remove a live search indicator (e.g. when the model moves to answering).
+export function clearSearchPending(container) {
+  if (!container) return;
+  const p = container.querySelector('.search-pending');
+  if (p) p.remove();
+  if (!container.children.length) container.classList.add('hidden');
+}
+
 // Escape plain text (used for user messages, which are NOT rendered as markdown
 // — a user typing # or * shouldn't see accidental formatting).
 export function escapeHtml(s) {
@@ -131,15 +253,28 @@ export function escapeHtml(s) {
 // StreamRenderer coalesces incoming chunks into at most one markdown re-parse
 // per animation frame, so a fast burst of SSE chunks can't thrash the parser.
 // Syntax highlighting is skipped while streaming; finalize() does the full
-// render with highlighting + copy buttons and drops the cursor.
+// render with highlighting + copy buttons.
 export class StreamRenderer {
-  constructor(container, cursor) {
+  constructor(container) {
     this.container = container;
-    this.cursor = cursor;        // blinking caret element (appended after prose)
     this.acc = '';
     this.phase = '';
     this.dirty = false;
     this.scheduled = false;
+    this._scrollParent = undefined; // cached nearest scrollable ancestor
+  }
+
+  // Walk up from the bubble to the first ancestor that scrolls vertically.
+  // Cached so we don't repeat getComputedStyle every animation frame.
+  _scrollAncestor() {
+    if (this._scrollParent !== undefined) return this._scrollParent;
+    let el = this.container.parentElement;
+    while (el) {
+      if (/(auto|scroll)/.test(getComputedStyle(el).overflowY)) { this._scrollParent = el; return el; }
+      el = el.parentElement;
+    }
+    this._scrollParent = null;
+    return null;
   }
 
   set(text) { this.acc = text ?? ''; this._mark(); }
@@ -155,16 +290,18 @@ export class StreamRenderer {
   }
 
   _statusEl() {
+    // The bubble's waiting state shows only generic thinking dots. Search-
+    // specific "Searching the web…" text lives in the evidence block above
+    // (showSearchPending), so we don't duplicate it here.
     const wrap = document.createElement('span');
     wrap.className = 'status';
-    let name = '', text = '';
-    if (this.phase === 'queued') { name = 'clock'; text = 'Queued — another reply is generating…'; }
-    else if (this.phase.startsWith('searching:')) { name = 'search'; text = 'Searching: ' + this.phase.slice(10).trim(); }
-    else if (this.phase === 'searching') { name = 'search'; text = 'Searching the web…'; }
-    if (!name) { wrap.appendChild(thinkingDots()); return wrap; }
-    const ic = document.createElement('span'); ic.className = 'status-ic'; ic.innerHTML = icon(name, 15);
-    const t = document.createElement('span'); t.textContent = text;
-    wrap.appendChild(ic); wrap.appendChild(t); wrap.appendChild(thinkingDots());
+    if (this.phase === 'queued') {
+      const ic = document.createElement('span'); ic.className = 'status-ic'; ic.innerHTML = icon('clock', 15);
+      const t = document.createElement('span'); t.textContent = 'Queued — another reply is generating…';
+      wrap.appendChild(ic); wrap.appendChild(t);
+      return wrap;
+    }
+    wrap.appendChild(thinkingDots());
     return wrap;
   }
 
@@ -172,17 +309,24 @@ export class StreamRenderer {
     this.scheduled = false;
     if (!this.dirty) return;
     this.dirty = false;
+    // Capture the follow state BEFORE re-parsing, while scrollTop still
+    // reflects where the user sits relative to the existing content. Capturing
+    // after the update would mistake a big frame of new text for a scroll-up.
+    const sp = this._scrollAncestor();
+    const follow = sp ? (sp.scrollHeight - sp.scrollTop - sp.clientHeight < 160) : false;
     if (this.acc) {
       this.container.innerHTML = parseAndSanitize(this.acc);
       polishLinks(this.container);
     } else {
       this.container.replaceChildren(this._statusEl());
     }
-    if (this.cursor) this.container.appendChild(this.cursor);
-    // Scroll is driven by the caller; nothing here.
+    // Pin to the bottom so the live text + the date/time row beneath it stay in
+    // view as the bubble grows — but only if the user is following along. If
+    // they scrolled up to read earlier text, leave their position alone.
+    if (follow && sp) sp.scrollTop = sp.scrollHeight;
   }
 
-  // Final render: full markdown + highlighting + copy buttons, no cursor.
+  // Final render: full markdown + highlighting + copy buttons.
   finalize(text) {
     this.scheduled = false;
     this.dirty = false;

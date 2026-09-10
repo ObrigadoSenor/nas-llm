@@ -13,9 +13,14 @@ import (
 )
 
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-	Ts      int64  `json:"ts,omitempty"`
+	Role    string      `json:"role"`
+	Content string      `json:"content"`
+	// Images holds base64 data URLs attached to a vision turn (e.g. gemma3:4b).
+	// Empty for text-only messages, so existing stored conversations round-trip
+	// unchanged. Persisted inline in the messages JSON blob.
+	Images  []string    `json:"images,omitempty"`
+	Ts      int64       `json:"ts,omitempty"`
+	Search  *searchMeta `json:"search,omitempty"`
 }
 
 type Conversation struct {

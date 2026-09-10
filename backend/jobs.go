@@ -31,7 +31,7 @@ var errJobActive = errors.New("a generation is already running for this conversa
 
 // subEvent is a single event pushed to an SSE subscriber.
 type subEvent struct {
-	kind string // "chunk", "phase", "done", "error"
+	kind string // "chunk", "phase", "search", "done", "error"
 	text string
 }
 
@@ -52,6 +52,8 @@ type job struct {
 	status          string // queued, generating, done, error, cancelled
 	content         strings.Builder
 	errMsg          string
+	phase           string         // last phase hint (searching/answering…): replayed on (re)connect
+	searches        []searchEntry // accumulated web-search evidence: broadcast + persisted
 	subs            map[chan subEvent]struct{}
 	finished        chan struct{}      // closed when the job reaches a terminal state
 	cancelFn        context.CancelFunc // set when the job starts running
@@ -104,9 +106,12 @@ func (j *job) emitChunk(delta string) {
 }
 
 // emitPhase broadcasts a phase hint (e.g. "searching", "answering") so the UI
-// can show an appropriate waiting state.
+// can show an appropriate waiting state. The latest phase is also stored so a
+// client that connects after the hint fired (a common race: runSearchLoop emits
+// "searching" before the SSE stream opens) gets it replayed on subscribe.
 func (j *job) emitPhase(phase string) {
 	j.mu.Lock()
+	j.phase = phase
 	subs := make([]chan subEvent, 0, len(j.subs))
 	for ch := range j.subs {
 		subs = append(subs, ch)
@@ -121,10 +126,51 @@ func (j *job) emitPhase(phase string) {
 	}
 }
 
+// emitSearch records a web-search event (a real query + its sources, or a
+// Skipped marker) and broadcasts it to every subscriber so the UI can show
+// proof a lookup ran. Also accumulated for persistence and SSE replay.
+func (j *job) emitSearch(entry searchEntry) {
+	j.mu.Lock()
+	j.searches = append(j.searches, entry)
+	subs := make([]chan subEvent, 0, len(j.subs))
+	for ch := range j.subs {
+		subs = append(subs, ch)
+	}
+	j.mu.Unlock()
+	b, _ := json.Marshal(entry)
+	ev := subEvent{kind: "search", text: string(b)}
+	for _, ch := range subs {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
+}
+
+// searchSnapshot returns a copy of the accumulated web-search evidence for
+// persistence (attached to the saved assistant message) and SSE replay.
+func (j *job) searchSnapshot() []searchEntry {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if len(j.searches) == 0 {
+		return nil
+	}
+	out := make([]searchEntry, len(j.searches))
+	copy(out, j.searches)
+	return out
+}
+
 func (j *job) contentString() string {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return j.content.String()
+}
+
+// phaseSnapshot returns the latest phase hint for SSE replay on (re)connect.
+func (j *job) phaseSnapshot() string {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.phase
 }
 
 // cancel requests a stop. It records the request even before the job starts
@@ -333,6 +379,10 @@ func (jm *jobManager) worker() {
 
 		err := jm.srv.runGeneration(j)
 		content := j.contentString()
+		var smeta *searchMeta
+		if searches := j.searchSnapshot(); len(searches) > 0 {
+			smeta = &searchMeta{Searches: searches}
+		}
 
 		j.mu.Lock()
 		cancelled := j.cancelRequested // set by cancel() before it fires the context
@@ -345,7 +395,7 @@ func (jm *jobManager) worker() {
 			ts := time.Now().UnixMilli()
 			if strings.TrimSpace(content) != "" {
 				_ = jm.store.setJobContent(j.id, content)
-				_ = jm.store.appendAssistantMessage(j.email, j.convID, Message{Role: "assistant", Content: content, Ts: ts})
+				_ = jm.store.appendAssistantMessage(j.email, j.convID, Message{Role: "assistant", Content: content, Ts: ts, Search: smeta})
 			}
 			_ = jm.store.finalizeJob(j.id, "cancelled", "", ts)
 			j.notifyCancelled()
@@ -355,7 +405,7 @@ func (jm *jobManager) worker() {
 		default:
 			_ = jm.store.setJobContent(j.id, content)
 			ts := time.Now().UnixMilli()
-			_ = jm.store.appendAssistantMessage(j.email, j.convID, Message{Role: "assistant", Content: content, Ts: ts})
+			_ = jm.store.appendAssistantMessage(j.email, j.convID, Message{Role: "assistant", Content: content, Ts: ts, Search: smeta})
 			_ = jm.store.finalizeJob(j.id, "done", "", ts)
 			j.notifyDone()
 		}
@@ -367,6 +417,35 @@ func (jm *jobManager) worker() {
 }
 
 // --- Generation (drives Ollama detached from any HTTP request) ---
+
+// messageContent builds the OpenAI `content` field for a stored Message.
+// Text-only messages stay a plain JSON string (what non-vision models expect);
+// a message carrying Images becomes an array of typed parts —
+// [{type:"text",text:…},{type:"image_url",image_url:{url:…}}] — so a vision
+// model such as gemma3:4b actually receives the image. Images are stored as
+// data URLs and passed through verbatim.
+func messageContent(m Message) json.RawMessage {
+	if len(m.Images) == 0 {
+		return jsonString(m.Content)
+	}
+	type imageURL struct {
+		URL string `json:"url"`
+	}
+	type part struct {
+		Type     string    `json:"type"`
+		Text     string    `json:"text,omitempty"`
+		ImageURL *imageURL `json:"image_url,omitempty"`
+	}
+	parts := make([]part, 0, 1+len(m.Images))
+	if m.Content != "" {
+		parts = append(parts, part{Type: "text", Text: m.Content})
+	}
+	for _, img := range m.Images {
+		parts = append(parts, part{Type: "image_url", ImageURL: &imageURL{URL: img}})
+	}
+	b, _ := json.Marshal(parts)
+	return json.RawMessage(b)
+}
 
 // runGeneration loads the conversation, builds the message list, and drives
 // Ollama on a background context. Content deltas flow through the job's
@@ -388,11 +467,17 @@ func (s *server) runGeneration(j *job) error {
 
 	msgs := make([]oaiMessage, len(conv.Messages))
 	for i, m := range conv.Messages {
-		msgs[i] = oaiMessage{Role: m.Role, Content: jsonString(m.Content)}
+		msgs[i] = oaiMessage{Role: m.Role, Content: messageContent(m)}
 	}
 
-	if j.webSearch && s.cfg.searxngURL != "" {
-		return s.runSearchLoop(ctx, j.model, msgs, j.emitChunk, j.emitPhase)
+	if j.webSearch {
+		if s.cfg.searxngURL == "" {
+			// Toggle was on but no SearXNG backend configured: surface it instead
+			// of silently answering as if search were off.
+			j.emitSearch(searchEntry{Skipped: true, Reason: "web search not configured"})
+			return s.runStreamPass(ctx, j.model, msgs, j.emitChunk)
+		}
+		return s.runSearchLoop(ctx, j.model, msgs, j.emitChunk, j.emitPhase, j.emitSearch)
 	}
 	return s.runStreamPass(ctx, j.model, msgs, j.emitChunk)
 }
