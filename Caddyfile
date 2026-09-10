@@ -71,6 +71,11 @@ http://chat.selected.systems:8080 {
 	}
 	handle {
 		root * /srv/chat
+		# Static assets: let the browser cache, but always revalidate via ETag
+		# before serving a stale copy. Without this, Cloudflare/the browser
+		# serve a cached app.js for up to 4h after a deploy, so UI changes
+		# (like the model-management panel) don't appear until the cache expires.
+		header Cache-Control "no-cache"
 		file_server
 	}
 }
