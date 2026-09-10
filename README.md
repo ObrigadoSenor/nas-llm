@@ -66,6 +66,12 @@ that adds three things on top of the static page:
   generating on the NAS and the result lands in history; come back and it's
   finished. One generation runs at a time (matching `OLLAMA_NUM_PARALLEL=1`);
   a second request queues and shows “Queued”.
+- **Stop.** The Send button becomes a red ⏹ Stop while the open chat is
+  generating. `POST /api/conversations/:id/cancel` aborts the job's Ollama
+  request via its context; any partial text streamed so far is saved as the
+  assistant reply and the page reloads with it. A queued (not-yet-started) job
+  is dropped before it ever drives Ollama. Stop applies to the conversation
+  you're viewing — switching to another generating chat shows its own Stop.
 - **Ollama proxy** `GET /api/models` and `POST /api/chat/completions` (streaming
   passthrough) so the page never needs the bearer token or cross-origin CORS.
 - **Web search (optional).** With the 🌐 toggle on, `/api/chat/completions` runs
@@ -88,12 +94,17 @@ with you.
 ## Web search (optional)
 
 The chat page has a 🌐 toggle. When on, the backend gives the model a
-`web_search` tool and runs a small loop: the model emits a search query, the
+`web_search` tool and runs a small loop: the model emits one search query, the
 backend queries the internal SearXNG (`http://searxng:8080/search?format=json`,
-top 5 results, snippets trimmed to ~300 chars), feeds them back, and streams a
-cited answer — up to 3 search rounds. This rides the existing
-`chat.selected.systems` → backend path; the pure-API host
+top 3 results, snippets trimmed to ~200 chars), feeds them back, and streams a
+cited answer — one search round (env-tunable: `MAX_SEARCH_ROUNDS`, default 1).
+The query is echoed to the page as `🔍 searching: <query>` while it runs. This
+rides the existing `chat.selected.systems` → backend path; the pure-API host
 `llm.selected.systems` is untouched and the extension is unaffected.
+
+`searxng/settings.yml` also bounds outbound latency (`outgoing.request_timeout`
+3s, `max_request_timeout` 5s overall, per-engine `timeout: 3`) so a slow/blocked
+engine can't stall the meta-search.
 
 The LLM itself never browses — Ollama is inference-only; the backend executes
 the search. "Local" means inference and summarization stay on the NAS, but the
@@ -148,6 +159,36 @@ scripts/deploy.sh
 With no `TUNNEL_TOKEN`, this starts **ollama + caddy + backend** (LAN mode). Once
 `TUNNEL_TOKEN` is set it also starts **cloudflared**. The backend image is built
 on the NAS (`--build`); no local Go toolchain is needed.
+
+`searxng/settings.yml` is a read-only bind mount, so edits to it are **not**
+picked up by `up -d` — restart the container after a deploy that changes it:
+```sh
+ssh root@<nas-ip> "docker restart searxng"
+```
+
+### Pending: web-search speedup + Stop button (commits 2131e9a, b1949e3)
+
+These are committed but **not yet deployed/verified** (NAS SSH was unstable
+during the session). Once SSH is back up:
+
+```sh
+# 1. Deploy the rebuilt backend + new www/ + updated searxng settings
+scripts/deploy.sh
+ssh root@<nas-ip> "docker restart searxng"   # settings.yml changed
+
+# 2. Smoke test — expect 16/16 (added a /cancel 401 check)
+scripts/smoke-test.sh
+
+# 3. Browser test on https://chat.selected.systems (hard-refresh first):
+#    a) Speed: 🌐 on, ask a time-sensitive question — expect 🔍 searching: <query>
+#       then a cited answer sooner than before (one round, not up to three).
+#    b) Stop: send a question, click ⏹ Stop mid-generation — the reply halts and
+#       the partial text is saved; send again → works normally.
+#    c) Confirm https://llm.selected.systems/v1/models still 401 (pure-API host).
+```
+
+Optional: set `MAX_SEARCH_ROUNDS=2` in `.env` + redeploy if single-round answers
+feel too shallow for multi-part questions.
 
 ## Pull / swap models
 
