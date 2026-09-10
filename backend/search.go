@@ -18,7 +18,7 @@ import (
 
 const (
 	searchResultCount  = 3
-	searchSnippetChars = 200
+	searchSnippetChars = 280
 	searchCallTimeout  = 200 * time.Second
 )
 
@@ -26,6 +26,28 @@ const (
 // 15s timeout is a backstop; SearXNG's own outgoing max_request_timeout bounds
 // the actual search latency.
 var searxngClient = &http.Client{Timeout: 15 * time.Second}
+
+// --- Web-search evidence (emitted to the UI + persisted on the message) ---
+// searchSource is one result URL the user can click to verify a search happened.
+type searchSource struct {
+	Title   string `json:"title"`
+	URL     string `json:"url"`
+	Snippet string `json:"snippet,omitempty"`
+}
+
+// searchEntry is one search event: a real query + its top hits, or a Skipped
+// marker explaining why no search ran (model declined / backend unconfigured).
+type searchEntry struct {
+	Query   string         `json:"query,omitempty"`
+	Sources []searchSource `json:"sources,omitempty"`
+	Skipped bool           `json:"skipped,omitempty"`
+	Reason  string         `json:"reason,omitempty"`
+}
+
+// searchMeta is the full per-message search record, persisted on Message.Search.
+type searchMeta struct {
+	Searches []searchEntry `json:"searches,omitempty"`
+}
 
 // --- OpenAI chat schema (the subset we manipulate) -------------------------
 
@@ -103,9 +125,11 @@ func jsonString(s string) json.RawMessage {
 // runSearchLoop runs the web_search tool-calling loop and emits the final
 // answer through emit. It is detached from any HTTP response: the caller
 // (job worker or handleChatWithSearch) wires emit to its output sink.
-// emitPhase("searching"/"answering") is a hint the UI can use. Returns nil on
-// success, an error otherwise.
-func (s *server) runSearchLoop(ctx context.Context, model string, msgs []oaiMessage, emit func(string), emitPhase func(string)) error {
+// emitPhase("searching"/"answering") is a hint the UI can use; emitSearch fires
+// once per real search (query + source URLs) so the UI can prove a lookup ran,
+// or a Skipped entry when the model answers without ever calling the tool.
+// Returns nil on success, an error otherwise.
+func (s *server) runSearchLoop(ctx context.Context, model string, msgs []oaiMessage, emit func(string), emitPhase func(string), emitSearch func(searchEntry)) error {
 	emitPhase("searching")
 	ollamaChatURL := strings.TrimRight(s.cfg.ollamaURL, "/") + "/v1/chat/completions"
 	req := chatRequest{
@@ -114,6 +138,7 @@ func (s *server) runSearchLoop(ctx context.Context, model string, msgs []oaiMess
 		Tools:    []oaiTool{webSearchTool},
 	}
 
+	searched := false
 	for round := 0; round < s.cfg.maxSearchRounds; round++ {
 		// Stream the tool-calling pass so any content the model produces before
 		// deciding to search (or instead of searching) reaches the UI live,
@@ -125,10 +150,17 @@ func (s *server) runSearchLoop(ctx context.Context, model string, msgs []oaiMess
 		}
 		if len(msg.ToolCalls) == 0 {
 			// The model answered without (further) searching: its content was
-			// already streamed above. Guard the empty case.
+			// already streamed above. Transition to "answering" so the UI drops
+			// any live "searching" indicator and a reconnect replays the right
+			// phase (not a stale "searching:…").
+			emitPhase("answering")
 			if len(msg.Content) == 0 {
-				emitPhase("answering")
 				emit("(no response)")
+			}
+			if !searched {
+				// Web search was on but the model never called the tool — tell the
+				// UI so it can show the answer is from training data, not a lookup.
+				emitSearch(searchEntry{Skipped: true, Reason: "model answered without searching"})
 			}
 			return nil
 		}
@@ -136,13 +168,19 @@ func (s *server) runSearchLoop(ctx context.Context, model string, msgs []oaiMess
 		// single round run concurrently (ordered results preserve the API's
 		// tool_call_id alignment); the query is echoed to the UI as it fires.
 		req.Messages = append(req.Messages, msg)
-		results := make([]string, len(msg.ToolCalls))
+		type searchOut struct {
+			snippet string
+			hits    []searchSource
+		}
+		results := make([]searchOut, len(msg.ToolCalls))
+		queries := make([]string, len(msg.ToolCalls))
 		var wg sync.WaitGroup
 		for i, tc := range msg.ToolCalls {
 			if tc.Function.Name != "web_search" {
-				results[i] = "unknown tool"
+				results[i] = searchOut{snippet: "unknown tool"}
 				continue
 			}
+			searched = true
 			var args struct {
 				Query string `json:"query"`
 			}
@@ -151,6 +189,7 @@ func (s *server) runSearchLoop(ctx context.Context, model string, msgs []oaiMess
 				if len(q) > 80 {
 					q = q[:80] + "…"
 				}
+				queries[i] = q
 				if q != "" {
 					emitPhase("searching:" + q)
 				}
@@ -158,16 +197,20 @@ func (s *server) runSearchLoop(ctx context.Context, model string, msgs []oaiMess
 			wg.Add(1)
 			go func(i int, argsJSON string) {
 				defer wg.Done()
-				results[i] = s.runWebSearch(argsJSON)
+				snip, hits := s.runWebSearch(argsJSON)
+				results[i] = searchOut{snippet: snip, hits: hits}
 			}(i, tc.Function.Arguments)
 		}
 		wg.Wait()
 		for i, tc := range msg.ToolCalls {
+			if tc.Function.Name == "web_search" && queries[i] != "" {
+				emitSearch(searchEntry{Query: queries[i], Sources: results[i].hits})
+			}
 			req.Messages = append(req.Messages, oaiMessage{
 				Role:       "tool",
 				ToolCallID: tc.ID,
 				Name:       tc.Function.Name,
-				Content:    jsonString(results[i]),
+				Content:    jsonString(results[i].snippet),
 			})
 		}
 	}
@@ -304,27 +347,29 @@ func (s *server) streamOllamaChatWithTools(ctx context.Context, target string, r
 	return msg, nil
 }
 
-// runWebSearch queries SearXNG and returns formatted result snippets.
-func (s *server) runWebSearch(argsJSON string) string {
+// runWebSearch queries SearXNG and returns formatted result snippets plus the
+// top hit URLs (title+url) so the UI can show clickable proof a search ran.
+// The snippet text is what the model sees; hits are for the user.
+func (s *server) runWebSearch(argsJSON string) (string, []searchSource) {
 	var args struct {
 		Query string `json:"query"`
 	}
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil || strings.TrimSpace(args.Query) == "" {
-		return "No search query provided."
+		return "No search query provided.", nil
 	}
 	searchURL := strings.TrimRight(s.cfg.searxngURL, "/") + "/search?q=" + url.QueryEscape(args.Query) + "&format=json"
 	req, err := http.NewRequest(http.MethodGet, searchURL, nil)
 	if err != nil {
-		return "Search backend misconfigured."
+		return "Search backend misconfigured.", nil
 	}
 	resp, err := searxngClient.Do(req)
 	if err != nil {
 		log.Printf("web_search: %v", err)
-		return "Search failed: " + err.Error()
+		return "Search failed: " + err.Error(), nil
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Sprintf("Search backend returned %s.", resp.Status)
+		return fmt.Sprintf("Search backend returned %s.", resp.Status), nil
 	}
 	var sr struct {
 		Results []struct {
@@ -334,23 +379,49 @@ func (s *server) runWebSearch(argsJSON string) string {
 		} `json:"results"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
-		return "Search returned unreadable results."
+		return "Search returned unreadable results.", nil
 	}
 	if len(sr.Results) == 0 {
-		return "No results found."
+		return "No results found.", nil
 	}
 	var b strings.Builder
+	var hits []searchSource
 	for i, r := range sr.Results {
 		if i >= searchResultCount {
 			break
 		}
-		snippet := strings.TrimSpace(r.Content)
-		if len(snippet) > searchSnippetChars {
-			snippet = snippet[:searchSnippetChars] + "…"
-		}
+		snippet := cleanSnippet(r.Content, searchSnippetChars)
 		fmt.Fprintf(&b, "[%d] %s\n    %s\n    %s\n\n", i+1, r.Title, r.URL, snippet)
+		hits = append(hits, searchSource{Title: r.Title, URL: r.URL, Snippet: snippet})
 	}
-	return b.String()
+	return b.String(), hits
+}
+
+// cleanSnippet normalizes raw SearXNG content into readable text: collapses
+// whitespace runs, strips stray control chars and embedded URLs (links are
+// shown separately as mini chips), and trims to a clean boundary within max.
+func cleanSnippet(raw string, max int) string {
+	s := strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == '\t' {
+			return ' '
+		}
+		if r < 32 {
+			return -1
+		}
+		return r
+	}, raw)
+	// Collapse runs of whitespace into a single space.
+	s = strings.Join(strings.Fields(s), " ")
+	s = strings.TrimSpace(s)
+	if len(s) > max {
+		s = s[:max]
+		// Try to cut at the last sentence/phrase boundary within the trim window.
+		if idx := strings.LastIndexAny(s[:max], ".!?,;:—–"); idx > max/2 {
+			s = s[:idx+1]
+		}
+		s = strings.TrimRight(s, " .,!?,;:") + "…"
+	}
+	return s
 }
 
 // handleChatWithSearch serves the legacy /api/chat/completions web_search path,
@@ -420,7 +491,7 @@ func (s *server) handleChatWithSearch(w http.ResponseWriter, r *http.Request, bo
 	ctx, cancel := context.WithTimeout(r.Context(), searchCallTimeout)
 	defer cancel()
 
-	err := s.runSearchLoop(ctx, req.Model, req.Messages, emit, emitPhase)
+	err := s.runSearchLoop(ctx, req.Model, req.Messages, emit, emitPhase, func(searchEntry) {})
 	close(stop)
 	wg.Wait()
 

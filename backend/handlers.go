@@ -377,17 +377,18 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 // --- Background generation (chat UI) ---
 
 type jobState struct {
-	ID        string `json:"id"`
-	Status    string `json:"status"`
-	Content   string `json:"content"`
-	Error     string `json:"error,omitempty"`
-	WebSearch bool   `json:"webSearch"`
-	CreatedAt int64  `json:"createdAt"`
+	ID        string        `json:"id"`
+	Status    string        `json:"status"`
+	Content   string        `json:"content"`
+	Error     string        `json:"error,omitempty"`
+	WebSearch bool          `json:"webSearch"`
+	CreatedAt int64         `json:"createdAt"`
+	Searches  []searchEntry `json:"searches,omitempty"`
 }
 
 func jobStateFrom(j *job) jobState {
 	st, content, errMsg := j.snapshot()
-	return jobState{ID: j.id, Status: st, Content: content, Error: errMsg, WebSearch: j.webSearch, CreatedAt: j.createdAt}
+	return jobState{ID: j.id, Status: st, Content: content, Error: errMsg, WebSearch: j.webSearch, CreatedAt: j.createdAt, Searches: j.searchSnapshot()}
 }
 
 // handleGenerate persists the user's turn and enqueues a detached background
@@ -524,8 +525,18 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// live chunks. This makes reconnects correct (no double-counting).
 	pdata, _ := json.Marshal(prefix)
 	writeSSE("event: reset\ndata: " + string(pdata) + "\n\n")
-	// If the job is still queued behind another, hint it so the UI can say so.
-	if st, _, _ := j.snapshot(); st == "queued" {
+	// Replay any web-search evidence accumulated so far as one "searches" event
+	// so a reconnect/reload re-paints the query + source links.
+	if searches := j.searchSnapshot(); len(searches) > 0 {
+		sdata, _ := json.Marshal(searches)
+		writeSSE("event: searches\ndata: " + string(sdata) + "\n\n")
+	}
+	// Replay the current phase hint. A queued job reports "queued"; a generating
+	// web-search job may have already fired "searching" before this stream opened,
+	// so replay the stored phase so the UI shows the right waiting state on connect.
+	if ph := j.phaseSnapshot(); ph != "" {
+		writeSSE("event: phase\ndata: " + ph + "\n\n")
+	} else if st, _, _ := j.snapshot(); st == "queued" {
 		writeSSE("event: phase\ndata: queued\n\n")
 	}
 
@@ -557,6 +568,9 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	flushPhase := func(text string) {
 		writeSSE("event: phase\ndata: " + text + "\n\n")
 	}
+	flushSearch := func(text string) {
+		writeSSE("event: search\ndata: " + text + "\n\n")
+	}
 	flushError := func(text string) {
 		d, _ := json.Marshal(text)
 		writeSSE("event: joberror\ndata: " + string(d) + "\n\n")
@@ -572,6 +586,8 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 				flushChunk(ev.text)
 			case "phase":
 				flushPhase(ev.text)
+			case "search":
+				flushSearch(ev.text)
 			case "done":
 				writeSSE("event: done\ndata: \n\n")
 				return
@@ -591,6 +607,8 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 						flushChunk(ev.text)
 					case "phase":
 						flushPhase(ev.text)
+					case "search":
+						flushSearch(ev.text)
 					case "done":
 						writeSSE("event: done\ndata: \n\n")
 						return

@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="dark">
 <title>nas-llm</title>
 <link rel="stylesheet" href="vendor/highlight-github-dark.min.css">
-<link rel="stylesheet" href="styles.css?v=3">
+<link rel="stylesheet" href="styles.css?v=21">
 <script defer src="vendor/highlight.min.js"></script>
 </head>
 <body>
@@ -48,15 +48,22 @@
       <button id="manageModels" title="Manage models" aria-label="Manage models"><svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/></svg></button>
     </header>
     <div id="chat"></div>
-    <div class="form">
-      <button id="searchToggle" class="toggle" title="Toggle web search (looks up fresh info via SearXNG)" aria-pressed="false"></button>
-      <textarea id="input" placeholder="" rows="1"></textarea>
-      <button id="send"></button>
+    <div class="composer">
+      <div id="pills" class="pills hidden"></div>
+      <div id="imgPills" class="img-pills hidden"></div>
+      <div class="input-wrap">
+        <button id="plusBtn" class="plus-btn" title="Add tools" aria-label="Add tools" aria-expanded="false"></button>
+        <div id="plusPopup" class="plus-popup hidden" role="menu"></div>
+        <textarea id="input" placeholder="" rows="1"></textarea>
+        <button id="attachBtn" class="attach-btn hidden" title="Attach image" aria-label="Attach image"></button>
+        <input id="fileInput" type="file" accept="image/*" multiple class="hidden">
+        <button id="send"></button>
+      </div>
     </div>
   </main>
 </div>
 
-<div id="modelsModal" class="modal hidden">
+<div id="modelsModal" class="modal">
   <div class="modal-card">
     <div class="modal-head">
       <h2>Models</h2>
@@ -74,6 +81,6 @@
   </div>
 </div>
 
-<script type="module" src="app.js?v=3"></script>
+<script type="module" src="app.js?v=21"></script>
 </body>
 </html>
