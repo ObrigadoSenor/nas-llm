@@ -166,19 +166,30 @@ picked up by `up -d` — restart the container after a deploy that changes it:
 ssh root@<nas-ip> "docker restart searxng"
 ```
 
-### Deployed: web-search speedup + Stop button (commits 2131e9a, b1949e3)
+### Shipped: web-search speedup + Stop button (PR #2, merged to `production`)
 
-Deployed and smoke-tested (16/16, incl. a new `/api/conversations/{id}/cancel`
-401 check). The rebuilt backend, updated `www/`, and SearXNG `outgoing` timeout
-bounds are live. Remaining is a manual browser test on
-https://chat.selected.systems (needs a magic-link session, so it can't run from
-the CLI):
+Merged to `production` via [PR #2](https://github.com/ObrigadoSenor/nas-llm/pull/2)
+(`main` → `production`). Deployed to the NAS and verified through the public
+Cloudflare edge (not just LAN):
+
+- `https://llm.selected.systems/v1/models` — 401 unauth, 200 auth (pure-API
+  host, extension unaffected).
+- `https://chat.selected.systems/` — 200 (chat page).
+- `https://chat.selected.systems/api/conversations/{id}/cancel` — 401 without a
+  session (the new Stop route is live and auth-gated).
+- LAN smoke test **16/16** (incl. the `/cancel` 401 check and SearXNG internal
+  JSON check). SearXNG search leg measured at 0.83–1.17s/query.
+
+The NAS is deployed from `main`; `production` is the release branch that `main`
+merges into via PR. Branch model: work on `main`, open `main` → `production`
+PRs to release.
+
+Remaining (manual, needs a magic-link session on https://chat.selected.systems):
 
 - **Speed:** 🌐 on, ask a time-sensitive question — expect `🔍 searching: <query>`
   then a cited answer sooner than before (one round, not up to three).
 - **Stop:** send a question, click ⏹ Stop mid-generation — the reply halts and
   the partial text is saved; send again → works normally.
-- Confirm https://llm.selected.systems/v1/models still 401 (pure-API host).
 
 Optional: set `MAX_SEARCH_ROUNDS=2` in `.env` + redeploy if single-round answers
 feel too shallow for multi-part questions.
