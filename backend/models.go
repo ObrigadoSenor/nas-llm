@@ -401,6 +401,15 @@ func (pm *pullManager) worker() {
 		case err != nil:
 			j.notifyTerminal("error", err.Error())
 		default:
+			// Auto-benchmark so the user sees real tok/s immediately after a
+			// download, without an extra click. Non-fatal: a benchmark failure
+			// (e.g. an unloadable model) never undoes a successful pull.
+			j.emitPhase("benchmarking")
+			if br, berr := pm.srv.runBenchmark(j.model); berr != nil {
+				log.Printf("auto-benchmark %s: %v", j.model, berr)
+			} else {
+				_ = pm.srv.store.upsertBenchmark(j.model, br.TokPerSec, br.PromptTokPerSec, br.LoadMs)
+			}
 			j.notifyTerminal("success", "")
 		}
 		pm.mu.Lock()
@@ -504,42 +513,42 @@ var curatedCatalog = []catalogEntry{
 		Name: "qwen3:1.7b", Family: "qwen3", Params: "1.7B", Quant: "Q4_K_M",
 		SizeGB: 1.1, ContextWindow: 32768, Capabilities: []string{"tools", "thinking", "completion"},
 		Blurb: "Very fast little model. Great for quick answers and tool/web-search calls.",
-		EstTokPerSec: [2]float64{16, 26}, RecommendedFor: "Fast replies, web search",
+		EstTokPerSec: [2]float64{10, 16}, RecommendedFor: "Fast replies, web search",
 		Layers: 28, KVHeads: 8, HeadDim: 128,
 	},
 	{
 		Name: "llama3.2:3b", Family: "llama", Params: "3B", Quant: "Q4_K_M",
 		SizeGB: 2.0, ContextWindow: 128000, Capabilities: []string{"completion"},
 		Blurb: "The sweet spot on 8 GB. Solid general chat and page summarizing.",
-		EstTokPerSec: [2]float64{10, 16}, RecommendedFor: "General chat, summarizing",
+		EstTokPerSec: [2]float64{7, 11}, RecommendedFor: "General chat, summarizing",
 		Layers: 28, KVHeads: 8, HeadDim: 128,
 	},
 	{
 		Name: "qwen2.5:3b", Family: "qwen2.5", Params: "3B", Quant: "Q4_K_M",
 		SizeGB: 1.9, ContextWindow: 32768, Capabilities: []string{"tools", "completion"},
 		Blurb: "Strong reasoning for its size and tool-capable. A good 3B alternative.",
-		EstTokPerSec: [2]float64{9, 15}, RecommendedFor: "Reasoning, tool calls",
+		EstTokPerSec: [2]float64{6, 10}, RecommendedFor: "Reasoning, tool calls",
 		Layers: 36, KVHeads: 2, HeadDim: 128,
 	},
 	{
 		Name: "phi3:mini", Family: "phi3", Params: "3.8B", Quant: "Q4_K_M",
 		SizeGB: 2.2, ContextWindow: 128000, Capabilities: []string{"completion"},
 		Blurb: "Microsoft's small model. Decent reasoning, long context window.",
-		EstTokPerSec: [2]float64{6, 11}, RecommendedFor: "Long-context notes",
+		EstTokPerSec: [2]float64{4, 8}, RecommendedFor: "Long-context notes",
 		Layers: 32, KVHeads: 32, HeadDim: 96,
 	},
 	{
 		Name: "gemma3:4b", Family: "gemma3", Params: "4B", Quant: "Q4_K_M",
 		SizeGB: 2.5, ContextWindow: 128000, Capabilities: []string{"vision", "completion"},
 		Blurb: "Multimodal — understands images as well as text. Slower than the 3B models.",
-		EstTokPerSec: [2]float64{7, 12}, RecommendedFor: "Image + text",
+		EstTokPerSec: [2]float64{5, 9}, RecommendedFor: "Image + text",
 		Layers: 35, KVHeads: 1, HeadDim: 256,
 	},
 	{
 		Name: "llama3.1:8b", Family: "llama3", Params: "8B", Quant: "Q4_K_M",
 		SizeGB: 4.7, ContextWindow: 128000, Capabilities: []string{"tools", "completion"},
 		Blurb: "Best quality here, but slow and RAM-heavy on 8 GB. Shorten its context.",
-		EstTokPerSec: [2]float64{3, 6}, RecommendedFor: "Best quality (slow)",
+		EstTokPerSec: [2]float64{2, 4}, RecommendedFor: "Best quality (slow)",
 		Layers: 32, KVHeads: 8, HeadDim: 128,
 	},
 	{
@@ -901,55 +910,73 @@ func (s *server) handleModelDelete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleModelBenchmark runs a short non-streaming generate and reports measured
+// benchmarkResult holds the measured speed sample from a short generation.
+type benchmarkResult struct {
+	TokPerSec       float64
+	PromptTokPerSec float64
+	LoadMs          int64
+	EvalCount       int
+	PromptEvalCount int
+}
+
+// runBenchmark drives a short non-streaming generation and returns measured
 // tok/s from Ollama's eval stats: tok/s = eval_count / eval_duration * 1e9.
+// It runs on a background context so it works detached from any HTTP request
+// (used by both the manual benchmark handler and the post-pull auto-benchmark).
+func (s *server) runBenchmark(model string) (*benchmarkResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	resp, err := s.ollamaRequest(ctx, http.MethodPost, "/api/generate", map[string]any{
+		"model":   model,
+		"prompt":  "Write a numbered list of three short facts about the ocean.",
+		"stream":  false,
+		"options": map[string]any{"num_predict": 64, "temperature": 0},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("could not reach ollama: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("ollama: %s", strings.TrimSpace(string(body)))
+	}
+	var g ollamaGenerateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&g); err != nil {
+		return nil, fmt.Errorf("unreadable response: %w", err)
+	}
+	br := &benchmarkResult{EvalCount: g.EvalCount, PromptEvalCount: g.PromptEvalCount, LoadMs: g.LoadDuration / int64(1e6)}
+	if g.EvalDuration > 0 && g.EvalCount > 0 {
+		br.TokPerSec = float64(g.EvalCount) / float64(g.EvalDuration) * 1e9
+	}
+	if g.PromptEvalDuration > 0 && g.PromptEvalCount > 0 {
+		br.PromptTokPerSec = float64(g.PromptEvalCount) / float64(g.PromptEvalDuration) * 1e9
+	}
+	return br, nil
+}
+
+// handleModelBenchmark is the manual, on-demand benchmark endpoint. It reuses
+// runBenchmark and persists the result so it shows across browsers/reloads.
 func (s *server) handleModelBenchmark(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if name == "" {
 		jsonError(w, "model is required", http.StatusBadRequest)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
-	defer cancel()
-	resp, err := s.ollamaRequest(ctx, http.MethodPost, "/api/generate", map[string]any{
-		"model":   name,
-		"prompt":  "Write a numbered list of three short facts about the ocean.",
-		"stream":  false,
-		"options": map[string]any{"num_predict": 64, "temperature": 0},
-	})
+	br, err := s.runBenchmark(name)
 	if err != nil {
-		jsonError(w, "could not reach ollama", http.StatusBadGateway)
+		jsonError(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		jsonError(w, "ollama: "+strings.TrimSpace(string(body)), resp.StatusCode)
-		return
-	}
-	var g ollamaGenerateResponse
-	if err := json.NewDecoder(resp.Body).Decode(&g); err != nil {
-		jsonError(w, "unreadable response", http.StatusBadGateway)
-		return
-	}
-	var tokPerSec, ptokPerSec float64
-	if g.EvalDuration > 0 && g.EvalCount > 0 {
-		tokPerSec = float64(g.EvalCount) / float64(g.EvalDuration) * 1e9
-	}
-	if g.PromptEvalDuration > 0 && g.PromptEvalCount > 0 {
-		ptokPerSec = float64(g.PromptEvalCount) / float64(g.PromptEvalDuration) * 1e9
-	}
-	loadMs := g.LoadDuration / int64(1e6)
-	if err := s.store.upsertBenchmark(name, tokPerSec, ptokPerSec, loadMs); err != nil {
+	if err := s.store.upsertBenchmark(name, br.TokPerSec, br.PromptTokPerSec, br.LoadMs); err != nil {
 		log.Printf("upsertBenchmark: %v", err)
 	}
 	writeJSON(w, map[string]any{
 		"model":           name,
-		"tokPerSec":       tokPerSec,
-		"promptTokPerSec": ptokPerSec,
-		"loadMs":          loadMs,
-		"evalCount":       g.EvalCount,
-		"promptEvalCount": g.PromptEvalCount,
+		"tokPerSec":       br.TokPerSec,
+		"promptTokPerSec": br.PromptTokPerSec,
+		"loadMs":          br.LoadMs,
+		"evalCount":       br.EvalCount,
+		"promptEvalCount": br.PromptEvalCount,
 		"evaluatedAt":     time.Now().UnixMilli(),
 	})
 }

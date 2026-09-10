@@ -831,12 +831,12 @@ function tailPull(jobId){
 }
 
 async function onPullDone(){
-  if(pullEls){ pullEls.fill.style.width="100%"; pullEls.phase.textContent="Installed ✓"; pullEls.cancel.disabled=true; }
+  if(pullEls){ pullEls.fill.style.width="100%"; pullEls.phase.textContent="Installed ✓ — benchmarked"; pullEls.cancel.disabled=true; }
   setTimeout(async ()=>{
     $("pullStatus").classList.add("hidden"); pullEls=null;
-    await loadModels();                              // refresh the header selector
-    await switchTab(modelsTab);                      // re-render current tab (marks installed)
-  }, 900);
+    await loadModels();                              // refresh the header selector (benchmark now persisted)
+    await switchTab(modelsTab);                      // re-render current tab (marks installed + shows tok/s)
+  }, 1100);
 }
 
 function onPullError(msg){
@@ -910,7 +910,7 @@ function badge(label, cls){ const b=document.createElement("span"); b.className=
 function mutedNote(text){ const d=document.createElement("div"); d.className="muted"; d.textContent=text; return d; }
 function capLabel(c){ return {completion:"chat",tools:"tools",vision:"vision",thinking:"thinking",embedding:"embeddings"}[c]||c; }
 function fmtPullBytes(completed, total){ if(!total) return ""; return `${(completed/1e9).toFixed(2)} / ${(total/1e9).toFixed(2)} GB`; }
-function prettyPhase(p){ const m={queued:"Queued…","pulling manifest":"Pulling manifest…","verifying sha256 digest":"Verifying…","writing manifest":"Writing manifest…","removing any unused layers":"Cleaning up…",success:"Installed",pulling:"Pulling…"}; return m[p]||p; }
+function prettyPhase(p){ const m={queued:"Queued…","pulling manifest":"Pulling manifest…","verifying sha256 digest":"Verifying…","writing manifest":"Writing manifest…","removing any unused layers":"Cleaning up…",success:"Downloaded — benchmarking…",pulling:"Pulling…",benchmarking:"Benchmarking…"}; return m[p]||p; }
 function fitBadge(v){
   const cls=v.fit==="fits"?"fit-good":v.fit==="tight"?"fit-tight":"fit-bad";
   const label=v.fit==="fits"?"Fits":v.fit==="tight"?"Tight":"Won't fit";
