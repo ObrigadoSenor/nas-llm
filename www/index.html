@@ -93,6 +93,8 @@
   .msg.assistant .bubble{background:var(--panel);border:1px solid var(--border)}
   .form{max-width:760px;width:100%;margin:0 auto;padding:12px 16px 16px;display:flex;gap:8px;align-items:flex-end}
   .form textarea{flex:1;resize:none;min-height:var(--h);max-height:200px}
+  #send.stop{border-color:#e0556b;background:color-mix(in srgb,#e0556b 22%,transparent);color:#e0556b}
+  #send.stop:hover:not(:disabled){border-color:#e0556b;background:color-mix(in srgb,#e0556b 30%,transparent)}
 
   /* row action menu */
   .menu{position:fixed;z-index:40;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:4px;min-width:160px;box-shadow:0 6px 24px rgba(0,0,0,.4)}
@@ -183,6 +185,20 @@ let webSearch = localStorage.getItem("nas-llm-search") === "1";
 let generatingIds = new Set(); // conversation IDs with an active background job
 let activeES = null;           // the current EventSource tail (active conversation)
 let activeJobConvId = null;    // conversation whose tail is currently open
+function renderSend(){
+  // While the open conversation is generating, the Send button becomes Stop.
+  const gen = activeJobConvId !== null && activeJobConvId === activeId;
+  if(gen){ send.textContent="⏹ Stop"; send.classList.add("stop"); send.disabled=false; }
+  else { send.textContent="Send"; send.classList.remove("stop"); send.disabled=false; }
+}
+async function stopActive(){
+  if(activeJobConvId !== activeId) return;
+  send.disabled=true; send.textContent="Stopping…";
+  try{ await fetch("/api/conversations/"+encodeURIComponent(activeId)+"/cancel",{method:"POST"}); }catch{}
+  // The SSE "done" event from the cancelled job finalizes the UI; if it never
+  // arrives (e.g. the job already finished), fall back after a short delay.
+  setTimeout(()=>{ if(activeJobConvId === activeId){ activeJobConvId=null; renderSend(); } }, 4000);
+}
 const thinkingDots = ()=>{ const t=document.createElement("span"); t.className="thinking"; t.innerHTML="<i class=dot></i><i class=dot></i><i class=dot></i>"; return t; };
 const searchToggle = $("searchToggle");
 function renderSearchToggle(){ searchToggle.classList.toggle("on", webSearch); searchToggle.setAttribute("aria-pressed", String(webSearch)); }
@@ -270,7 +286,7 @@ async function logout(){
   closeTail(); activeJobConvId=null; generatingIds=new Set();
   try{ await fetch("/api/auth/logout",{method:"POST"}); }catch{}
   me=null; activeId=null; messages=[]; conversations=[]; selectedModel="";
-  showLogin();
+  showLogin(); renderSend();
 }
 $("logout").addEventListener("click", logout);
 $("newChat").addEventListener("click", ()=>{ newChat(); closeSidebar(); });
@@ -455,7 +471,7 @@ async function openConversation(id){
   // NAS. We just stop listening; if this conversation has an active job we
   // reopen the tail below and resume live.
   closeTail();
-  activeJobConvId=null; send.disabled=false;
+  activeJobConvId=null;
   try{
     const r=await fetch("/api/conversations/" + encodeURIComponent(id));
     if(!r.ok) return;
@@ -468,6 +484,7 @@ async function openConversation(id){
     updateHeader();
   }catch{}
   await resumeIfGenerating(id);
+  renderSend();
 }
 
 // --- Background generation ---
@@ -510,7 +527,7 @@ async function resumeIfGenerating(id){
     return;
   }
   generatingIds.add(id); renderSidebar();
-  activeJobConvId=id; send.disabled=true;
+  activeJobConvId=id; renderSend();
   const bubble=addMsg("assistant","",job.createdAt||Date.now());
   const cursor=document.createElement("span"); cursor.className="cursor"; cursor.textContent="▍";
   tailJob(id, bubble, cursor, job.content||"");
@@ -546,16 +563,17 @@ function tailJob(convId, bubble, cursor, initialAcc){
     bubble.replaceChildren(); bubble.textContent=acc || ("⚠️ "+msg);
     cursor.remove();
     generatingIds.delete(convId); renderSidebar();
-    activeJobConvId=null; send.disabled=false; input.focus();
+    activeJobConvId=null; renderSend(); input.focus();
   });
   es.onerror=()=>{ if(esClosed) return; /* transport drop: EventSource auto-reconnects; reset re-anchors acc */ };
 }
 
 async function onGenerationDone(convId){
   generatingIds.delete(convId); activeJobConvId=null;
+  renderSend();
   if(convId===activeId){
-    send.disabled=false;
-    // Reload from the server: the assistant reply is persisted there now.
+    // Reload from the server: the assistant reply (or partial, if stopped) is
+    // persisted there now.
     try{
       const r=await fetch("/api/conversations/"+encodeURIComponent(convId));
       if(r.ok){ const c=await r.json(); messages=c.messages||[]; rerenderChat(); updateHeader(); }
@@ -565,8 +583,8 @@ async function onGenerationDone(convId){
   input.focus();
 }
 function newChat(){
-  closeTail(); activeJobConvId=null; send.disabled=false;
-  activeId=null; messages=[]; chat.innerHTML=""; renderSidebar(); updateHeader(); input.focus();
+  closeTail(); activeJobConvId=null;
+  activeId=null; messages=[]; chat.innerHTML=""; renderSidebar(); updateHeader(); renderSend(); input.focus();
 }
 async function deleteConversation(id){
   if(!confirm("Delete this conversation?")) return;
@@ -679,9 +697,10 @@ async function stream(){
   // Tail the job. Generation keeps running on the NAS even if the user switches
   // chats; "done" reloads this conversation from the server (source of truth).
   tailJob(activeId, bubble, cursor, job.content||"");
+  renderSend();
 }
 
-send.addEventListener("click",stream);
+send.addEventListener("click",()=>{ if(send.classList.contains("stop")) stopActive(); else stream(); });
 input.addEventListener("keydown",e=>{ if(e.key==="Enter"&&!e.shiftKey){ e.preventDefault(); stream(); } });
 input.addEventListener("input",()=>{ input.style.height="auto"; input.style.height=input.scrollHeight+"px"; });
 

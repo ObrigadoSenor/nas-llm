@@ -463,6 +463,17 @@ func (s *server) handleJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, jobStateFrom(j))
 }
 
+// handleCancel stops the conversation's active background job. 404 if there is
+// no in-flight job for this conversation/user; the worker then finalizes it as
+// cancelled (partial content persisted) and subscribers see a terminal "done".
+func (s *server) handleCancel(w http.ResponseWriter, r *http.Request) {
+	if !s.jobs.cancel(r.PathValue("id"), emailFrom(r)) {
+		jsonError(w, "no active generation for this conversation", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, map[string]string{"status": "cancelled"})
+}
+
 // handleActiveJobs returns {conversationID: status} for the caller's active
 // jobs, so the sidebar can show which chats are generating.
 func (s *server) handleActiveJobs(w http.ResponseWriter, r *http.Request) {

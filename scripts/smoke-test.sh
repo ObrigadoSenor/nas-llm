@@ -83,6 +83,8 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${CHAT_HOST}" "${CHAT_BA
 [[ "$code" == 401 ]] && ok "chat /api/conversations/{id}/events rejects no session (401)" || bad "chat /api/conversations/{id}/events expected 401 got $code"
 code=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${CHAT_HOST}" -X POST -H 'Content-Type: application/json' -d '{}' "${CHAT_BASE}/api/conversations/fakeid/generate")
 [[ "$code" == 401 ]] && ok "chat /api/conversations/{id}/generate rejects no session (401)" || bad "chat /api/conversations/{id}/generate expected 401 got $code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${CHAT_HOST}" -X POST "${CHAT_BASE}/api/conversations/fakeid/cancel")
+[[ "$code" == 401 ]] && ok "chat /api/conversations/{id}/cancel rejects no session (401)" || bad "chat /api/conversations/{id}/cancel expected 401 got $code"
 
 # 8. SearXNG internal JSON search (no published port — reach it from the
 #    backend container on the internal network). LAN endpoint only; the

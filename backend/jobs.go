@@ -48,12 +48,14 @@ type job struct {
 	webSearch bool
 	createdAt int64
 
-	mu       sync.Mutex
-	status   string // queued, generating, done, error
-	content  strings.Builder
-	errMsg   string
-	subs     map[chan subEvent]struct{}
-	finished chan struct{} // closed when the job becomes done/error
+	mu              sync.Mutex
+	status          string // queued, generating, done, error, cancelled
+	content         strings.Builder
+	errMsg          string
+	subs            map[chan subEvent]struct{}
+	finished        chan struct{}      // closed when the job reaches a terminal state
+	cancelFn        context.CancelFunc // set when the job starts running
+	cancelRequested bool               // set by cancel(): survive a queued/unstarted job
 }
 
 func newJobID() string {
@@ -125,6 +127,19 @@ func (j *job) contentString() string {
 	return j.content.String()
 }
 
+// cancel requests a stop. It records the request even before the job starts
+// (queued) so the worker drops it without driving Ollama, and calls the job's
+// context cancel if it is already running.
+func (j *job) cancel() {
+	j.mu.Lock()
+	j.cancelRequested = true
+	c := j.cancelFn
+	j.mu.Unlock()
+	if c != nil {
+		c()
+	}
+}
+
 func (j *job) snapshot() (status, content, errMsg string) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -159,6 +174,30 @@ func (j *job) notifyDone() {
 		return
 	}
 	j.status = "done"
+	subs := make([]chan subEvent, 0, len(j.subs))
+	for ch := range j.subs {
+		subs = append(subs, ch)
+	}
+	close(j.finished)
+	j.mu.Unlock()
+	for _, ch := range subs {
+		select {
+		case ch <- subEvent{kind: "done"}:
+		default:
+		}
+	}
+}
+
+// notifyCancelled marks the job cancelled and broadcasts a terminal "done".
+// Subscribers treat it like a normal finish (they reload the conversation,
+// which now holds the partial assistant reply).
+func (j *job) notifyCancelled() {
+	j.mu.Lock()
+	if j.status == "done" || j.status == "error" || j.status == "cancelled" {
+		j.mu.Unlock()
+		return
+	}
+	j.status = "cancelled"
 	subs := make([]chan subEvent, 0, len(j.subs))
 	for ch := range j.subs {
 		subs = append(subs, ch)
@@ -241,6 +280,22 @@ func (jm *jobManager) get(convID string) *job {
 	return jm.active[convID]
 }
 
+// cancel requests a stop for the conversation's active job. Returns false if
+// there is no active job for this conversation/user (so the handler can 404).
+// A queued job is dropped before it starts; a running job has its Ollama
+// request aborted via the job's context. Either way the worker finalizes the
+// job as cancelled (partial content persisted).
+func (jm *jobManager) cancel(convID, email string) bool {
+	jm.mu.Lock()
+	j, ok := jm.active[convID]
+	jm.mu.Unlock()
+	if !ok || j.email != email {
+		return false
+	}
+	j.cancel()
+	return true
+}
+
 func (jm *jobManager) activeByUser(email string) map[string]string {
 	jm.mu.Lock()
 	defer jm.mu.Unlock()
@@ -262,6 +317,16 @@ func (jm *jobManager) activeByUser(email string) map[string]string {
 func (jm *jobManager) worker() {
 	for j := range jm.queue {
 		j.mu.Lock()
+		if j.cancelRequested {
+			// Stopped while still queued: never start Ollama.
+			j.mu.Unlock()
+			_ = jm.store.finalizeJob(j.id, "cancelled", "", time.Now().UnixMilli())
+			j.notifyCancelled()
+			jm.mu.Lock()
+			delete(jm.active, j.convID)
+			jm.mu.Unlock()
+			continue
+		}
 		j.status = "generating"
 		j.mu.Unlock()
 		_ = jm.store.setJobGenerating(j.id)
@@ -269,10 +334,25 @@ func (jm *jobManager) worker() {
 		err := jm.srv.runGeneration(j)
 		content := j.contentString()
 
-		if err != nil {
+		j.mu.Lock()
+		cancelled := j.cancelRequested // set by cancel() before it fires the context
+		j.mu.Unlock()
+
+		switch {
+		case cancelled:
+			// Stopped by the user: persist the partial reply (if any) and report
+			// a clean "done" to subscribers rather than an error.
+			ts := time.Now().UnixMilli()
+			if strings.TrimSpace(content) != "" {
+				_ = jm.store.setJobContent(j.id, content)
+				_ = jm.store.appendAssistantMessage(j.email, j.convID, Message{Role: "assistant", Content: content, Ts: ts})
+			}
+			_ = jm.store.finalizeJob(j.id, "cancelled", "", ts)
+			j.notifyCancelled()
+		case err != nil:
 			_ = jm.store.finalizeJob(j.id, "error", err.Error(), time.Now().UnixMilli())
 			j.notifyError(err.Error())
-		} else {
+		default:
 			_ = jm.store.setJobContent(j.id, content)
 			ts := time.Now().UnixMilli()
 			_ = jm.store.appendAssistantMessage(j.email, j.convID, Message{Role: "assistant", Content: content, Ts: ts})
@@ -294,6 +374,9 @@ func (jm *jobManager) worker() {
 func (s *server) runGeneration(j *job) error {
 	ctx, cancel := context.WithTimeout(context.Background(), genTimeout)
 	defer cancel()
+	j.mu.Lock()
+	j.cancelFn = cancel // let handleCancel abort the in-flight Ollama request
+	j.mu.Unlock()
 
 	conv, err := s.store.getConversation(j.email, j.convID)
 	if err != nil {
