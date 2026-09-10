@@ -196,6 +196,18 @@ feel too shallow for multi-part questions.
 
 ## Pull / swap models
 
+The chat UI has a **Manage models** panel (the grid icon next to the model
+selector in the header) that is the primary way to download, remove, and
+benchmark models. **Browse** shows a curated set with a per-model fit verdict
+(est. RAM vs. your NAS at the configured context) and an estimated tok/s range,
+plus a free-text "Pull by name" for any `model:tag`. **Installed** lists what's
+on the NAS with a one-tap **Benchmark** that measures real tok/s (`eval_count /
+eval_duration`). Downloads stream live progress over SSE and survive a page
+reload (they run detached on the NAS, like chat generation). Set `NAS_RAM_GB`
+and `NAS_SYSTEM_RESERVE_GB` in `.env` to tune the fit guidance.
+
+The `ollama` CLI over SSH remains as a fallback/ops tool:
+
 ```sh
 scripts/pull-models.sh pull llama3.2:3b   # download (one-time, ~2 GB)
 scripts/pull-models.sh list               # what's installed

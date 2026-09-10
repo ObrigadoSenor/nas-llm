@@ -99,6 +99,13 @@ CREATE TABLE IF NOT EXISTS jobs (
 	finished_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_conv ON jobs(conversation_id);
+CREATE TABLE IF NOT EXISTS model_benchmarks (
+	model TEXT PRIMARY KEY,
+	tok_per_sec REAL NOT NULL DEFAULT 0,
+	prompt_tok_per_sec REAL NOT NULL DEFAULT 0,
+	load_ms INTEGER NOT NULL DEFAULT 0,
+	evaluated_at INTEGER NOT NULL DEFAULT 0
+);
 `
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("schema: %w", err)
@@ -110,6 +117,34 @@ CREATE INDEX IF NOT EXISTS idx_jobs_conv ON jobs(conversation_id);
 		return nil, fmt.Errorf("reconcile jobs: %w", err)
 	}
 	return &store{db: db}, nil
+}
+
+// upsertBenchmark records (or replaces) the last measured benchmark for a model.
+func (s *store) upsertBenchmark(model string, tokPerSec, promptTokPerSec float64, loadMs int64) error {
+	_, err := s.db.Exec(`INSERT INTO model_benchmarks(model, tok_per_sec, prompt_tok_per_sec, load_ms, evaluated_at)
+		VALUES(?, ?, ?, ?, ?)
+		ON CONFLICT(model) DO UPDATE SET tok_per_sec=excluded.tok_per_sec,
+			prompt_tok_per_sec=excluded.prompt_tok_per_sec, load_ms=excluded.load_ms,
+			evaluated_at=excluded.evaluated_at`,
+		model, tokPerSec, promptTokPerSec, loadMs, time.Now().UnixMilli())
+	return err
+}
+
+// getBenchmark returns the last measured benchmark for a model, or nil if none.
+func (s *store) getBenchmark(model string) *benchmark {
+	var b benchmark
+	var tok, ptok float64
+	var loadMs int64
+	err := s.db.QueryRow(`SELECT tok_per_sec, prompt_tok_per_sec, load_ms, evaluated_at FROM model_benchmarks WHERE model = ?`, model).
+		Scan(&tok, &ptok, &loadMs, &b.EvaluatedAt)
+	if err != nil {
+		return nil
+	}
+	b.Model = model
+	b.TokPerSec = tok
+	b.PromptTokPerSec = ptok
+	b.LoadMs = loadMs
+	return &b
 }
 
 // migrate adds columns to pre-existing conversations tables (a no-op for fresh
