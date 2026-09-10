@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -54,15 +55,6 @@ type oaiToolFunction struct {
 type oaiTool struct {
 	Type     string          `json:"type"`
 	Function oaiToolFunction `json:"function"`
-}
-
-type oaiChoice struct {
-	Message      oaiMessage `json:"message"`
-	FinishReason string     `json:"finish_reason,omitempty"`
-}
-
-type oaiChatResponse struct {
-	Choices []oaiChoice `json:"choices"`
 }
 
 // chatRequest is the body we accept from the browser. Unknown fields are
@@ -119,30 +111,25 @@ func (s *server) runSearchLoop(ctx context.Context, model string, msgs []oaiMess
 	req := chatRequest{
 		Model:    model,
 		Messages: append([]oaiMessage{systemNudge()}, msgs...),
-		Stream:   false, // non-streaming internally so we can parse tool_calls
 		Tools:    []oaiTool{webSearchTool},
 	}
 
 	for round := 0; round < s.cfg.maxSearchRounds; round++ {
-		oresp, err := s.callOllamaChatCtx(ctx, ollamaChatURL, &req)
+		// Stream the tool-calling pass so any content the model produces before
+		// deciding to search (or instead of searching) reaches the UI live,
+		// rather than after a blocking non-streaming round-trip. tool_call
+		// deltas are accumulated into one assistant message for the next round.
+		msg, err := s.streamOllamaChatWithTools(ctx, ollamaChatURL, &req, emit)
 		if err != nil {
 			return fmt.Errorf("search failed: %w", err)
 		}
-		if len(oresp.Choices) == 0 {
-			return errors.New("empty response from model")
-		}
-		msg := oresp.Choices[0].Message
 		if len(msg.ToolCalls) == 0 {
-			// The model answered without (further) searching: emit its text and finish.
-			var content string
-			if len(msg.Content) > 0 {
-				_ = json.Unmarshal(msg.Content, &content)
+			// The model answered without (further) searching: its content was
+			// already streamed above. Guard the empty case.
+			if len(msg.Content) == 0 {
+				emitPhase("answering")
+				emit("(no response)")
 			}
-			if strings.TrimSpace(content) == "" {
-				content = "(no response)"
-			}
-			emitPhase("answering")
-			emit(content)
 			return nil
 		}
 		// Echo the assistant tool_calls, then append tool results. Searches in a
@@ -192,18 +179,30 @@ func (s *server) runSearchLoop(ctx context.Context, model string, msgs []oaiMess
 	return s.streamFromOllama(ctx, ollamaChatURL, &req, emit)
 }
 
-// callOllamaChatCtx makes a non-streaming chat-completions call to Ollama on the
-// given context and returns the decoded response. Host is forced to
-// localhost:11434 (Ollama 403s non-localhost Hosts) and Origin/Referer stripped.
-func (s *server) callOllamaChatCtx(ctx context.Context, target string, req *chatRequest) (*oaiChatResponse, error) {
-	req.Stream = false
+// streamOllamaChatWithTools POSTs a streaming chat completion, pipes content
+// deltas to emit, and accumulates OpenAI-format tool_call deltas into one
+// assembled assistant message (content + tool_calls) returned for the next
+// round's context. Streaming the tool-calling pass — replacing the old blocking
+// non-streaming call — lets the model's preamble, or a full answer when it
+// decides not to search, reach the UI as it is produced instead of after the
+// whole response is generated. Host is forced to localhost:11434 and
+// Origin/Referer stripped, mirroring streamFromOllama (Ollama 403s non-localhost
+// Hosts and any request carrying an Origin).
+//
+// Ollama streams each tool call as a complete delta (id + name + full
+// arguments in one chunk), so we accumulate by arrival order: a delta carrying
+// a new id starts a new call, a delta with no id is a continuation fragment of
+// the previous call. Keying on id presence (rather than index) stays correct
+// even when Ollama emits index:0 for every call in a multi-call response.
+func (s *server) streamOllamaChatWithTools(ctx context.Context, target string, req *chatRequest, emit func(string)) (oaiMessage, error) {
+	req.Stream = true
 	payload, err := json.Marshal(req)
 	if err != nil {
-		return nil, err
+		return oaiMessage{}, err
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(payload))
 	if err != nil {
-		return nil, err
+		return oaiMessage{}, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Host = "localhost:11434"
@@ -211,17 +210,98 @@ func (s *server) callOllamaChatCtx(ctx context.Context, target string, req *chat
 	httpReq.Header.Del("Referer")
 	resp, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
-		return nil, err
+		return oaiMessage{}, fmt.Errorf("model request failed: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("ollama %s", resp.Status)
+		return oaiMessage{}, fmt.Errorf("model error: %s", resp.Status)
 	}
-	var o oaiChatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&o); err != nil {
-		return nil, fmt.Errorf("decode: %w", err)
+
+	type tcAccum struct {
+		id, typ, name string
+		args          strings.Builder
 	}
-	return &o, nil
+	var calls []tcAccum
+	var content strings.Builder
+	br := bufio.NewReader(resp.Body)
+	for {
+		line, err := br.ReadBytes('\n')
+		if len(line) > 0 {
+			t := strings.TrimSpace(string(line))
+			if strings.HasPrefix(t, "data: ") {
+				data := t[6:]
+				if data == "[DONE]" {
+					break
+				}
+				var chunk struct {
+					Choices []struct {
+						Delta struct {
+							Content   string `json:"content"`
+							ToolCalls []struct {
+								ID       string `json:"id"`
+								Type     string `json:"type"`
+								Function struct {
+									Name      string `json:"name"`
+									Arguments string `json:"arguments"`
+								} `json:"function"`
+							} `json:"tool_calls"`
+						} `json:"delta"`
+					} `json:"choices"`
+				}
+				if json.Unmarshal([]byte(data), &chunk) == nil && len(chunk.Choices) > 0 {
+					d := chunk.Choices[0].Delta
+					if c := d.Content; c != "" {
+						content.WriteString(c)
+						emit(c)
+					}
+					for _, tc := range d.ToolCalls {
+						if tc.ID != "" {
+							c := tcAccum{id: tc.ID, typ: tc.Type, name: tc.Function.Name}
+							c.args.WriteString(tc.Function.Arguments)
+							calls = append(calls, c)
+						} else if len(calls) > 0 {
+							c := &calls[len(calls)-1]
+							if tc.Type != "" {
+								c.typ = tc.Type
+							}
+							if tc.Function.Name != "" {
+								c.name = tc.Function.Name
+							}
+							if tc.Function.Arguments != "" {
+								c.args.WriteString(tc.Function.Arguments)
+							}
+						}
+					}
+				}
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			// A dropped connection after we already have content or tool calls is
+			// tolerable (treat like [DONE]); otherwise it's a hard error.
+			if content.Len() == 0 && len(calls) == 0 {
+				return oaiMessage{}, fmt.Errorf("connection lost: %w", err)
+			}
+			break
+		}
+	}
+
+	msg := oaiMessage{Role: "assistant"}
+	if content.Len() > 0 {
+		msg.Content = jsonString(content.String())
+	}
+	for i := range calls {
+		tc := oaiToolCall{ID: calls[i].id, Type: calls[i].typ}
+		tc.Function.Name = calls[i].name
+		tc.Function.Arguments = calls[i].args.String()
+		msg.ToolCalls = append(msg.ToolCalls, tc)
+	}
+	if content.Len() == 0 && len(calls) == 0 {
+		return msg, errors.New("empty response from model")
+	}
+	return msg, nil
 }
 
 // runWebSearch queries SearXNG and returns formatted result snippets.
