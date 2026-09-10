@@ -16,11 +16,15 @@ import (
 )
 
 const (
-	maxSearchRounds    = 3
-	searchResultCount  = 5
-	searchSnippetChars = 300
+	searchResultCount  = 3
+	searchSnippetChars = 200
 	searchCallTimeout  = 200 * time.Second
 )
+
+// searxngClient is reused across web_search calls for connection pooling. The
+// 15s timeout is a backstop; SearXNG's own outgoing max_request_timeout bounds
+// the actual search latency.
+var searxngClient = &http.Client{Timeout: 15 * time.Second}
 
 // --- OpenAI chat schema (the subset we manipulate) -------------------------
 
@@ -92,7 +96,8 @@ var webSearchTool = oaiTool{
 func systemNudge() oaiMessage {
 	return oaiMessage{Role: "system", Content: jsonString(
 		"You have a web_search tool for current or time-sensitive facts that may be past your training cutoff. " +
-			"Call it only when the answer needs fresh information; otherwise answer directly. " +
+			"Call it once with a well-formed query, then synthesize your answer directly from the results — do not search again. " +
+			"Only call it when the answer needs fresh information; otherwise answer directly. " +
 			"When you do search, cite the source URLs in your answer and say when you could not verify something.")}
 }
 
@@ -118,7 +123,7 @@ func (s *server) runSearchLoop(ctx context.Context, model string, msgs []oaiMess
 		Tools:    []oaiTool{webSearchTool},
 	}
 
-	for round := 0; round < maxSearchRounds; round++ {
+	for round := 0; round < s.cfg.maxSearchRounds; round++ {
 		oresp, err := s.callOllamaChatCtx(ctx, ollamaChatURL, &req)
 		if err != nil {
 			return fmt.Errorf("search failed: %w", err)
@@ -140,18 +145,42 @@ func (s *server) runSearchLoop(ctx context.Context, model string, msgs []oaiMess
 			emit(content)
 			return nil
 		}
-		// Echo the assistant tool_calls, then append tool results.
+		// Echo the assistant tool_calls, then append tool results. Searches in a
+		// single round run concurrently (ordered results preserve the API's
+		// tool_call_id alignment); the query is echoed to the UI as it fires.
 		req.Messages = append(req.Messages, msg)
-		for _, tc := range msg.ToolCalls {
-			result := "unknown tool"
-			if tc.Function.Name == "web_search" {
-				result = s.runWebSearch(tc.Function.Arguments)
+		results := make([]string, len(msg.ToolCalls))
+		var wg sync.WaitGroup
+		for i, tc := range msg.ToolCalls {
+			if tc.Function.Name != "web_search" {
+				results[i] = "unknown tool"
+				continue
 			}
+			var args struct {
+				Query string `json:"query"`
+			}
+			if json.Unmarshal([]byte(tc.Function.Arguments), &args) == nil {
+				q := strings.ReplaceAll(strings.TrimSpace(args.Query), "\n", " ")
+				if len(q) > 80 {
+					q = q[:80] + "…"
+				}
+				if q != "" {
+					emitPhase("searching:" + q)
+				}
+			}
+			wg.Add(1)
+			go func(i int, argsJSON string) {
+				defer wg.Done()
+				results[i] = s.runWebSearch(argsJSON)
+			}(i, tc.Function.Arguments)
+		}
+		wg.Wait()
+		for i, tc := range msg.ToolCalls {
 			req.Messages = append(req.Messages, oaiMessage{
 				Role:       "tool",
 				ToolCallID: tc.ID,
 				Name:       tc.Function.Name,
-				Content:    jsonString(result),
+				Content:    jsonString(results[i]),
 			})
 		}
 	}
@@ -204,12 +233,11 @@ func (s *server) runWebSearch(argsJSON string) string {
 		return "No search query provided."
 	}
 	searchURL := strings.TrimRight(s.cfg.searxngURL, "/") + "/search?q=" + url.QueryEscape(args.Query) + "&format=json"
-	client := &http.Client{Timeout: 15 * time.Second}
 	req, err := http.NewRequest(http.MethodGet, searchURL, nil)
 	if err != nil {
 		return "Search backend misconfigured."
 	}
-	resp, err := client.Do(req)
+	resp, err := searxngClient.Do(req)
 	if err != nil {
 		log.Printf("web_search: %v", err)
 		return "Search failed: " + err.Error()

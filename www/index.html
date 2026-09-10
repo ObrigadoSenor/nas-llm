@@ -528,7 +528,7 @@ function tailJob(convId, bubble, cursor, initialAcc){
     bubble.replaceChildren();
     if(acc){ bubble.textContent=acc; }
     else if(phase==="queued"){ bubble.textContent="⏳ Queued — another reply is generating… "; bubble.appendChild(thinkingDots()); }
-    else if(phase==="searching"){ bubble.textContent="🔍 searching the web… "; bubble.appendChild(thinkingDots()); }
+    else if(phase==="searching"||phase.startsWith("searching:")){ const q=phase.startsWith("searching:")?phase.slice(10).trim():""; bubble.textContent=q?("🔍 searching: "+q+" "):"🔍 searching the web… "; bubble.appendChild(thinkingDots()); }
     else{ bubble.appendChild(thinkingDots()); }
     bubble.appendChild(cursor);
     chat.scrollTop=chat.scrollHeight;

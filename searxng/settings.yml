@@ -20,19 +20,29 @@ server:
   bind_address: "0.0.0.0"
   port: 8080
 
+# Bound outbound latency: per-engine request_timeout (3s, the inherited
+# default pinned explicitly) and an overall max_request_timeout (5s) so one
+# slow or hung engine can't stall the meta-search the backend is waiting on.
+outgoing:
+  request_timeout: 3.0
+  max_request_timeout: 5.0
+
 # A small engine set reduces outbound noise / CAPTCHA risk.
 engines:
   - name: google
     engine: google
     shortcut: g
+    timeout: 3
     disabled: false
   - name: bing
     engine: bing
     shortcut: b
+    timeout: 3
     disabled: false
   - name: duckduckgo
     engine: duckduckgo
     shortcut: ddg
+    timeout: 3
     disabled: false
 
 general:
