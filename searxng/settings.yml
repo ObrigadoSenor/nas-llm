@@ -1,0 +1,50 @@
+# SearXNG settings for the nas-llm web_search tool.
+# Internal-only (no published port) — the backend calls /search?format=json.
+#
+# `use_default_settings: true` inherits the image's bundled defaults, then our
+# overrides below take precedence. Two load-bearing settings:
+#   - search.formats includes json  (off by default; without it every consumer
+#     silently gets HTML and "no results")
+#   - server.limiter: false         (no Redis; the backend is the only client)
+# Rotate secret_key if SearXNG is ever exposed beyond the internal network.
+use_default_settings: true
+
+search:
+  formats:
+    - html
+    - json
+
+server:
+  secret_key: "704fa71cd86ffa7af05a82f88e4f89fa81c68086f08002ed8b9cc30be0140385"
+  limiter: false
+  bind_address: "0.0.0.0"
+  port: 8080
+
+# Bound outbound latency: per-engine request_timeout (3s, the inherited
+# default pinned explicitly) and an overall max_request_timeout (5s) so one
+# slow or hung engine can't stall the meta-search the backend is waiting on.
+outgoing:
+  request_timeout: 3.0
+  max_request_timeout: 5.0
+
+# A small engine set reduces outbound noise / CAPTCHA risk.
+engines:
+  - name: google
+    engine: google
+    shortcut: g
+    timeout: 3
+    disabled: false
+  - name: bing
+    engine: bing
+    shortcut: b
+    timeout: 3
+    disabled: false
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    timeout: 3
+    disabled: false
+
+general:
+  debug: false
+  instance_name: "nas-llm search"

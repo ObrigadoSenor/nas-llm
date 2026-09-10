@@ -5,20 +5,23 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
 
 type config struct {
-	addr          string
-	sessionSecret []byte
-	cookieSecure  bool
-	brevoKey      string
-	appBaseURL    string
-	mailFrom      string
-	allowedEmails map[string]bool
-	dbPath        string
-	ollamaURL     string
+	addr            string
+	sessionSecret   []byte
+	cookieSecure    bool
+	brevoKey        string
+	appBaseURL      string
+	mailFrom        string
+	allowedEmails   map[string]bool
+	dbPath          string
+	ollamaURL       string
+	searxngURL      string
+	maxSearchRounds int
 }
 
 type server struct {
@@ -28,6 +31,7 @@ type server struct {
 	mailer      mailer
 	modelsProxy http.Handler
 	chatProxy   http.Handler
+	jobs        *jobManager
 }
 
 type ctxKey int
@@ -36,13 +40,15 @@ const ctxEmail ctxKey = 0
 
 func main() {
 	cfg := config{
-		addr:          ":" + env("BACKEND_PORT", "8081"),
-		sessionSecret: []byte(mustEnv("SESSION_SECRET")),
-		brevoKey:      env("BREVO_API_KEY", ""),
-		appBaseURL:    env("APP_BASE_URL", "https://chat.selected.systems"),
-		mailFrom:      env("MAIL_FROM", "noreply@selected.systems"),
-		dbPath:        env("DB_PATH", "/data/nas-llm.db"),
-		ollamaURL:     env("OLLAMA_URL", "http://ollama:11434"),
+		addr:            ":" + env("BACKEND_PORT", "8081"),
+		sessionSecret:   []byte(mustEnv("SESSION_SECRET")),
+		brevoKey:        env("BREVO_API_KEY", ""),
+		appBaseURL:      env("APP_BASE_URL", "https://chat.selected.systems"),
+		mailFrom:        env("MAIL_FROM", "noreply@selected.systems"),
+		dbPath:          env("DB_PATH", "/data/nas-llm.db"),
+		ollamaURL:       env("OLLAMA_URL", "http://ollama:11434"),
+		searxngURL:      env("SEARXNG_URL", ""),
+		maxSearchRounds: envInt("MAX_SEARCH_ROUNDS", 1),
 	}
 	cfg.cookieSecure = strings.HasPrefix(cfg.appBaseURL, "https://")
 	cfg.allowedEmails = parseAllowed(os.Getenv("ALLOWED_EMAILS"))
@@ -61,6 +67,7 @@ func main() {
 		modelsProxy: buildProxy(cfg.ollamaURL, "/v1/models"),
 		chatProxy:   buildProxy(cfg.ollamaURL, "/v1/chat/completions"),
 	}
+	srv.jobs = newJobManager(st, srv)
 
 	hs := &http.Server{
 		Addr:              cfg.addr,
@@ -76,6 +83,15 @@ func main() {
 func env(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
+	}
+	return def
+}
+
+func envInt(k string, def int) int {
+	if v := os.Getenv(k); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
 	}
 	return def
 }
@@ -112,12 +128,17 @@ func (s *server) routes() http.Handler {
 
 	mux.HandleFunc("GET /api/models", s.requireAuth(s.handleModels))
 	mux.HandleFunc("POST /api/chat/completions", s.requireAuth(s.handleChat))
+	mux.HandleFunc("GET /api/jobs/active", s.requireAuth(s.handleActiveJobs))
 	mux.HandleFunc("GET /api/conversations", s.requireAuth(s.handleListConversations))
 	mux.HandleFunc("GET /api/conversations/{id}", s.requireAuth(s.handleGetConversation))
 	mux.HandleFunc("POST /api/conversations", s.requireAuth(s.handleCreateConversation))
 	mux.HandleFunc("PUT /api/conversations/{id}", s.requireAuth(s.handleUpdateConversation))
 	mux.HandleFunc("PATCH /api/conversations/{id}", s.requireAuth(s.handlePatchConversation))
 	mux.HandleFunc("DELETE /api/conversations/{id}", s.requireAuth(s.handleDeleteConversation))
+	mux.HandleFunc("POST /api/conversations/{id}/generate", s.requireAuth(s.handleGenerate))
+	mux.HandleFunc("POST /api/conversations/{id}/cancel", s.requireAuth(s.handleCancel))
+	mux.HandleFunc("GET /api/conversations/{id}/events", s.requireAuth(s.handleEvents))
+	mux.HandleFunc("GET /api/conversations/{id}/job", s.requireAuth(s.handleJob))
 	mux.HandleFunc("GET /api/folders", s.requireAuth(s.handleListFolders))
 	mux.HandleFunc("POST /api/folders", s.requireAuth(s.handleCreateFolder))
 	mux.HandleFunc("PUT /api/folders/{id}", s.requireAuth(s.handleRenameFolder))

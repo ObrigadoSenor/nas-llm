@@ -25,7 +25,7 @@ echo "==> Syncing stack to ${REMOTE}:${REMOTE_DIR}"
 ssh "$REMOTE" "mkdir -p ${REMOTE_DIR}/ollama ${REMOTE_DIR}/caddy/data ${REMOTE_DIR}/caddy/config ${REMOTE_DIR}/backend/data"
 # UGOS Pro ships a restricted rsync wrapper (ug_start_server) that rejects
 # /volume1/docker paths, so pipe the files over plain SSH with tar instead.
-tar -cf - -C "$ROOT_DIR" docker-compose.yml Caddyfile .env www backend \
+tar -cf - -C "$ROOT_DIR" docker-compose.yml Caddyfile .env www backend searxng \
   | ssh "$REMOTE" "tar -xf - -C '${REMOTE_DIR}'"
 ssh "$REMOTE" "chmod 600 ${REMOTE_DIR}/.env"
 
