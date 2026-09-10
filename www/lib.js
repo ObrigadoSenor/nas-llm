@@ -33,6 +33,7 @@ const ICONS = {
   'plus':        '<path d="M5 12h14"/><path d="M12 5v14"/>',
   'paperclip':   '<path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 17.93 8.83l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/>',
   'image':       '<rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/>',
+  'help':        '<circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><path d="M12 17h.01"/>',
 };
 
 // Render an icon by name. Returns an SVG string (currentColor stroke).
@@ -243,6 +244,46 @@ export function clearSearchPending(container) {
   if (!container.children.length) container.classList.add('hidden');
 }
 
+// --- Clarifying questions (agent loop) --------------------------------------
+// renderClarifyCard paints the model's clarifying question(s) as a card with
+// one button per option (single-select) or a "type your answer" hint (free).
+// It replaces the bubble's streamed preamble so the card is the whole answer.
+// When answered=true the option buttons render disabled (the user already
+// replied, e.g. on a reload of history); onAnswer(value) fires on click for a
+// live, unanswered card and is expected to send the value as the next turn.
+export function renderClarifyCard(container, clarify, answered, onAnswer) {
+  if (!container) return;
+  container.replaceChildren();
+  const qs = (clarify && clarify.questions) || [];
+  qs.forEach(q => {
+    const card = document.createElement('div'); card.className = 'clarify-card';
+    const head = document.createElement('div'); head.className = 'clarify-q';
+    head.textContent = q.text || '';
+    card.appendChild(head);
+    const opts = q.options || [];
+    if (q.type === 'free' || !opts.length) {
+      const hint = document.createElement('div'); hint.className = 'clarify-hint muted';
+      hint.textContent = 'Type your answer below and send.';
+      card.appendChild(hint);
+    } else {
+      const row = document.createElement('div'); row.className = 'clarify-options';
+      opts.forEach(o => {
+        const v = o.value || o.label;
+        const btn = document.createElement('button'); btn.type = 'button'; btn.className = 'clarify-option';
+        btn.textContent = o.label || v || '';
+        if (answered) {
+          btn.disabled = true;
+        } else if (onAnswer) {
+          btn.addEventListener('click', () => onAnswer(v));
+        }
+        row.appendChild(btn);
+      });
+      card.appendChild(row);
+    }
+    container.appendChild(card);
+  });
+}
+
 // Escape plain text (used for user messages, which are NOT rendered as markdown
 // — a user typing # or * shouldn't see accidental formatting).
 export function escapeHtml(s) {
@@ -262,8 +303,13 @@ export class StreamRenderer {
     this.phase = '';
     this.dirty = false;
     this.scheduled = false;
+    this._suspended = false; // when true, _flush is a no-op (a clarify card owns the bubble)
     this._scrollParent = undefined; // cached nearest scrollable ancestor
   }
+
+  // Freeze the renderer so a scheduled RAF flush won't overwrite a clarify card
+  // that took over the bubble. Used when a "questions" event arrives.
+  suspend() { this.scheduled = false; this.dirty = false; this._suspended = true; }
 
   // Walk up from the bubble to the first ancestor that scrolls vertically.
   // Cached so we don't repeat getComputedStyle every animation frame.
@@ -310,12 +356,19 @@ export class StreamRenderer {
       wrap.appendChild(ic); wrap.appendChild(t);
       return wrap;
     }
+    if (this.phase === 'clarifying') {
+      const ic = document.createElement('span'); ic.className = 'status-ic'; ic.innerHTML = icon('help', 15);
+      const t = document.createElement('span'); t.textContent = 'Thinking of a question to ask…';
+      wrap.appendChild(ic); wrap.appendChild(t);
+      return wrap;
+    }
     wrap.appendChild(thinkingDots());
     return wrap;
   }
 
   _flush() {
     this.scheduled = false;
+    if (this._suspended) return;
     if (!this.dirty) return;
     this.dirty = false;
     // Capture the follow state BEFORE re-parsing, while scrollTop still

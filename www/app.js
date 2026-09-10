@@ -1,6 +1,6 @@
 // nas-llm chat UI — app logic, split out of the old single-file index.html.
 // Imports UI helpers (icons, markdown rendering) from lib.js. No build step.
-import { icon, setIcon, renderMessage, escapeHtml, StreamRenderer, thinkingDots, renderSearchBlock, appendSearchEntry, showSearchPending, clearSearchPending, renderSourceLinks, appendSourceLinks } from './lib.js?v=22';
+import { icon, setIcon, renderMessage, escapeHtml, StreamRenderer, thinkingDots, renderSearchBlock, appendSearchEntry, showSearchPending, clearSearchPending, renderSourceLinks, appendSourceLinks, renderClarifyCard } from './lib.js?v=23';
 
 const $ = id => document.getElementById(id);
 const app=$("app"), loginView=$("login");
@@ -37,7 +37,10 @@ let openMenu = null;           // currently shown row action menu element
 let dragConv = null;           // conversation being dragged onto a folder
 // Extras: add-ons the user toggles via the + menu. Active ones ride along on
 // the next generate request and show as removable pills above the input.
-const EXTRA_DEFS = [ { id:"web", label:"Web search", icon:"globe" } ];
+const EXTRA_DEFS = [
+  { id:"web", label:"Web search", icon:"globe", exclusive:"clarify" },
+  { id:"clarify", label:"Clarify", icon:"help", exclusive:"web" },
+];
 let activeExtras = loadExtras();
 function loadExtras(){
   let ids=[]; try{ ids=JSON.parse(localStorage.getItem("nas-llm-extras")||"[]")||[]; }catch{}
@@ -48,9 +51,11 @@ function loadExtras(){
 }
 function saveExtras(){ localStorage.setItem("nas-llm-extras", JSON.stringify([...activeExtras])); }
 function webSearchOn(){ return activeExtras.has("web"); }
+function clarifyOn(){ return activeExtras.has("clarify"); }
 let generatingIds = new Set(); // conversation IDs with an active background job
 let activeES = null;           // the current EventSource tail (active conversation)
 let activeJobConvId = null;    // conversation whose tail is currently open
+let pendingClarifyAnswer = null; // option clicked while a question was still finalizing
 let inputHistory = loadInputHistory(); // sent questions, oldest→newest
 let histIndex = inputHistory.length;   // pointer; ==length means "current draft"
 let draft = "";                        // in-progress text saved on first ArrowUp
@@ -78,7 +83,7 @@ function renderPlusPopup(){
     const b=document.createElement("button"); b.type="button"; b.className="plus-item"+(on?" on":"");
     b.setAttribute("role","menuitemcheckbox"); b.setAttribute("aria-checked",String(on));
     b.innerHTML=icon(def.icon,16)+'<span>'+escapeHtml(def.label)+'</span>'+(on?icon("check",14):'');
-    b.addEventListener("click",e=>{ e.stopPropagation(); if(activeExtras.has(def.id)) activeExtras.delete(def.id); else activeExtras.add(def.id); saveExtras(); renderExtras(); });
+    b.addEventListener("click",e=>{ e.stopPropagation(); if(activeExtras.has(def.id)){ activeExtras.delete(def.id); } else { activeExtras.add(def.id); if(def.exclusive) activeExtras.delete(def.exclusive); } saveExtras(); renderExtras(); });
     plusPopup.appendChild(b);
   });
 }
@@ -567,19 +572,30 @@ async function resumeIfGenerating(id){
   }
   generatingIds.add(id); renderSidebar();
   activeJobConvId=id; renderSend();
-  const {bubble, searchWrap, srcLinks}=addMsg("assistant","",job.createdAt||Date.now(), job.searches||null);
-  tailJob(id, bubble, job.content||"", searchWrap, srcLinks);
+  const hasQ = !!(job.questions && job.questions.questions && job.questions.questions.length);
+  const {bubble, searchWrap, srcLinks}=addMsg("assistant", hasQ ? "" : (job.content||""), job.createdAt||Date.now(), job.searches||null, null, job.questions||null, false);
+  tailJob(id, bubble, hasQ ? "" : (job.content||""), searchWrap, srcLinks, job.questions||null);
 }
 
 // tailJob opens an EventSource to /events and renders into bubble via a
 // StreamRenderer (one markdown re-parse per animation frame). On reconnect the
 // server sends a "reset" with the full prefix, which re-anchors acc so
-// reconnects never double-count. "done" reloads the conversation from the
-// server (source of truth — the assistant reply is persisted there).
-function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks){
+// reconnects never double-count. A "questions" event (agent loop) swaps the
+// bubble to a clickable option card and suspends the renderer so a queued
+// flush can't wipe it. "done" reloads the conversation from the server
+// (source of truth — the assistant reply is persisted there).
+function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarify){
   closeTail();
   const renderer = new StreamRenderer(bubble);
-  renderer.set(initialAcc);
+  const onAnswer=(value)=>sendClarifyAnswer(value, bubble);
+  if(initialClarify){
+    // Reattaching to a job that already reached a clarifying question: paint
+    // the card now and freeze the renderer so a queued flush can't wipe it.
+    renderer.suspend();
+    renderClarifyCard(bubble, initialClarify, false, onAnswer);
+  } else {
+    renderer.set(initialAcc);
+  }
   let esClosed=false;
   activeJobConvId=convId;
   const es=new EventSource("/api/conversations/"+encodeURIComponent(convId)+"/events");
@@ -587,6 +603,7 @@ function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks){
   es.addEventListener("reset", e=>{ let acc=""; try{ acc=JSON.parse(e.data); }catch{} renderer.set(acc); });
   es.addEventListener("searches", e=>{ let arr=[]; try{ arr=JSON.parse(e.data)||[]; }catch{} renderSearchBlock(searchWrap, arr); renderSourceLinks(srcLinks, arr); });
   es.addEventListener("search", e=>{ let entry=null; try{ entry=JSON.parse(e.data); }catch{} appendSearchEntry(searchWrap, entry); appendSourceLinks(srcLinks, entry); });
+  es.addEventListener("questions", e=>{ let q=null; try{ q=JSON.parse(e.data); }catch{} renderer.suspend(); renderClarifyCard(bubble, q, false, onAnswer); });
   es.addEventListener("phase", e=>{
     const p=e.data;
     renderer.setPhase(p);
@@ -619,6 +636,12 @@ async function onGenerationDone(convId){
     }catch{}
   }
   await loadConversations();
+  // If the user clicked a clarifying option while the question was still
+  // finalizing, send it now that the turn is done and the card is reloaded.
+  if(convId===activeId && pendingClarifyAnswer){
+    const v=pendingClarifyAnswer; pendingClarifyAnswer=null;
+    input.value=v; stream(); return;
+  }
   input.focus();
 }
 function newChat(){
@@ -658,7 +681,7 @@ function bubbleError(bubble, msg){
   bubble.appendChild(s);
 }
 
-function addMsg(role, text, ts, searches, images){
+function addMsg(role, text, ts, searches, images, clarify, answered){
   const d=document.createElement("div"); d.className="msg "+role;
   if(role==="user"){
     // Questions: text + any attached images — no header, right-aligned.
@@ -683,14 +706,23 @@ function addMsg(role, text, ts, searches, images){
   else searchWrap.classList.add("hidden");
   d.appendChild(searchWrap);
   const b=document.createElement("div"); b.className="bubble prose";
-  if(text) renderMessage(b, text);
+  const hasClarify = !!(clarify && clarify.questions && clarify.questions.length);
+  if(hasClarify){
+    // A clarifying turn renders the question/options card instead of markdown
+    // prose. The question text is also persisted as Content for the model's own
+    // context next round, but we don't show it twice.
+    b.classList.remove("prose");
+    renderClarifyCard(b, clarify, !!answered, (value)=>sendClarifyAnswer(value, b));
+  } else if(text){
+    renderMessage(b, text);
+  }
   d.appendChild(b);
   const meta=document.createElement("div"); meta.className="msg-meta";
   if(ts){ const t=document.createElement("span"); t.className="ts"; t.textContent=fmtTs(ts); meta.appendChild(t); }
   const srcLinks=document.createElement("span"); srcLinks.className="src-links";
   if(searches && searches.length) renderSourceLinks(srcLinks, searches);
   meta.appendChild(srcLinks);
-  if(text) addCopyMsg(meta, text);
+  if(text && !hasClarify) addCopyMsg(meta, text);
   d.appendChild(meta);
   chat.appendChild(d);
   chat.scrollTop=chat.scrollHeight;
@@ -711,7 +743,12 @@ function addCopyMsg(roleRow, text){
 }
 function rerenderChat(){
   chat.innerHTML="";
-  messages.forEach(m=>addMsg(m.role, m.content, m.ts, m.search ? m.search.searches : null, m.images||null));
+  messages.forEach((m,i)=>{
+    // A clarifying question is "answered" once a user turn follows it, so on a
+    // reload we render its option buttons disabled.
+    const answered = m.role==="assistant" && !!m.clarify && i<messages.length-1 && messages[i+1] && messages[i+1].role==="user";
+    addMsg(m.role, m.content, m.ts, m.search ? m.search.searches : null, m.images||null, m.clarify||null, answered);
+  });
 }
 function updateHeader(){
   if(!activeId){ chatTitle.textContent="New chat"; chatMeta.textContent=""; return; }
@@ -767,7 +804,7 @@ async function stream(){
       const r=await fetch("/api/conversations/"+encodeURIComponent(activeId)+"/generate",{
         method:"POST",
         headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({model:selectedModel, messages, web_search:webSearchOn()})
+        body:JSON.stringify({model:selectedModel, messages, web_search:webSearchOn(), clarify:clarifyOn()})
       });
       if(r.ok || r.status===409){ job=await r.json(); break; }
       genErr=new Error("HTTP "+r.status);
@@ -792,6 +829,20 @@ async function stream(){
   // chats; "done" reloads this conversation from the server (source of truth).
   tailJob(activeId, bubble, job.content||"", searchWrap, srcLinks);
   renderSend();
+}
+
+// A clarifying-question option was clicked: send its value as the next user
+// turn (which re-enters /generate so the model asks again or answers). If the
+// question is still finalizing (job active), defer until it's done. Disables
+// the card's buttons immediately so the user can't double-send.
+function sendClarifyAnswer(value, bubble){
+  if(bubble) bubble.querySelectorAll(".clarify-option").forEach(btn=>{ btn.disabled=true; });
+  if(activeJobConvId===activeId){
+    pendingClarifyAnswer=value;
+    return;
+  }
+  input.value=value;
+  stream();
 }
 
 send.addEventListener("click",()=>{ if(send.classList.contains("stop")) stopActive(); else stream(); });

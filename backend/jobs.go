@@ -31,7 +31,7 @@ var errJobActive = errors.New("a generation is already running for this conversa
 
 // subEvent is a single event pushed to an SSE subscriber.
 type subEvent struct {
-	kind string // "chunk", "phase", "search", "done", "error"
+	kind string // "chunk", "phase", "search", "questions", "done", "error"
 	text string
 }
 
@@ -46,14 +46,16 @@ type job struct {
 	email     string
 	model     string
 	webSearch bool
+	clarify   bool // Clarify extra was on for this generation (drives the agent loop)
 	createdAt int64
 
 	mu              sync.Mutex
 	status          string // queued, generating, done, error, cancelled
 	content         strings.Builder
 	errMsg          string
-	phase           string         // last phase hint (searching/answering…): replayed on (re)connect
+	phase           string        // last phase hint (searching/answering/clarifying…): replayed on (re)connect
 	searches        []searchEntry // accumulated web-search evidence: broadcast + persisted
+	clarifyMeta     *clarifyMeta  // stashed clarifying question(s) when the model called ask_user: broadcast + persisted
 	subs            map[chan subEvent]struct{}
 	finished        chan struct{}      // closed when the job reaches a terminal state
 	cancelFn        context.CancelFunc // set when the job starts running
@@ -68,13 +70,14 @@ func newJobID() string {
 	return hex.EncodeToString(b)
 }
 
-func newJob(convID, email, model string, webSearch bool) *job {
+func newJob(convID, email, model string, webSearch, clarify bool) *job {
 	return &job{
 		id:        newJobID(),
 		convID:    convID,
 		email:     email,
 		model:     model,
 		webSearch: webSearch,
+		clarify:   clarify,
 		createdAt: time.Now().UnixMilli(),
 		status:    "queued",
 		subs:      map[chan subEvent]struct{}{},
@@ -158,6 +161,41 @@ func (j *job) searchSnapshot() []searchEntry {
 	out := make([]searchEntry, len(j.searches))
 	copy(out, j.searches)
 	return out
+}
+
+// emitQuestions stashes the clarifying question(s) the model produced (so the
+// worker can persist them on the assistant message and /events can replay them)
+// and broadcasts a "questions" event to every live subscriber so the UI paints
+// the clickable option card. Mirrors emitSearch.
+func (j *job) emitQuestions(meta clarifyMeta) {
+	j.mu.Lock()
+	cp := meta
+	j.clarifyMeta = &cp
+	subs := make([]chan subEvent, 0, len(j.subs))
+	for ch := range j.subs {
+		subs = append(subs, ch)
+	}
+	j.mu.Unlock()
+	b, _ := json.Marshal(meta)
+	ev := subEvent{kind: "questions", text: string(b)}
+	for _, ch := range subs {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
+}
+
+// clarifySnapshot returns a copy of the stashed clarifying question(s) for
+// persistence and SSE replay, or nil if the model didn't ask.
+func (j *job) clarifySnapshot() *clarifyMeta {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.clarifyMeta == nil {
+		return nil
+	}
+	cp := *j.clarifyMeta
+	return &cp
 }
 
 func (j *job) contentString() string {
@@ -383,6 +421,16 @@ func (jm *jobManager) worker() {
 		if searches := j.searchSnapshot(); len(searches) > 0 {
 			smeta = &searchMeta{Searches: searches}
 		}
+		// A clarifying turn (the model called ask_user) stashes its structured
+		// question card on the job. Persist the question text as the assistant
+		// content (so the model has context for the user's follow-up answer) and
+		// attach the card for the UI. Preamble the model streamed before calling
+		// ask_user is dropped in favor of the explicit question text.
+		var cmeta *clarifyMeta
+		if cm := j.clarifySnapshot(); cm != nil {
+			cmeta = cm
+			content = clarifyAsContent(cm)
+		}
 
 		j.mu.Lock()
 		cancelled := j.cancelRequested // set by cancel() before it fires the context
@@ -395,7 +443,7 @@ func (jm *jobManager) worker() {
 			ts := time.Now().UnixMilli()
 			if strings.TrimSpace(content) != "" {
 				_ = jm.store.setJobContent(j.id, content)
-				_ = jm.store.appendAssistantMessage(j.email, j.convID, Message{Role: "assistant", Content: content, Ts: ts, Search: smeta})
+				_ = jm.store.appendAssistantMessage(j.email, j.convID, Message{Role: "assistant", Content: content, Ts: ts, Search: smeta, Clarify: cmeta})
 			}
 			_ = jm.store.finalizeJob(j.id, "cancelled", "", ts)
 			j.notifyCancelled()
@@ -405,7 +453,7 @@ func (jm *jobManager) worker() {
 		default:
 			_ = jm.store.setJobContent(j.id, content)
 			ts := time.Now().UnixMilli()
-			_ = jm.store.appendAssistantMessage(j.email, j.convID, Message{Role: "assistant", Content: content, Ts: ts, Search: smeta})
+			_ = jm.store.appendAssistantMessage(j.email, j.convID, Message{Role: "assistant", Content: content, Ts: ts, Search: smeta, Clarify: cmeta})
 			_ = jm.store.finalizeJob(j.id, "done", "", ts)
 			j.notifyDone()
 		}
@@ -474,6 +522,18 @@ func (s *server) runGeneration(j *job) error {
 		}
 	}
 
+	if j.clarify {
+		// Cap back-to-back clarifying questions at MAX_CLARIFY_ROUNDS: once the
+		// model has asked that many in the current clarify session, drop the
+		// ask_user tool and answer directly (a plain streamed pass). Otherwise
+		// run the one-shot agent loop, which is terminal when the model calls
+		// ask_user (it stashes the card on the job and returns nil).
+		if countRecentClarify(conv.Messages) >= s.cfg.maxClarifyRounds {
+			j.emitPhase(phaseForImages(hasImages))
+			return s.runStreamPass(ctx, j.model, msgs, j.emitChunk)
+		}
+		return s.runClarifyLoop(ctx, j.model, msgs, j.emitChunk, j.emitPhase, j.emitQuestions)
+	}
 	if j.webSearch {
 		if s.cfg.searxngURL == "" {
 			// Toggle was on but no SearXNG backend configured: surface it instead

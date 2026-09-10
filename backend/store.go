@@ -13,14 +13,20 @@ import (
 )
 
 type Message struct {
-	Role    string      `json:"role"`
-	Content string      `json:"content"`
+	Role    string `json:"role"`
+	Content string `json:"content"`
 	// Images holds base64 data URLs attached to a vision turn (e.g. gemma3:4b).
 	// Empty for text-only messages, so existing stored conversations round-trip
 	// unchanged. Persisted inline in the messages JSON blob.
-	Images  []string    `json:"images,omitempty"`
-	Ts      int64       `json:"ts,omitempty"`
-	Search  *searchMeta `json:"search,omitempty"`
+	Images []string    `json:"images,omitempty"`
+	Ts     int64       `json:"ts,omitempty"`
+	Search *searchMeta `json:"search,omitempty"`
+	// Clarify, when set on an assistant turn, marks it as a clarifying question
+	// from the agent loop and carries the structured question/options card for
+	// the UI. The question text is also stored in Content so the model has
+	// context for the user's follow-up answer on the next round. Rides in the
+	// messages JSON blob; omitempty keeps existing rows byte-identical.
+	Clarify *clarifyMeta `json:"clarify,omitempty"`
 }
 
 type Conversation struct {

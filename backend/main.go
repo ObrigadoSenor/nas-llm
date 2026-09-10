@@ -11,17 +11,18 @@ import (
 )
 
 type config struct {
-	addr            string
-	sessionSecret   []byte
-	cookieSecure    bool
-	brevoKey        string
-	appBaseURL      string
-	mailFrom        string
-	allowedEmails   map[string]bool
-	dbPath          string
-	ollamaURL       string
-	searxngURL      string
-	maxSearchRounds int
+	addr             string
+	sessionSecret    []byte
+	cookieSecure     bool
+	brevoKey         string
+	appBaseURL       string
+	mailFrom         string
+	allowedEmails    map[string]bool
+	dbPath           string
+	ollamaURL        string
+	searxngURL       string
+	maxSearchRounds  int
+	maxClarifyRounds int
 	// Model-management fit/perf guidance. contextLength mirrors the Ollama
 	// container's OLLAMA_CONTEXT_LENGTH so the backend can estimate the KV-cache
 	// RAM a model will consume at the configured context.
@@ -47,15 +48,16 @@ const ctxEmail ctxKey = 0
 
 func main() {
 	cfg := config{
-		addr:            ":" + env("BACKEND_PORT", "8081"),
-		sessionSecret:   []byte(mustEnv("SESSION_SECRET")),
-		brevoKey:        env("BREVO_API_KEY", ""),
-		appBaseURL:      env("APP_BASE_URL", "https://chat.selected.systems"),
-		mailFrom:        env("MAIL_FROM", "noreply@selected.systems"),
-		dbPath:          env("DB_PATH", "/data/nas-llm.db"),
-		ollamaURL:       env("OLLAMA_URL", "http://ollama:11434"),
-		searxngURL:       env("SEARXNG_URL", ""),
-		maxSearchRounds: envInt("MAX_SEARCH_ROUNDS", 1),
+		addr:               ":" + env("BACKEND_PORT", "8081"),
+		sessionSecret:      []byte(mustEnv("SESSION_SECRET")),
+		brevoKey:           env("BREVO_API_KEY", ""),
+		appBaseURL:         env("APP_BASE_URL", "https://chat.selected.systems"),
+		mailFrom:           env("MAIL_FROM", "noreply@selected.systems"),
+		dbPath:             env("DB_PATH", "/data/nas-llm.db"),
+		ollamaURL:          env("OLLAMA_URL", "http://ollama:11434"),
+		searxngURL:         env("SEARXNG_URL", ""),
+		maxSearchRounds:    envInt("MAX_SEARCH_ROUNDS", 1),
+		maxClarifyRounds:   envInt("MAX_CLARIFY_ROUNDS", 3),
 		contextLength:      envInt("OLLAMA_CONTEXT_LENGTH", 16384),
 		nasRamGB:           envFloat("NAS_RAM_GB", 8),
 		nasSystemReserveGB: envFloat("NAS_SYSTEM_RESERVE_GB", 1.5),

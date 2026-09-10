@@ -126,6 +126,16 @@ header h1{font-size:var(--fs-l);font-weight:600;margin:0}
 .badge.web{background:var(--soft);border-color:color-mix(in srgb,var(--accent) 40%,transparent);color:var(--accent)}
 .badge.web .icon{color:var(--accent)}
 
+/* --- Clarifying questions (agent loop) --- */
+.clarify-card{background:var(--panel);border:1px solid color-mix(in srgb,var(--accent) 35%,transparent);border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:10px}
+.clarify-card+.clarify-card{margin-top:8px}
+.clarify-q{font-size:var(--fs-l);line-height:1.5;color:var(--text)}
+.clarify-hint{font-size:var(--fs-m)}
+.clarify-options{display:flex;flex-wrap:wrap;gap:8px}
+.clarify-option{height:auto;min-height:34px;padding:7px 14px;border-radius:99px;border:1px solid color-mix(in srgb,var(--accent) 45%,transparent);background:var(--soft);color:var(--accent);font-size:var(--fs-m);line-height:1.3}
+.clarify-option:hover:not(:disabled){border-color:var(--accent);background:color-mix(in srgb,var(--accent) 26%,transparent)}
+.clarify-option:disabled{opacity:.5}
+
 .composer{width:100%;max-width:none;margin:0 auto;padding:12px 20% 16px}
 .pills{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
 .pills.hidden{display:none!important}

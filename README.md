@@ -125,6 +125,30 @@ includes `json` — off by default, and without it every consumer silently gets
 HTML) and disables the rate limiter (no Redis). It is internal-only (no
 published port); rotate `server.secret_key` if you ever expose it.
 
+## Clarifying questions (optional)
+
+The chat page's + menu has a **Clarify** toggle. When on, the backend gives the
+model an `ask_user` tool and runs a small agent loop: if the task is ambiguous,
+the model emits a clarifying question with concrete options, shown as a
+clickable card; the user picks one (or types a free-text answer) and that
+becomes the next turn, so the model asks again or answers. It reuses the
+existing background-generation + SSE machinery — each question is a persisted
+assistant turn, each answer a normal user turn — so a half-answered question
+survives a reload or a backend restart (it lives in the conversation, not in
+memory). Back-to-back questions are capped at `MAX_CLARIFY_ROUNDS` (default 3):
+once the cap is reached the `ask_user` tool is withheld and the model must
+answer.
+
+Clarify and Web search are mutually exclusive in the UI (turning one on turns
+the other off). Clarify needs a tool-calling model — `qwen3:1.7b`,
+`qwen2.5:3b`, or `llama3.1:8b` (`deepseek-r1` and the non-tool 3B models just
+answer directly instead of asking). The pure-API host `llm.selected.systems`
+and the browser extension are unaffected; everything rides the existing
+session-cookie `/api/*` surface.
+
+Env (`.env`, with a safe default): `MAX_CLARIFY_ROUNDS=3` — raise it for more
+thorough interrogation, lower it to force a faster answer.
+
 ## Prerequisites on the NAS (phase 1)
 
 1. **Docker** — install from UGOS Pro **App Center > Docker**.
