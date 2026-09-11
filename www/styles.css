@@ -292,14 +292,14 @@ header h1{font-size:var(--fs-l);font-weight:600;margin:0}
 .bar-fill{height:100%;background:var(--accent);border-radius:99px;transition:width .15s linear}
 .bar-meta{display:flex;justify-content:space-between;font-size:var(--fs-s);color:var(--muted)}
 
-.pullbyname{display:flex;flex-direction:column;gap:6px;padding:10px 12px;border:1px dashed var(--border);border-radius:8px}
+.pullbyname{display:flex;flex-direction:column;gap:5px;padding:8px 10px;border:1px dashed var(--border);border-radius:8px}
 .pullbyname .row{display:flex;gap:8px}
 .pullbyname input{flex:1}
 .catalog-note{line-height:1.5}
 
 /* Browse: download target chooser + search + category filter + mode toggle */
-.browse-seg{display:inline-flex;gap:4px;border:1px solid var(--border);border-radius:8px;padding:3px}
-.seg-btn{background:transparent;border:none;border-radius:6px;height:28px;padding:0 14px;color:var(--muted);font-size:var(--fs-m)}
+.browse-seg{display:flex;gap:4px;border:1px solid var(--border);border-radius:8px;padding:3px}
+.seg-btn{flex:1;background:transparent;border:none;border-radius:6px;height:30px;padding:0 14px;color:var(--muted);font-size:var(--fs-m)}
 .seg-btn:hover:not(.active){background:var(--hover);color:var(--text)}
 .seg-btn.active{background:var(--soft);color:var(--accent)}
 .lib-sort-row{display:flex;align-items:center;gap:6px}
@@ -314,6 +314,9 @@ header h1{font-size:var(--fs-l);font-weight:600;margin:0}
 .cat-chip:hover:not(.active){background:var(--hover);color:var(--text)}
 .cat-chip.active{background:var(--soft);border-color:color-mix(in srgb,var(--accent) 40%,transparent);color:var(--accent)}
 .browse-list{display:flex;flex-direction:column;gap:12px}
+/* Secondary zone: manual pull + download settings, grouped below the list */
+.browse-secondary{display:flex;flex-direction:column;gap:10px;padding-top:12px;margin-top:4px;border-top:1px solid var(--border)}
+.browse-secondary-label{font-size:var(--fs-s);color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
 .badge.cat{background:color-mix(in srgb,var(--accent) 12%,transparent);border-color:color-mix(in srgb,var(--accent) 30%,transparent);color:var(--accent)}
 .cat-badges{margin-top:2px}
 /* Gated (no-tool) extras in the + menu read as unavailable, not normal items */

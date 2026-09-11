@@ -1541,42 +1541,9 @@ async function renderBrowseTab(){
   try{ const r=await fetchRetry("/api/models/catalog",{},{label:"Load catalog"}); data=await r.json(); }
   catch(e){ body.appendChild(mutedNote("Could not load catalog.")); await resumePullIfActive(); return; }
   browseCatalog=data;
-  // Download target — prominent, always visible at the top. Applies to every
-  // download (browse cards, pull-by-name, and library cards).
-  const targetRow=document.createElement("div"); targetRow.className="pull-target-row";
-  const tl=document.createElement("span"); tl.className="muted"; tl.textContent="Download to:";
-  targetRow.appendChild(tl); targetRow.appendChild(buildPullTargetSelect());
-  // Local RAM budget: the backend can't know the visitor's RAM, so Local-target
-  // fit is estimated in-browser against this number (persisted, default 16 GB).
-  const ramWrap=document.createElement("span"); ramWrap.className="local-ram-wrap";
-  const ramLabel=document.createElement("span"); ramLabel.className="muted"; ramLabel.textContent="Local RAM:";
-  const ramInp=document.createElement("input"); ramInp.type="number"; ramInp.className="local-ram";
-  ramInp.min=2; ramInp.max=128; ramInp.step=1; ramInp.value=localRamGB;
-  ramInp.title="Your computer's RAM (GB) — used to estimate whether Local-target downloads fit";
-  ramInp.addEventListener("change",()=>{
-    const v=parseFloat(ramInp.value);
-    if(!(v>0)){ ramInp.value=localRamGB; return; }
-    localRamGB=v; saveLocalRamGB(); refreshLocalPreflightBadges();
-  });
-  ramWrap.appendChild(ramLabel); ramWrap.appendChild(ramInp);
-  targetRow.appendChild(ramWrap);
-  body.appendChild(targetRow);
-  // Pull-by-name.
-  const pbn=document.createElement("div"); pbn.className="pullbyname";
-  const hint=document.createElement("span"); hint.className="muted"; hint.textContent="Pull any model by name (e.g. mistral:7b, llama3.2:1b):";
-  const row=document.createElement("div"); row.className="row";
-  const inp=document.createElement("input"); inp.placeholder="model:tag";
-  const go=document.createElement("button"); go.textContent="Download";
-  go.addEventListener("click",()=>{ const v=inp.value.trim(); if(v) startPull(v, pullTarget); });
-  inp.addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault(); go.click(); } });
-  row.appendChild(inp); row.appendChild(go);
-  pbn.appendChild(hint); pbn.appendChild(row); body.appendChild(pbn);
   const nas=data.nas||{};
-  const note=document.createElement("div"); note.className="catalog-note muted";
-  note.textContent=`Fit is estimated for ${nas.ramGB||8} GB RAM · ${(nas.contextLength||16384).toLocaleString()}-tok context (reserve ${(nas.reserveGB||1.5).toFixed(1)} GB). Benchmark after download for real tok/s.`;
-  body.appendChild(note);
-  // Mode toggle: Recommended (curated, with fit verdicts) vs All models (live
-  // search of the full Ollama library via /api/models/library).
+  // Primary: the mode toggle (Recommended | All models) sits on top so browsing
+  // is the first thing the user reaches. Each mode owns its controls + list.
   const seg=document.createElement("div"); seg.className="browse-seg";
   const recB=document.createElement("button"); recB.type="button"; recB.className="seg-btn"+(browseMode!=="library"?" active":""); recB.textContent="Recommended";
   recB.addEventListener("click",()=>{ browseMode="recommended"; localStorage.setItem("nas-llm-browse-mode", browseMode); renderBrowseMode(); });
@@ -1598,17 +1565,58 @@ async function renderBrowseTab(){
   body.appendChild(rec);
   // Library section (live full-library search).
   body.appendChild(buildLibrarySection());
+  // Fit legend: a small muted footnote for the Recommended verdicts. Library
+  // cards carry no fit verdict, so renderBrowseMode hides it in that mode.
+  const note=document.createElement("div"); note.className="catalog-note muted"; note.id="browseFitNote";
+  note.textContent=`Fit is estimated for ${nas.ramGB||8} GB RAM · ${(nas.contextLength||16384).toLocaleString()}-tok context (reserve ${(nas.reserveGB||1.5).toFixed(1)} GB). Benchmark after download for real tok/s.`;
+  body.appendChild(note);
+  // Secondary zone: manual pull + download settings, grouped below a divider
+  // as alternatives to browsing (compact, not primary content).
+  const secondary=document.createElement("div"); secondary.className="browse-secondary";
+  const pbnLabel=document.createElement("div"); pbnLabel.className="browse-secondary-label"; pbnLabel.textContent="Pull a specific model";
+  secondary.appendChild(pbnLabel);
+  const pbn=document.createElement("div"); pbn.className="pullbyname";
+  const hint=document.createElement("span"); hint.className="muted"; hint.textContent="Any model by name, e.g. mistral:7b, llama3.2:1b";
+  const row=document.createElement("div"); row.className="row";
+  const inp=document.createElement("input"); inp.placeholder="model:tag";
+  const go=document.createElement("button"); go.textContent="Download";
+  go.addEventListener("click",()=>{ const v=inp.value.trim(); if(v) startPull(v, pullTarget); });
+  inp.addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault(); go.click(); } });
+  row.appendChild(inp); row.appendChild(go);
+  pbn.appendChild(hint); pbn.appendChild(row); secondary.appendChild(pbn);
+  const dsLabel=document.createElement("div"); dsLabel.className="browse-secondary-label"; dsLabel.textContent="Download settings";
+  secondary.appendChild(dsLabel);
+  const targetRow=document.createElement("div"); targetRow.className="pull-target-row";
+  const tl=document.createElement("span"); tl.className="muted"; tl.textContent="Download to:";
+  targetRow.appendChild(tl); targetRow.appendChild(buildPullTargetSelect());
+  // Local RAM budget: the backend can't know the visitor's RAM, so Local-target
+  // fit is estimated in-browser against this number (persisted, default 16 GB).
+  const ramWrap=document.createElement("span"); ramWrap.className="local-ram-wrap";
+  const ramLabel=document.createElement("span"); ramLabel.className="muted"; ramLabel.textContent="Local RAM:";
+  const ramInp=document.createElement("input"); ramInp.type="number"; ramInp.className="local-ram";
+  ramInp.min=2; ramInp.max=128; ramInp.step=1; ramInp.value=localRamGB;
+  ramInp.title="Your computer's RAM (GB) — used to estimate whether Local-target downloads fit";
+  ramInp.addEventListener("change",()=>{
+    const v=parseFloat(ramInp.value);
+    if(!(v>0)){ ramInp.value=localRamGB; return; }
+    localRamGB=v; saveLocalRamGB(); refreshLocalPreflightBadges();
+  });
+  ramWrap.appendChild(ramLabel); ramWrap.appendChild(ramInp);
+  targetRow.appendChild(ramWrap);
+  secondary.appendChild(targetRow);
+  body.appendChild(secondary);
   renderBrowseMode();
   await resumePullIfActive();
 }
 
 // Toggle which Browse section is visible and render the active one.
 function renderBrowseMode(){
-  const rec=$("browseRec"), lib=$("browseLib");
+  const rec=$("browseRec"), lib=$("browseLib"), note=$("browseFitNote");
   if(!rec||!lib) return;
   const libOn=browseMode==="library";
   rec.classList.toggle("hidden", libOn);
   lib.classList.toggle("hidden", !libOn);
+  if(note) note.classList.toggle("hidden", libOn);
   document.querySelectorAll(".browse-seg .seg-btn").forEach((b,i)=>{ b.classList.toggle("active", (i===0 && !libOn) || (i===1 && libOn)); });
   if(libOn) renderLibraryList(); else renderBrowseList();
 }
