@@ -237,6 +237,10 @@ function renderSend(){
 async function stopActive(){
   if(activeJobConvId !== activeId) return;
   send.disabled=true;
+  // For a local-model job, abort the in-flight localhost inference immediately
+  // so Stop is responsive — don't wait for the SSE "done" round-trip. The
+  // backend /cancel still finalizes the connection-bound job.
+  if(activeLocalAbort){ activeLocalAbort.abort(); activeLocalAbort=null; }
   try{ await fetch("/api/conversations/"+encodeURIComponent(activeId)+"/cancel",{method:"POST"}); }catch{}
   // The SSE "done" event from the cancelled job finalizes the UI; if it never
   // arrives (e.g. the job already finished), fall back after a short delay.
@@ -705,31 +709,39 @@ async function relayLocalModelCall(convId, call, renderer, bubble, signal){
   if(!resp.ok){ const msg=localStatusErrMsg(resp.status); bubbleError(bubble, msg); postModelResponse(convId, call.jobId, null, null, msg); return null; }
   let content=""; const toolsByIndex=new Map();
   const reader=resp.body.getReader(); const dec=new TextDecoder(); let buf=""; let finished=false;
-  while(!finished){
-    const {done, value}=await reader.read();
-    if(done) break;
-    buf+=dec.decode(value,{stream:true});
-    let idx;
-    while((idx=buf.indexOf("\n"))>=0){
-      const line=buf.slice(0,idx).trim(); buf=buf.slice(idx+1);
-      if(!line.startsWith("data:")) continue;
-      const data=line.slice(5).trim();
-      if(data==="[DONE]"){ finished=true; break; }
-      let j; try{ j=JSON.parse(data); }catch{ continue; }
-      const delta=j.choices && j.choices[0] && j.choices[0].delta;
-      if(!delta) continue;
-      if(delta.content){ content+=delta.content; renderer.append(delta.content); }
-      if(delta.tool_calls){
-        for(const tc of delta.tool_calls){
-          const i=tc.index??0;
-          let cur=toolsByIndex.get(i);
-          if(!cur){ cur={id:tc.id||null, type:tc.type||"function", function:{name:"", arguments:""}}; toolsByIndex.set(i,cur); }
-          if(tc.id) cur.id=tc.id;
-          if(tc.type) cur.type=tc.type;
-          if(tc.function){ if(tc.function.name) cur.function.name+=tc.function.name; if(tc.function.arguments) cur.function.arguments+=tc.function.arguments; }
+  try{
+    while(!finished){
+      const {done, value}=await reader.read();
+      if(done) break;
+      buf+=dec.decode(value,{stream:true});
+      let idx;
+      while((idx=buf.indexOf("\n"))>=0){
+        const line=buf.slice(0,idx).trim(); buf=buf.slice(idx+1);
+        if(!line.startsWith("data:")) continue;
+        const data=line.slice(5).trim();
+        if(data==="[DONE]"){ finished=true; break; }
+        let j; try{ j=JSON.parse(data); }catch{ continue; }
+        const delta=j.choices && j.choices[0] && j.choices[0].delta;
+        if(!delta) continue;
+        if(delta.content){ content+=delta.content; renderer.append(delta.content); }
+        if(delta.tool_calls){
+          for(const tc of delta.tool_calls){
+            const i=tc.index??0;
+            let cur=toolsByIndex.get(i);
+            if(!cur){ cur={id:tc.id||null, type:tc.type||"function", function:{name:"", arguments:""}}; toolsByIndex.set(i,cur); }
+            if(tc.id) cur.id=tc.id;
+            if(tc.type) cur.type=tc.type;
+            if(tc.function){ if(tc.function.name) cur.function.name+=tc.function.name; if(tc.function.arguments) cur.function.arguments+=tc.function.arguments; }
+          }
         }
       }
     }
+  }catch(e){
+    // Intentional abort (Stop / done / closeTail): bail without posting — the
+    // backend's connection-bound job is finalized by the SSE done/cancel path.
+    if(signal.aborted) return null;
+    // Mid-stream network drop: fall through and return whatever streamed so
+    // far so the backend gets partial content instead of hanging.
   }
   const toolCalls=toolsByIndex.size?[...toolsByIndex.entries()].sort((a,b)=>a[0]-b[0]).map(([,v])=>v):null;
   return { content, toolCalls };
@@ -778,10 +790,19 @@ function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarif
     let d={}; try{ d=JSON.parse(e.data); }catch{ return; }
     if(!d.jobId || !d.model) return;
     const ctrl=new AbortController(); activeLocalAbort=ctrl;
-    const res=await relayLocalModelCall(convId, d, renderer, bubble, ctrl.signal);
-    activeLocalAbort=null;
-    if(res===null) return;                  // fetch failed: error shown + empty response posted
-    await postModelResponse(convId, d.jobId, res.content, res.toolCalls);
+    try{
+      const res=await relayLocalModelCall(convId, d, renderer, bubble, ctrl.signal);
+      if(res===null) return;                  // fetch failed or aborted: error shown / nothing to post
+      await postModelResponse(convId, d.jobId, res.content, res.toolCalls);
+    }catch(err){
+      // Unexpected throw relayLocalModelCall didn't handle: finalize as an
+      // error so the backend's connection-bound job doesn't hang.
+      if(ctrl.signal.aborted) return;
+      bubbleError(bubble, localFetchErrMsg());
+      postModelResponse(convId, d.jobId, null, null, localFetchErrMsg());
+    }finally{
+      if(activeLocalAbort===ctrl) activeLocalAbort=null;
+    }
   });
   es.addEventListener("phase", e=>{
     const p=e.data;
