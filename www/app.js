@@ -856,7 +856,10 @@ async function relayLocalModelCall(convId, call, renderer, bubble, signal){
   const body={ model:call.model, messages:call.messages, stream:true };
   if(call.tools && call.tools.length) body.tools=call.tools;
   let resp;
-  try{ resp=await fetch("http://localhost:11434/v1/chat/completions",{ method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body), signal }); }
+  // text/plain (not application/json) to keep this a CORS "simple request" with
+  // no preflight — same Private Network Access dodge as startLocalPull. Ollama's
+  // /v1/chat/completions decodes the JSON body regardless of Content-Type.
+  try{ resp=await fetch("http://localhost:11434/v1/chat/completions",{ method:"POST", headers:{"Content-Type":"text/plain"}, body:JSON.stringify(body), signal }); }
   catch(e){ if(signal.aborted) return null; const msg=localFetchErrMsg(String(e&&e.message||e)); bubbleError(bubble, msg); postModelResponse(convId, call.jobId, null, null, msg); return null; }
   if(!resp.ok){ const msg=localStatusErrMsg(resp.status); bubbleError(bubble, msg); postModelResponse(convId, call.jobId, null, null, msg); return null; }
   let content=""; const calls=[];
@@ -1808,7 +1811,13 @@ async function startLocalPull(model){
   const ctrl=new AbortController(); activePullAbort=ctrl; pullMode="local"; pullJobModel=model;
   renderPullStatus({ model, percent:0, completed:0, total:0, phase:"pulling manifest", status:"pulling", jobId:"local" });
   let resp;
-  try{ resp=await fetch("http://localhost:11434/api/pull",{ method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({model, stream:true}), signal:ctrl.signal }); }
+  // Content-Type is text/plain (not application/json) on purpose: a POST with a
+  // CORS-safelisted content type is a "simple request" with no preflight, so it
+  // isn't blocked by Chrome's Private Network Access (an HTTPS page POSTing to
+  // http://localhost triggers a preflight that Ollama can't answer with
+  // Access-Control-Allow-Private-Network: true). Ollama's JSON decoder ignores
+  // the Content-Type and parses the body regardless, so the JSON still works.
+  try{ resp=await fetch("http://localhost:11434/api/pull",{ method:"POST", headers:{"Content-Type":"text/plain"}, body:JSON.stringify({model, stream:true}), signal:ctrl.signal }); }
   catch(e){ if(ctrl.signal.aborted){ abortCleanup(); return; } onPullError(localFetchErrMsg(String(e&&e.message||e))); abortCleanup(); return; }
   if(!resp.ok){ onPullError(localStatusErrMsg(resp.status)); abortCleanup(); return; }
   const reader=resp.body.getReader(); const dec=new TextDecoder(); let buf=""; const layers=new Map(); let finished=false; let gotSuccess=false;
