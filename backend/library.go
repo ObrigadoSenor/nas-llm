@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -152,4 +153,134 @@ func (s *server) handleModelLibrary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"models": models, "count": len(models)})
+}
+
+// --- Per-model tags + download sizes (ollama.com/library/<name>/tags) -------
+
+// libraryTag is one available tag of a library model with its on-disk download
+// size, scraped from ollama.com/library/<name>/tags — the only place per-tag
+// sizes are published (Ollama exposes no tags API). SizeGB is normalized to
+// decimal GB; SizeLabel keeps the page's "1.3GB"/"581MB" string for display.
+type libraryTag struct {
+	Tag       string  `json:"tag"`
+	Model     string  `json:"model"` // full "name:tag"
+	SizeGB    float64 `json:"sizeGB"`
+	SizeLabel string  `json:"sizeLabel,omitempty"`
+	Context   string  `json:"context,omitempty"`
+}
+
+var (
+	// Each tag row lists the download size bullet-anchored ("• 1.3GB •") in the
+	// mobile variant only; the desktop grid cell repeats it without the bullet.
+	// Anchoring on the bullet avoids stray "8 mb"-style tokens elsewhere on the
+	// page and yields exactly one size per tag, in document order.
+	libTagSizeRe = regexp.MustCompile(`•\s*([0-9]+(?:\.[0-9]+)?)\s?(GB|MB|KB)`)
+	libTagCtxRe  = regexp.MustCompile(`([0-9]+(?:\.[0-9]+)?[KM]?)\scontext window`)
+)
+
+// parseOllamaTagsHTML turns ollama.com/library/<name>/tags HTML into libraryTag
+// entries. Each tag row appears twice (mobile + desktop variants sharing one
+// href each), so we dedupe consecutive tag hrefs and pair each with the first
+// bullet-anchored size that starts after its href. Lenient: a changed layout
+// yields fewer (or zero) entries rather than erroring; the caller falls back to
+// a default-tag pull when the result is empty.
+func parseOllamaTagsHTML(body []byte, modelName string) []libraryTag {
+	hrefRe := regexp.MustCompile(`href="/library/` + regexp.QuoteMeta(modelName) + `:([^"]+)"`)
+	hrefIdx := hrefRe.FindAllSubmatchIndex(body, -1)
+	sizeIdx := libTagSizeRe.FindAllSubmatchIndex(body, -1)
+	ctxIdx := libTagCtxRe.FindAllSubmatchIndex(body, -1)
+	out := make([]libraryTag, 0, len(hrefIdx)/2)
+	si, ci := 0, 0
+	last := ""
+	for _, h := range hrefIdx {
+		tag := string(body[h[2]:h[3]])
+		if tag == last { // skip the desktop-variant duplicate of the same tag
+			continue
+		}
+		last = tag
+		lt := libraryTag{Tag: tag, Model: modelName + ":" + tag}
+		for si < len(sizeIdx) && sizeIdx[si][0] < h[1] {
+			si++
+		}
+		if si < len(sizeIdx) {
+			numStr := string(body[sizeIdx[si][2]:sizeIdx[si][3]])
+			unitStr := string(body[sizeIdx[si][4]:sizeIdx[si][5]])
+			lt.SizeLabel = numStr + unitStr
+			if num, err := strconv.ParseFloat(numStr, 64); err == nil {
+				switch unitStr {
+				case "GB":
+					lt.SizeGB = num
+				case "MB":
+					lt.SizeGB = num / 1024
+				case "KB":
+					lt.SizeGB = num / (1024 * 1024)
+				}
+			}
+			si++
+		}
+		for ci < len(ctxIdx) && ctxIdx[ci][0] < h[1] {
+			ci++
+		}
+		if ci < len(ctxIdx) {
+			lt.Context = string(body[ctxIdx[ci][2]:ctxIdx[ci][3]])
+			ci++
+		}
+		out = append(out, lt)
+	}
+	return out
+}
+
+// scrapeOllamaModelTags fetches ollama.com/library/<name>/tags and parses the
+// per-tag list with download sizes. Used by Browse's Download menu so the user
+// can pick a specific size/quant before pulling. A name carrying a tag
+// ("llama3.2:1b") is reduced to its base model; only the base has a tags page.
+func scrapeOllamaModelTags(ctx context.Context, name string) ([]libraryTag, error) {
+	name = strings.TrimSpace(name)
+	if i := strings.Index(name, ":"); i >= 0 {
+		name = name[:i] // strip an incidental tag; the tags page is per base model
+	}
+	if name == "" {
+		return nil, fmt.Errorf("model name required")
+	}
+	u := "https://ollama.com/library/" + url.PathEscape(name) + "/tags"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("ollama.com unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("ollama.com tags returned %s", resp.Status)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return nil, err
+	}
+	return parseOllamaTagsHTML(body, name), nil
+}
+
+// handleModelLibraryTags returns the available tags + download sizes for one
+// library model, scraped from ollama.com/library/<name>/tags. Session-auth-
+// gated. On scrape failure returns 502 so the frontend can fall back to a
+// default-tag pull.
+func (s *server) handleModelLibraryTags(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	if name == "" {
+		jsonError(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
+	defer cancel()
+	tags, err := scrapeOllamaModelTags(ctx, name)
+	if err != nil {
+		log.Printf("model tags scrape: %v", err)
+		jsonError(w, "model tags unavailable: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, map[string]any{"name": name, "tags": tags})
 }

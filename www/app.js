@@ -410,10 +410,12 @@ async function reattachLocalModels(){
   enforceToolGating();
   if($("modelsModal").classList.contains("open") && modelsTab==="installed") renderInstalledTab();
 }
-// Discover the visitor's local Ollama (localhost:11434). An HTTPS page makes
-// the fetch trigger Chrome's Local Network Access prompt (the "accept" UX).
-// 403 = Ollama is running but rejected the cross-origin request (needs
-// OLLAMA_ORIGINS); a throw = nothing is listening on 11434.
+// Discover the visitor's local Ollama (localhost:11434). A cross-origin GET
+// that Ollama 403s (no OLLAMA_ORIGINS) is surfaced by the browser as a thrown
+// TypeError, not an exposed 403 — so the catch below is hit for the common
+// "needs OLLAMA_ORIGINS" case too, not only when nothing is listening. The
+// HTTPS-page-to-http-localhost request can also trip Chrome's Local Network
+// Access gate; both land in the same catch as opaque TypeErrors.
 async function discoverLocalModels(){
   let r;
   try{ r=await fetch("http://localhost:11434/api/tags"); }
@@ -820,17 +822,14 @@ async function resumeIfGenerating(id){
 // bubble via the same StreamRenderer as server-model chunks, then POSTs the
 // assembled {content, tool_calls} back so the backend can continue the tool
 // loop (web_search/clarify/agent) or finalize. `tools` is null for plain chat.
-// The localhost:11434 fetch threw before any HTTP response — either nothing
-// answered on that port, or a browser security policy blocked the request (an
-// HTTPS page probing a local port trips Chrome's Local/Private Network Access
-// gate; a denied prompt or failed preflight surfaces as a throw, not a 403).
-// Browsers report all of these as an opaque TypeError, so we surface the raw
-// message and point at the console instead of claiming Ollama is missing — it
-// may well be running. `detail` is the captured e.message when available.
+// The localhost:11434 fetch threw before any HTTP response. The common cause
+// is Ollama 403'ing the cross-origin request because OLLAMA_ORIGINS isn't set:
+// the browser hides that 403 behind an opaque TypeError, so we never reach the
+// r.status===403 branch above. Lead with the OLLAMA_ORIGINS fix (the page's own
+// origin) and append the raw error when we have it. `detail` is e.message.
 function localFetchErrMsg(detail){
-  const lead = location.protocol === "https:"
-    ? "Could not reach Ollama on this computer. If it's running, the browser likely blocked the request (Private Network Access) — check DevTools → Console; otherwise start Ollama so localhost:11434 answers."
-    : "Could not reach Ollama on this computer — start Ollama so localhost:11434 answers, or check DevTools → Console if it's already running.";
+  const origin = location.origin || "*";
+  const lead = "Could not reach Ollama on this computer. If it's running, restart it with OLLAMA_ORIGINS=" + origin + " (or OLLAMA_ORIGINS=*); check DevTools → Console if that doesn't resolve it.";
   return detail ? lead + " (" + detail + ")" : lead;
 }
 function localStatusErrMsg(status){
@@ -1501,11 +1500,20 @@ function availablePullTargets(){
   ts.push({value:"local",label:"Local (this computer)"});
   return ts;
 }
-// Per-card Download menu: click Download → choose where to pull this model.
-// Reuses the row-action menu infra (closeMenu/openMenu).
-function openDownloadMenu(anchor, model){
-  closeMenu();
-  const m=document.createElement("div"); m.className="menu dl-menu";
+// Position a floating menu under an anchor and arm the click-to-close listener.
+function positionMenu(m, anchor){
+  const r=anchor.getBoundingClientRect();
+  m.style.left=Math.min(r.left, window.innerWidth-m.offsetWidth-8)+"px";
+  m.style.top=(r.bottom+4)+"px";
+  openMenu=m;
+  setTimeout(()=>document.addEventListener("click",closeMenu),0);
+}
+// Build the NAS/Mac/Local target chooser inside m for a fully-qualified model
+// (name or name:tag). Each target is enriched with the real download size +
+// per-host fit once its preflight resolves. Clicking a target pulls.
+function renderTargetChooser(m, model){
+  m.className="menu dl-menu";
+  m.replaceChildren();
   const title=document.createElement("div"); title.className="menu-msg"; title.textContent="Download "+model+" to:"; m.appendChild(title);
   availablePullTargets().forEach(t=>{
     const b=document.createElement("button"); b.className="dl-target";
@@ -1514,9 +1522,9 @@ function openDownloadMenu(anchor, model){
     b.appendChild(label); b.appendChild(sub);
     b.addEventListener("click",e=>{ e.stopPropagation(); closeMenu(); startPull(model, t.value); });
     m.appendChild(b);
-    // Enrich this item with the real download size + per-host fit once the
-    // preflight resolves (cached, so a reopen is instant). Fails silently to a
-    // muted "size unknown" when the registry endpoint is unreachable.
+    // Enrich with the real download size + per-host fit once the preflight
+    // resolves (cached, so a reopen is instant). Fails silently to a muted
+    // "size unknown" when the registry endpoint is unreachable.
     preflightModel(model, t.value).then(pf=>{
       if(!pf || pf.downloadGB == null){ sub.textContent="size unknown"; sub.classList.add("dl-unknown"); return; }
       sub.replaceChildren(); sub.classList.remove("muted");
@@ -1528,12 +1536,36 @@ function openDownloadMenu(anchor, model){
       }
     });
   });
+}
+// Per-card Download menu. An already-tagged name (curated catalog entry like
+// "llama3.2:1b") goes straight to the target chooser. A bare library name has
+// many tags/sizes, so we list them (scraped from ollama.com/library/<name>/tags)
+// and morph into the target chooser once the user picks a tag. Falls back to
+// the default-tag target chooser if the tags lookup fails.
+async function openDownloadMenu(anchor, model){
+  closeMenu();
+  const m=document.createElement("div"); m.className="menu dl-menu";
   document.body.appendChild(m);
-  const r=anchor.getBoundingClientRect();
-  m.style.left=Math.min(r.left, window.innerWidth-m.offsetWidth-8)+"px";
-  m.style.top=(r.bottom+4)+"px";
-  openMenu=m;
-  setTimeout(()=>document.addEventListener("click",closeMenu),0);
+  if(model.includes(":")){ renderTargetChooser(m, model); positionMenu(m, anchor); return; }
+  const title=document.createElement("div"); title.className="menu-msg"; title.textContent="Choose a size for "+model+":"; m.appendChild(title);
+  const loading=document.createElement("div"); loading.className="menu-msg muted"; loading.textContent="Loading sizes…"; m.appendChild(loading);
+  positionMenu(m, anchor);
+  let tags=[];
+  try{ const r=await fetchRetry("/api/models/library/tags?name="+encodeURIComponent(model),{},{label:"Load tags"}); if(r.ok){ const j=await r.json(); tags=j.tags||[]; } }catch{}
+  if(!tags.length){ renderTargetChooser(m, model); positionMenu(m, anchor); return; }
+  m.replaceChildren();
+  const head=document.createElement("div"); head.className="menu-msg"; head.textContent="Choose a size for "+model+":"; m.appendChild(head);
+  m.style.maxHeight="60vh"; m.style.overflowY="auto";
+  tags.forEach(t=>{
+    const b=document.createElement("button"); b.className="dl-target";
+    const nm=document.createElement("span"); nm.className="dl-label"; nm.textContent=t.tag;
+    const sz=document.createElement("span"); sz.className="dl-sub"; sz.textContent=(t.sizeLabel || (t.sizeGB? t.sizeGB.toFixed(1)+" GB":""));
+    if(t.context) b.title=t.context+" context window";
+    b.appendChild(nm); b.appendChild(sz);
+    b.addEventListener("click",e=>{ e.stopPropagation(); m.style.maxHeight=""; m.style.overflowY=""; renderTargetChooser(m, model+":"+t.tag); positionMenu(m, anchor); });
+    m.appendChild(b);
+  });
+  positionMenu(m, anchor);
 }
 async function renderBrowseTab(){
   const body=$("tabBody"); body.innerHTML="";
