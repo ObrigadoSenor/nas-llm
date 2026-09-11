@@ -33,6 +33,12 @@ type Message struct {
 	// messages JSON blob so a reload re-paints the trace; omitempty keeps
 	// existing rows byte-identical. Populated only for agent-mode turns.
 	Steps []agentStep `json:"steps,omitempty"`
+	// Thoughts, when set on an assistant turn, is the agent's per-round reasoning
+	// text (one entry per thinking round) shown in a smaller collapsible drawer
+	// above the answer. Rides in the messages JSON blob so a reload re-paints it;
+	// omitempty keeps existing rows byte-identical. Populated only for agent-mode
+	// turns where the model reasoned across multiple tool-calling rounds.
+	Thoughts []string `json:"thoughts,omitempty"`
 }
 
 type Conversation struct {

@@ -293,7 +293,8 @@ func agentSystemNudge() string {
 // identical calls. On step-budget exhaustion it forces one final streamed
 // answer with the tools removed so the model must synthesize.
 func (s *server) runAgentLoop(ctx context.Context, target, model, email string, msgs []oaiMessage, allow []string, systemPrompt string,
-	emit func(string), emitPhase func(string), emitTool func(agentStep), emitQuestions func(clarifyMeta), addUsage func(int, int)) error {
+	emit func(string), emitPhase func(string), emitTool func(agentStep), emitQuestions func(clarifyMeta),
+	emitThought func(string), emitClear func(), addUsage func(int, int)) error {
 	emitPhase("agent")
 	reg := s.toolRegistry(email)
 	tools := make([]oaiTool, 0, len(allow))
@@ -325,7 +326,20 @@ func (s *server) runAgentLoop(ctx context.Context, target, model, email string, 
 		// Bound the running transcript before each model call so a long multi-step
 		// run can't overflow the 8-16k context window (Tier 3 compaction).
 		req.Messages = s.maybeCompact(ctx, target, model, req.Messages)
-		msg, usage, err := s.streamOllamaChatWithTools(ctx, ollamaChatURL, &req, emit)
+		// Stream this round's content live to the answer bubble AND capture it in a
+		// per-round buffer. If the round ends with tool calls, the buffered text is
+		// moved to the thinking drawer and the bubble is cleared (emitClear), so only
+		// the final answer round's text remains in the bubble. This separates the
+		// model's reasoning (thinking) from its synthesized answer.
+		var roundBuf strings.Builder
+		roundEmit := func(delta string) {
+			if delta == "" {
+				return
+			}
+			roundBuf.WriteString(delta)
+			emit(delta)
+		}
+		msg, usage, err := s.streamOllamaChatWithTools(ctx, ollamaChatURL, &req, roundEmit)
 		if err != nil {
 			return fmt.Errorf("agent step %d: %w", step+1, err)
 		}
@@ -333,13 +347,21 @@ func (s *server) runAgentLoop(ctx context.Context, target, model, email string, 
 			addUsage(usage.PromptTokens, usage.CompletionTokens)
 		}
 		if len(msg.ToolCalls) == 0 {
-			// Final answer — its content was already streamed above.
+			// Final answer — its content was already streamed above and stays in
+			// the bubble + j.content (the answer, not thinking).
 			emitPhase("answering")
 			if len(msg.Content) == 0 {
 				emit("(no response)")
 			}
 			return nil
 		}
+		// Thinking round (had tool calls): move this round's text to the thinking
+		// drawer and clear the answer bubble so it ends up holding only the final
+		// synthesized answer.
+		if roundBuf.Len() > 0 {
+			emitThought(roundBuf.String())
+		}
+		emitClear()
 		// Append the assistant turn (thought + tool_calls) for the next round.
 		req.Messages = append(req.Messages, msg)
 		for _, tc := range msg.ToolCalls {
@@ -383,7 +405,13 @@ func (s *server) runAgentLoop(ctx context.Context, target, model, email string, 
 			if out.terminal {
 				// ask_user: stash the question card on the job (emitQuestions) so the
 				// worker persists it as a clarifying turn, and the step's Clarify
-				// payload lets the UI paint the card from the trace too.
+				// payload lets the UI paint the card from the trace too. The preamble
+				// streamed this round is thinking, not the answer — clear the bubble so
+				// the question card (rendered by the questions event) owns it cleanly.
+				if roundBuf.Len() > 0 {
+					emitThought(roundBuf.String())
+				}
+				emitClear()
 				if out.clarify != nil {
 					emitQuestions(*out.clarify)
 				}

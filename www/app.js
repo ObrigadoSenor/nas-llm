@@ -1,6 +1,6 @@
 // nas-llm chat UI — app logic, split out of the old single-file index.html.
 // Imports UI helpers (icons, markdown rendering) from lib.js. No build step.
-import { icon, setIcon, renderMessage, escapeHtml, StreamRenderer, thinkingDots, renderSearchBlock, appendSearchEntry, showSearchPending, clearSearchPending, renderSourceLinks, appendSourceLinks, renderClarifyCard, renderAgentSteps, appendAgentStep } from './lib.js?v=24';
+import { icon, setIcon, renderMessage, escapeHtml, StreamRenderer, thinkingDots, renderSearchBlock, appendSearchEntry, showSearchPending, clearSearchPending, renderSourceLinks, appendSourceLinks, renderClarifyCard, renderAgentSteps, appendAgentStep, buildThoughtsWrap, renderThoughts, appendThought } from './lib.js?v=25';
 
 const $ = id => document.getElementById(id);
 const app=$("app"), loginView=$("login");
@@ -581,8 +581,10 @@ async function resumeIfGenerating(id){
   generatingIds.add(id); renderSidebar();
   activeJobConvId=id; renderSend();
   const hasQ = !!(job.questions && job.questions.questions && job.questions.questions.length);
-  const {bubble, searchWrap, srcLinks, stepsWrap}=addMsg("assistant", hasQ ? "" : (job.content||""), job.createdAt||Date.now(), job.searches||null, null, job.questions||null, false, job.steps||null);
-  tailJob(id, bubble, hasQ ? "" : (job.content||""), searchWrap, srcLinks, job.questions||null, stepsWrap, job.steps||null);
+  const {bubble, searchWrap, srcLinks, stepsWrap, thoughtsWrap, thoughtsDet}=addMsg("assistant", hasQ ? "" : (job.content||""), job.createdAt||Date.now(), job.searches||null, null, job.questions||null, false, job.steps||null, job.thoughts||null);
+  // A finished/reloaded agent turn collapses its thinking (it's done).
+  if(thoughtsDet && (!job.thoughts || !job.thoughts.length)) thoughtsDet.open = false;
+  tailJob(id, bubble, hasQ ? "" : (job.content||""), searchWrap, srcLinks, job.questions||null, stepsWrap, job.steps||null, thoughtsWrap, thoughtsDet, job.thoughts||null);
 }
 
 // tailJob opens an EventSource to /events and renders into bubble via a
@@ -592,7 +594,7 @@ async function resumeIfGenerating(id){
 // bubble to a clickable option card and suspends the renderer so a queued
 // flush can't wipe it. "done" reloads the conversation from the server
 // (source of truth — the assistant reply is persisted there).
-function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarify, stepsWrap, initialSteps){
+function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarify, stepsWrap, initialSteps, thoughtsWrap, thoughtsDet, initialThoughts){
   closeTail();
   const renderer = new StreamRenderer(bubble);
   const onAnswer=(value)=>sendClarifyAnswer(value, bubble);
@@ -605,6 +607,7 @@ function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarif
     renderer.set(initialAcc);
   }
   if(initialSteps && stepsWrap) renderAgentSteps(stepsWrap, initialSteps);
+  if(initialThoughts && thoughtsWrap) renderThoughts(thoughtsWrap, initialThoughts);
   let esClosed=false;
   activeJobConvId=convId;
   const es=new EventSource("/api/conversations/"+encodeURIComponent(convId)+"/events");
@@ -615,6 +618,9 @@ function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarif
   es.addEventListener("questions", e=>{ let q=null; try{ q=JSON.parse(e.data); }catch{} renderer.suspend(); renderClarifyCard(bubble, q, false, onAnswer); });
   es.addEventListener("steps", e=>{ let arr=[]; try{ arr=JSON.parse(e.data)||[]; }catch{} renderAgentSteps(stepsWrap, arr); });
   es.addEventListener("tool", e=>{ let st=null; try{ st=JSON.parse(e.data); }catch{} appendAgentStep(stepsWrap, st); });
+  es.addEventListener("thoughts", e=>{ let arr=[]; try{ arr=JSON.parse(e.data)||[]; }catch{} renderThoughts(thoughtsWrap, arr); });
+  es.addEventListener("thought", e=>{ let t=""; try{ t=JSON.parse(e.data); }catch{} appendThought(thoughtsWrap, t); });
+  es.addEventListener("clear", ()=>{ renderer.set(""); });
   es.addEventListener("phase", e=>{
     const p=e.data;
     renderer.setPhase(p);
@@ -623,13 +629,14 @@ function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarif
     else if(p==="answering") clearSearchPending(searchWrap);
   });
   es.addEventListener("chunk", e=>{ let d=""; try{ d=JSON.parse(e.data); }catch{} renderer.append(d); });
-  es.addEventListener("done", ()=>{ esClosed=true; es.close(); activeES=null; onGenerationDone(convId); });
+  es.addEventListener("done", ()=>{ esClosed=true; es.close(); activeES=null; if(thoughtsDet) thoughtsDet.open=false; onGenerationDone(convId); });
   es.addEventListener("joberror", e=>{
     esClosed=true; es.close(); activeES=null;
     let msg=e.data; try{ msg=JSON.parse(e.data); }catch{}
     const acc = renderer.acc;
     if(acc) renderer.finalize(acc);
     else bubbleError(bubble, msg);
+    if(thoughtsDet) thoughtsDet.open=false; // collapse thinking on terminal
     generatingIds.delete(convId); renderSidebar();
     activeJobConvId=null; renderSend(); input.focus();
   });
@@ -692,7 +699,7 @@ function bubbleError(bubble, msg){
   bubble.appendChild(s);
 }
 
-function addMsg(role, text, ts, searches, images, clarify, answered, steps){
+function addMsg(role, text, ts, searches, images, clarify, answered, steps, thoughts){
   const d=document.createElement("div"); d.className="msg "+role;
   if(role==="user"){
     // Questions: text + any attached images — no header, right-aligned.
@@ -706,13 +713,18 @@ function addMsg(role, text, ts, searches, images, clarify, answered, steps){
     d.appendChild(b);
     chat.appendChild(d);
     chat.scrollTop=chat.scrollHeight;
-    return {bubble:b, searchWrap:null, srcLinks:null, stepsWrap:null};
+    return {bubble:b, searchWrap:null, srcLinks:null, stepsWrap:null, thoughtsWrap:null, thoughtsDet:null};
   }
-  // Answers: agent tool-call trace (steps drawer) and search evidence (readable
-  // snippets) above the answer, then a meta row (date/time + source-link chips +
-  // copy icon) below. Left-aligned. The steps + search wraps live outside the
-  // StreamRenderer's container so streaming re-parses never wipe them; srcLinks
-  // is filled from searches or during stream.
+  // Answers: agent thinking (per-round reasoning, collapsible) and tool-call
+  // trace (steps drawer) above the answer, then search evidence (readable
+  // snippets), then the answer bubble, then a meta row (date/time + source-link
+  // chips + copy icon) below. Left-aligned. The thinking/steps/search wraps
+  // live outside the StreamRenderer's container so streaming re-parses never
+  // wipe them; srcLinks is filled from searches or during stream.
+  const { wrap: thoughtsWrap, det: thoughtsDet } = buildThoughtsWrap();
+  if(thoughts && thoughts.length) renderThoughts(thoughtsWrap, thoughts);
+  else thoughtsWrap.classList.add("hidden");
+  d.appendChild(thoughtsWrap);
   let stepsWrap=document.createElement("div"); stepsWrap.className="msg-steps";
   if(steps && steps.length) renderAgentSteps(stepsWrap, steps);
   else stepsWrap.classList.add("hidden");
@@ -742,7 +754,7 @@ function addMsg(role, text, ts, searches, images, clarify, answered, steps){
   d.appendChild(meta);
   chat.appendChild(d);
   chat.scrollTop=chat.scrollHeight;
-  return {bubble:b, searchWrap, srcLinks, stepsWrap};
+  return {bubble:b, searchWrap, srcLinks, stepsWrap, thoughtsWrap, thoughtsDet};
 }
 function addCopyMsg(roleRow, text){
   const btn=document.createElement("button"); btn.type="button";
@@ -763,7 +775,7 @@ function rerenderChat(){
     // A clarifying question is "answered" once a user turn follows it, so on a
     // reload we render its option buttons disabled.
     const answered = m.role==="assistant" && !!m.clarify && i<messages.length-1 && messages[i+1] && messages[i+1].role==="user";
-    addMsg(m.role, m.content, m.ts, m.search ? m.search.searches : null, m.images||null, m.clarify||null, answered, m.steps||null);
+    addMsg(m.role, m.content, m.ts, m.search ? m.search.searches : null, m.images||null, m.clarify||null, answered, m.steps||null, m.thoughts||null);
   });
 }
 function updateHeader(){
@@ -805,7 +817,7 @@ async function stream(){
   if(!activeId) return;
 
   const aTs=Date.now();
-  const {bubble, searchWrap, srcLinks, stepsWrap}=addMsg("assistant","",aTs);
+  const {bubble, searchWrap, srcLinks, stepsWrap, thoughtsWrap, thoughtsDet}=addMsg("assistant","",aTs);
   send.disabled=true;
   generatingIds.add(activeId); renderSidebar();
   activeJobConvId=activeId;
@@ -843,7 +855,7 @@ async function stream(){
 
   // Tail the job. Generation keeps running on the NAS even if the user switches
   // chats; "done" reloads this conversation from the server (source of truth).
-  tailJob(activeId, bubble, job.content||"", searchWrap, srcLinks, null, stepsWrap, null);
+  tailJob(activeId, bubble, job.content||"", searchWrap, srcLinks, null, stepsWrap, null, thoughtsWrap, thoughtsDet, null);
   renderSend();
 }
 

@@ -31,7 +31,7 @@ var errJobActive = errors.New("a generation is already running for this conversa
 
 // subEvent is a single event pushed to an SSE subscriber.
 type subEvent struct {
-	kind string // "chunk", "phase", "search", "questions", "tool", "done", "error"
+	kind string // "chunk", "phase", "search", "questions", "tool", "thought", "clear", "done", "error"
 	text string
 }
 
@@ -61,6 +61,7 @@ type job struct {
 	searches        []searchEntry // accumulated web-search evidence: broadcast + persisted
 	clarifyMeta     *clarifyMeta  // stashed clarifying question(s) when the model called ask_user: broadcast + persisted
 	steps           []agentStep   // accumulated agent tool-call trace: broadcast + persisted
+	thoughts        []string      // accumulated agent per-round reasoning: broadcast + persisted
 	subs            map[chan subEvent]struct{}
 	finished        chan struct{}      // closed when the job reaches a terminal state
 	cancelFn        context.CancelFunc // set when the job starts running
@@ -253,6 +254,66 @@ func (j *job) usageSnapshot() (int, int) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return j.promptTokens, j.completionTokens
+}
+
+// emitThought records one agent reasoning round's text and broadcasts it to every
+// live subscriber so the UI can paint it in a smaller, collapsible thinking drawer
+// (separate from the answer bubble). Also accumulated for persistence and SSE
+// replay. Called by the agent loop at the end of each tool-calling round with
+// that round's full streamed text.
+func (j *job) emitThought(text string) {
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+	j.mu.Lock()
+	j.thoughts = append(j.thoughts, text)
+	subs := make([]chan subEvent, 0, len(j.subs))
+	for ch := range j.subs {
+		subs = append(subs, ch)
+	}
+	j.mu.Unlock()
+	d, _ := json.Marshal(text)
+	ev := subEvent{kind: "thought", text: string(d)}
+	for _, ch := range subs {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
+}
+
+// thoughtSnapshot returns a copy of the accumulated agent reasoning rounds for
+// persistence (attached to the saved assistant message) and SSE replay.
+func (j *job) thoughtSnapshot() []string {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if len(j.thoughts) == 0 {
+		return nil
+	}
+	out := make([]string, len(j.thoughts))
+	copy(out, j.thoughts)
+	return out
+}
+
+// emitClear clears the answer bubble (broadcasts a "clear" event) and rewinds the
+// job's content accumulator so j.content holds only the answer, not the thinking
+// that was just moved to the drawer. Called at the end of each agent thinking
+// round so the bubble ends up showing only the final synthesized answer.
+func (j *job) emitClear() {
+	j.mu.Lock()
+	j.content.Reset()
+	subs := make([]chan subEvent, 0, len(j.subs))
+	for ch := range j.subs {
+		subs = append(subs, ch)
+	}
+	j.mu.Unlock()
+	ev := subEvent{kind: "clear"}
+	for _, ch := range subs {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
 }
 
 func (j *job) contentString() string {
@@ -491,8 +552,10 @@ func (jm *jobManager) worker() {
 			content = clarifyAsContent(cm)
 		}
 		// Agent-mode turns carry their tool-call trace on the message so a reload
-		// re-paints the steps drawer.
+		// re-paints the steps drawer, and the per-round reasoning in a smaller
+		// collapsible thinking drawer.
 		steps := j.stepSnapshot()
+		thoughts := j.thoughtSnapshot()
 		// Observability: persist the per-step trace (agent_steps) and the cumulative
 		// token totals (jobs.prompt_tokens / completion_tokens) for analytics.
 		// Best-effort: a failure here never undoes a successful generation.
@@ -513,7 +576,7 @@ func (jm *jobManager) worker() {
 			ts := time.Now().UnixMilli()
 			if strings.TrimSpace(content) != "" {
 				_ = jm.store.setJobContent(j.id, content)
-				_ = jm.store.appendAssistantMessage(j.email, j.convID, Message{Role: "assistant", Content: content, Ts: ts, Search: smeta, Clarify: cmeta, Steps: steps})
+				_ = jm.store.appendAssistantMessage(j.email, j.convID, Message{Role: "assistant", Content: content, Ts: ts, Search: smeta, Clarify: cmeta, Steps: steps, Thoughts: thoughts})
 			}
 			_ = jm.store.finalizeJob(j.id, "cancelled", "", ts)
 			j.notifyCancelled()
@@ -523,7 +586,7 @@ func (jm *jobManager) worker() {
 		default:
 			_ = jm.store.setJobContent(j.id, content)
 			ts := time.Now().UnixMilli()
-			_ = jm.store.appendAssistantMessage(j.email, j.convID, Message{Role: "assistant", Content: content, Ts: ts, Search: smeta, Clarify: cmeta, Steps: steps})
+			_ = jm.store.appendAssistantMessage(j.email, j.convID, Message{Role: "assistant", Content: content, Ts: ts, Search: smeta, Clarify: cmeta, Steps: steps, Thoughts: thoughts})
 			_ = jm.store.finalizeJob(j.id, "done", "", ts)
 			j.notifyDone()
 		}
@@ -606,7 +669,7 @@ func (s *server) runGeneration(j *job) error {
 
 	if j.agent {
 		allow, sys := s.agentConfig(j)
-		return s.runAgentLoop(ctx, chatURL, j.model, j.email, msgs, allow, sys, j.emitChunk, j.emitPhase, j.emitTool, j.emitQuestions, j.addUsage)
+		return s.runAgentLoop(ctx, chatURL, j.model, j.email, msgs, allow, sys, j.emitChunk, j.emitPhase, j.emitTool, j.emitQuestions, j.emitThought, j.emitClear, j.addUsage)
 	}
 	if j.clarify {
 		// Cap back-to-back clarifying questions at MAX_CLARIFY_ROUNDS: once the

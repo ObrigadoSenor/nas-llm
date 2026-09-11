@@ -407,6 +407,7 @@ type jobState struct {
 	Searches  []searchEntry `json:"searches,omitempty"`
 	Questions *clarifyMeta  `json:"questions,omitempty"`
 	Steps     []agentStep   `json:"steps,omitempty"`
+	Thoughts  []string      `json:"thoughts,omitempty"`
 }
 
 func jobStateFrom(j *job) jobState {
@@ -418,7 +419,7 @@ func jobStateFrom(j *job) jobState {
 	if cq != nil {
 		content = clarifyAsContent(cq)
 	}
-	return jobState{ID: j.id, Status: st, Content: content, Error: errMsg, WebSearch: j.webSearch, Clarify: cq != nil, Agent: j.agent, CreatedAt: j.createdAt, Searches: j.searchSnapshot(), Questions: cq, Steps: j.stepSnapshot()}
+	return jobState{ID: j.id, Status: st, Content: content, Error: errMsg, WebSearch: j.webSearch, Clarify: cq != nil, Agent: j.agent, CreatedAt: j.createdAt, Searches: j.searchSnapshot(), Questions: cq, Steps: j.stepSnapshot(), Thoughts: j.thoughtSnapshot()}
 }
 
 // handleGenerate persists the user's turn and enqueues a detached background
@@ -583,6 +584,12 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		stdata, _ := json.Marshal(steps)
 		writeSSE("event: steps\ndata: " + string(stdata) + "\n\n")
 	}
+	// Replay the agent per-round reasoning accumulated so far as one "thoughts"
+	// event so a reconnect/reload re-paints the (collapsed) thinking drawer.
+	if thoughts := j.thoughtSnapshot(); len(thoughts) > 0 {
+		thdata, _ := json.Marshal(thoughts)
+		writeSSE("event: thoughts\ndata: " + string(thdata) + "\n\n")
+	}
 	// Replay the current phase hint. A queued job reports "queued"; a generating
 	// web-search job may have already fired "searching" before this stream opened,
 	// so replay the stored phase so the UI shows the right waiting state on connect.
@@ -629,6 +636,12 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	flushTool := func(text string) {
 		writeSSE("event: tool\ndata: " + text + "\n\n")
 	}
+	flushThought := func(text string) {
+		writeSSE("event: thought\ndata: " + text + "\n\n")
+	}
+	flushClear := func() {
+		writeSSE("event: clear\ndata: \n\n")
+	}
 	flushError := func(text string) {
 		d, _ := json.Marshal(text)
 		writeSSE("event: joberror\ndata: " + string(d) + "\n\n")
@@ -650,6 +663,10 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 				flushQuestions(ev.text)
 			case "tool":
 				flushTool(ev.text)
+			case "thought":
+				flushThought(ev.text)
+			case "clear":
+				flushClear()
 			case "done":
 				writeSSE("event: done\ndata: \n\n")
 				return
@@ -675,6 +692,10 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 						flushQuestions(ev.text)
 					case "tool":
 						flushTool(ev.text)
+					case "thought":
+						flushThought(ev.text)
+					case "clear":
+						flushClear()
 					case "done":
 						writeSSE("event: done\ndata: \n\n")
 						return
