@@ -349,6 +349,7 @@ async function showApp(){
   whoEmail.textContent=me.email;
   await loadModels();
   reattachLocalModels();          // re-probe localhost so a reload reattaches
+  resumeLocalPull();              // re-drive a local pull that was mid-download before the reload
   await loadConversations();
   await loadActiveJobs();
   if(conversations.length) await openConversation(conversations[0].id);
@@ -1306,6 +1307,13 @@ let pullJobModel = null; // model name of the active pull (for UI)
 let pullTarget = localStorage.getItem("nas-llm-pull-target") || "auto"; // auto|nas|mac|local
 let pullMode = null;            // "server" | "local" | null — which pull path is active
 let activePullAbort = null;     // AbortController for an in-flight LOCAL (browser-driven) pull
+// A local (browser-driven) pull runs as a fetch to localhost:11434/api/pull, so its
+// state lives only in memory — a page refresh aborts the fetch and loses the bar. We
+// persist the in-flight model name so a reload can re-POST /api/pull (Ollama resumes
+// from cached layers and re-streams progress) and re-drive the bar. Cleared on
+// success/cancel/error.
+function loadLocalPullName(){ return localStorage.getItem("nas-llm-local-pull") || ""; }
+function saveLocalPullName(name){ if(name) localStorage.setItem("nas-llm-local-pull", name); else localStorage.removeItem("nas-llm-local-pull"); }
 
 $("manageModels").addEventListener("click", openModelsPanel);
 $("closeModels").addEventListener("click", closeModelsPanel);
@@ -1809,6 +1817,7 @@ async function startLocalPull(model){
   if(pullES){ pullES.close(); pullES=null; }     // a server SSE tail can't drive a local pull
   if(activePullAbort){ activePullAbort.abort(); }
   const ctrl=new AbortController(); activePullAbort=ctrl; pullMode="local"; pullJobModel=model;
+  saveLocalPullName(model);   // remember so a reload can resume (Ollama caches layers)
   renderPullStatus({ model, percent:0, completed:0, total:0, phase:"pulling manifest", status:"pulling", jobId:"local" });
   let resp;
   // Content-Type is text/plain (not application/json) on purpose: a POST with a
@@ -1818,8 +1827,8 @@ async function startLocalPull(model){
   // Access-Control-Allow-Private-Network: true). Ollama's JSON decoder ignores
   // the Content-Type and parses the body regardless, so the JSON still works.
   try{ resp=await fetch("http://localhost:11434/api/pull",{ method:"POST", headers:{"Content-Type":"text/plain"}, body:JSON.stringify({model, stream:true}), signal:ctrl.signal }); }
-  catch(e){ if(ctrl.signal.aborted){ abortCleanup(); return; } onPullError(localFetchErrMsg(String(e&&e.message||e))); abortCleanup(); return; }
-  if(!resp.ok){ onPullError(localStatusErrMsg(resp.status)); abortCleanup(); return; }
+  catch(e){ if(ctrl.signal.aborted){ abortCleanup(); return; } saveLocalPullName(null); onPullError(localFetchErrMsg(String(e&&e.message||e))); abortCleanup(); return; }
+  if(!resp.ok){ saveLocalPullName(null); onPullError(localStatusErrMsg(resp.status)); abortCleanup(); return; }
   const reader=resp.body.getReader(); const dec=new TextDecoder(); let buf=""; const layers=new Map(); let finished=false; let gotSuccess=false;
   try{
     while(!finished){
@@ -1851,6 +1860,7 @@ async function startLocalPull(model){
 }
 function abortCleanup(){ activePullAbort=null; pullMode=null; $("pullStatus").classList.add("hidden"); pullEls=null; }
 async function onLocalPullDone(){
+  saveLocalPullName(null);   // pull finished — don't resume on a later reload
   if(pullEls){ pullEls.fill.style.width="100%"; pullEls.phase.textContent="Installed ✓"; pullEls.cancel.disabled=true; }
   setTimeout(async ()=>{
     $("pullStatus").classList.add("hidden"); pullEls=null; pullMode=null;
@@ -1870,12 +1880,22 @@ function attachPull(job){
 async function resumePullIfActive(){
   try{
     const r=await fetch("/api/models/pulls/active");
-    if(!r.ok) return;
-    const map=await r.json();
-    const keys=Object.keys(map||{});
-    if(!keys.length) return;
-    attachPull(map[keys[0]]);                       // pull survived a modal reopen/reload
+    if(r.ok){
+      const map=await r.json();
+      const keys=Object.keys(map||{});
+      if(keys.length){ attachPull(map[keys[0]]); return; }   // server pull survived a reload
+    }
   }catch{}
+  resumeLocalPull();   // no server pull — resume a browser-driven local pull if one was in progress
+}
+// Resume a browser-driven local pull after a reload: re-POST /api/pull for the
+// persisted model (Ollama resumes from cached layers and re-streams progress).
+// No-op if a pull is already active (server or local) or no pull was in flight.
+function resumeLocalPull(){
+  if(pullMode || activePullAbort) return;
+  const model=loadLocalPullName();
+  if(!model) return;
+  startLocalPull(model);
 }
 
 function renderPullStatus(job){
@@ -1930,7 +1950,7 @@ function onPullError(msg){
 
 async function cancelPull(jobId){
   // A local (browser-driven) pull has no backend job to cancel — abort the fetch.
-  if(pullMode==="local" && activePullAbort){ activePullAbort.abort(); return; }
+  if(pullMode==="local" && activePullAbort){ saveLocalPullName(null); activePullAbort.abort(); return; }
   try{ await fetchRetry("/api/models/pull/"+encodeURIComponent(jobId)+"/cancel",{method:"POST"},{label:"Cancel pull"}); }catch{}
 }
 // --- Per-model actions ------------------------------------------------------
