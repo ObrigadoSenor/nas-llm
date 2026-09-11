@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="dark">
 <title>nas-llm</title>
 <link rel="stylesheet" href="vendor/highlight-github-dark.min.css">
-<link rel="stylesheet" href="styles.css?v=23">
+<link rel="stylesheet" href="styles.css?v=24">
 <script defer src="vendor/highlight.min.js"></script>
 </head>
 <body>
@@ -63,6 +63,27 @@
   </main>
 </div>
 
+<div id="agentModal" class="modal">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h2>Agent settings</h2>
+      <div class="gap"></div>
+      <button id="closeAgent" title="Close"></button>
+    </div>
+    <div class="modal-body">
+      <div class="agent-cfg-note muted">These apply to every Agent-mode run (per-chat overrides come later). The model, tools, and budget make the agent — pick a small tool set for a small local model.</div>
+      <label class="agent-label" for="agentSystem">System prompt</label>
+      <textarea id="agentSystem" rows="5" placeholder="Leave blank to use the built-in agent prompt (injects today's date and steers toward few tool calls)."></textarea>
+      <label class="agent-label">Tools</label>
+      <div id="agentTools" class="agent-tools"></div>
+      <div class="agent-cfg-actions">
+        <button id="saveAgent">Save</button>
+      </div>
+      <div id="agentSaved" class="agent-saved muted hidden">Saved.</div>
+    </div>
+  </div>
+</div>
+
 <div id="modelsModal" class="modal">
   <div class="modal-card">
     <div class="modal-head">
@@ -81,6 +102,6 @@
   </div>
 </div>
 
-<script type="module" src="app.js?v=23"></script>
+<script type="module" src="app.js?v=24"></script>
 </body>
 </html>

@@ -82,11 +82,20 @@ type oaiTool struct {
 // chatRequest is the body we accept from the browser. Unknown fields are
 // ignored; for the search path we re-marshal only model/messages/stream/tools.
 type chatRequest struct {
-	Model     string       `json:"model"`
-	Messages  []oaiMessage `json:"messages"`
-	Stream    bool         `json:"stream"`
-	WebSearch bool         `json:"web_search"`
-	Tools     []oaiTool    `json:"tools,omitempty"`
+	Model         string         `json:"model"`
+	Messages      []oaiMessage   `json:"messages"`
+	Stream        bool           `json:"stream"`
+	WebSearch     bool           `json:"web_search"`
+	Tools         []oaiTool      `json:"tools,omitempty"`
+	StreamOptions map[string]any `json:"stream_options,omitempty"`
+}
+
+// agentUsage is the token accounting for one model round (parsed from Ollama's
+// final streaming chunk when stream_options.include_usage is set). The agent
+// loop accumulates it across rounds for observability.
+type agentUsage struct {
+	PromptTokens     int
+	CompletionTokens int
 }
 
 var webSearchTool = oaiTool{
@@ -129,9 +138,9 @@ func jsonString(s string) json.RawMessage {
 // once per real search (query + source URLs) so the UI can prove a lookup ran,
 // or a Skipped entry when the model answers without ever calling the tool.
 // Returns nil on success, an error otherwise.
-func (s *server) runSearchLoop(ctx context.Context, model string, msgs []oaiMessage, emit func(string), emitPhase func(string), emitSearch func(searchEntry)) error {
+func (s *server) runSearchLoop(ctx context.Context, target, model string, msgs []oaiMessage, emit func(string), emitPhase func(string), emitSearch func(searchEntry)) error {
 	emitPhase("searching")
-	ollamaChatURL := strings.TrimRight(s.cfg.ollamaURL, "/") + "/v1/chat/completions"
+	ollamaChatURL := target
 	req := chatRequest{
 		Model:    model,
 		Messages: append([]oaiMessage{systemNudge()}, msgs...),
@@ -144,7 +153,7 @@ func (s *server) runSearchLoop(ctx context.Context, model string, msgs []oaiMess
 		// deciding to search (or instead of searching) reaches the UI live,
 		// rather than after a blocking non-streaming round-trip. tool_call
 		// deltas are accumulated into one assistant message for the next round.
-		msg, err := s.streamOllamaChatWithTools(ctx, ollamaChatURL, &req, emit)
+		msg, _, err := s.streamOllamaChatWithTools(ctx, ollamaChatURL, &req, emit)
 		if err != nil {
 			return fmt.Errorf("search failed: %w", err)
 		}
@@ -237,15 +246,15 @@ func (s *server) runSearchLoop(ctx context.Context, model string, msgs []oaiMess
 // a new id starts a new call, a delta with no id is a continuation fragment of
 // the previous call. Keying on id presence (rather than index) stays correct
 // even when Ollama emits index:0 for every call in a multi-call response.
-func (s *server) streamOllamaChatWithTools(ctx context.Context, target string, req *chatRequest, emit func(string)) (oaiMessage, error) {
+func (s *server) streamOllamaChatWithTools(ctx context.Context, target string, req *chatRequest, emit func(string)) (oaiMessage, agentUsage, error) {
 	req.Stream = true
 	payload, err := json.Marshal(req)
 	if err != nil {
-		return oaiMessage{}, err
+		return oaiMessage{}, agentUsage{}, err
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(payload))
 	if err != nil {
-		return oaiMessage{}, err
+		return oaiMessage{}, agentUsage{}, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Host = "localhost:11434"
@@ -253,12 +262,13 @@ func (s *server) streamOllamaChatWithTools(ctx context.Context, target string, r
 	httpReq.Header.Del("Referer")
 	resp, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
-		return oaiMessage{}, fmt.Errorf("model request failed: %w", err)
+		return oaiMessage{}, agentUsage{}, fmt.Errorf("model request failed: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return oaiMessage{}, fmt.Errorf("model error: %s", resp.Status)
+		return oaiMessage{}, agentUsage{}, fmt.Errorf("model error: %s", resp.Status)
 	}
+	var usage agentUsage
 
 	type tcAccum struct {
 		id, typ, name string
@@ -290,8 +300,20 @@ func (s *server) streamOllamaChatWithTools(ctx context.Context, target string, r
 							} `json:"tool_calls"`
 						} `json:"delta"`
 					} `json:"choices"`
+					Usage *struct {
+						PromptTokens     int `json:"prompt_tokens"`
+						CompletionTokens int `json:"completion_tokens"`
+						TotalTokens      int `json:"total_tokens"`
+					} `json:"usage,omitempty"`
 				}
-				if json.Unmarshal([]byte(data), &chunk) == nil && len(chunk.Choices) > 0 {
+				if json.Unmarshal([]byte(data), &chunk) == nil {
+					if chunk.Usage != nil {
+						usage.PromptTokens = chunk.Usage.PromptTokens
+						usage.CompletionTokens = chunk.Usage.CompletionTokens
+					}
+					if len(chunk.Choices) == 0 {
+						continue
+					}
 					d := chunk.Choices[0].Delta
 					if c := d.Content; c != "" {
 						content.WriteString(c)
@@ -325,7 +347,7 @@ func (s *server) streamOllamaChatWithTools(ctx context.Context, target string, r
 			// A dropped connection after we already have content or tool calls is
 			// tolerable (treat like [DONE]); otherwise it's a hard error.
 			if content.Len() == 0 && len(calls) == 0 {
-				return oaiMessage{}, fmt.Errorf("connection lost: %w", err)
+				return oaiMessage{}, agentUsage{}, fmt.Errorf("connection lost: %w", err)
 			}
 			break
 		}
@@ -342,9 +364,9 @@ func (s *server) streamOllamaChatWithTools(ctx context.Context, target string, r
 		msg.ToolCalls = append(msg.ToolCalls, tc)
 	}
 	if content.Len() == 0 && len(calls) == 0 {
-		return msg, errors.New("empty response from model")
+		return msg, agentUsage{}, errors.New("empty response from model")
 	}
-	return msg, nil
+	return msg, usage, nil
 }
 
 // runWebSearch queries SearXNG and returns formatted result snippets plus the
@@ -428,7 +450,7 @@ func cleanSnippet(raw string, max int) string {
 // emitting OpenAI-format SSE. The tool loop itself lives in runSearchLoop; here
 // we only wire it to the ResponseWriter with a keepalive goroutine so the
 // Cloudflare 100s edge timeout (524) never fires while the N100 thinks.
-func (s *server) handleChatWithSearch(w http.ResponseWriter, r *http.Request, body []byte) {
+func (s *server) handleChatWithSearch(w http.ResponseWriter, r *http.Request, body []byte, chatURL string) {
 	var req chatRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		jsonError(w, "invalid request", http.StatusBadRequest)
@@ -491,7 +513,7 @@ func (s *server) handleChatWithSearch(w http.ResponseWriter, r *http.Request, bo
 	ctx, cancel := context.WithTimeout(r.Context(), searchCallTimeout)
 	defer cancel()
 
-	err := s.runSearchLoop(ctx, req.Model, req.Messages, emit, emitPhase, func(searchEntry) {})
+	err := s.runSearchLoop(ctx, chatURL, req.Model, req.Messages, emit, emitPhase, func(searchEntry) {})
 	close(stop)
 	wg.Wait()
 

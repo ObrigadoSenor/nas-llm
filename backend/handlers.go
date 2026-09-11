@@ -297,19 +297,21 @@ func (s *server) handleDeleteFolder(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) handlePatchConversation(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Title    *string `json:"title"`
-		FolderID *string `json:"folderId"`
-		Model    *string `json:"model"`
+		Title       *string `json:"title"`
+		FolderID    *string `json:"folderId"`
+		Model       *string `json:"model"`
+		AgentSystem *string `json:"agentSystem"`
+		AgentTools  *string `json:"agentTools"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, "invalid request", http.StatusBadRequest)
 		return
 	}
-	if body.Title == nil && body.FolderID == nil && body.Model == nil {
+	if body.Title == nil && body.FolderID == nil && body.Model == nil && body.AgentSystem == nil && body.AgentTools == nil {
 		jsonError(w, "nothing to update", http.StatusBadRequest)
 		return
 	}
-	c, err := s.store.patchConversation(emailFrom(r), r.PathValue("id"), body.Title, body.FolderID, body.Model)
+	c, err := s.store.patchConversation(emailFrom(r), r.PathValue("id"), body.Title, body.FolderID, body.Model, body.AgentSystem, body.AgentTools)
 	if err != nil {
 		log.Printf("patchConversation: %v", err)
 		jsonError(w, "server error", http.StatusInternalServerError)
@@ -359,19 +361,36 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	r.Body.Close()
 
 	// Branch on the optional web_search flag. Flag off (or no SearXNG
-	// configured) -> the existing streaming passthrough to Ollama, unchanged.
+	// configured) -> a streaming passthrough to the Ollama backend that owns the
+	// requested model; otherwise the tool loop runs on that same backend.
 	var probe struct {
-		WebSearch bool `json:"web_search"`
+		Model     string `json:"model"`
+		WebSearch bool   `json:"web_search"`
 	}
 	_ = json.Unmarshal(body, &probe)
+
+	// Resolve the backend host that owns the model. If no online host has it
+	// (e.g. it lives on the Mac and the Mac is offline), fall back to the default
+	// host so Ollama returns a clean not-found instead of the backend 500ing.
+	h := s.hosts.onlineHostForModel(probe.Model)
+	if h == nil {
+		h = s.hosts.defaultHost()
+	}
+
 	if !probe.WebSearch || s.cfg.searxngURL == "" {
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		r.ContentLength = int64(len(body))
-		s.chatProxy.ServeHTTP(w, r)
+		if p := s.chatProxies[h.name]; p != nil {
+			p.ServeHTTP(w, r)
+		} else if p := s.chatProxies[s.hosts.defaultHost().name]; p != nil {
+			p.ServeHTTP(w, r)
+		} else {
+			jsonError(w, "no inference backend configured", http.StatusBadGateway)
+		}
 		return
 	}
 
-	s.handleChatWithSearch(w, r, body)
+	s.handleChatWithSearch(w, r, body, h.chatURL())
 }
 
 // --- Background generation (chat UI) ---
@@ -383,9 +402,11 @@ type jobState struct {
 	Error     string        `json:"error,omitempty"`
 	WebSearch bool          `json:"webSearch"`
 	Clarify   bool          `json:"clarify,omitempty"`
+	Agent     bool          `json:"agent,omitempty"`
 	CreatedAt int64         `json:"createdAt"`
 	Searches  []searchEntry `json:"searches,omitempty"`
 	Questions *clarifyMeta  `json:"questions,omitempty"`
+	Steps     []agentStep   `json:"steps,omitempty"`
 }
 
 func jobStateFrom(j *job) jobState {
@@ -397,7 +418,7 @@ func jobStateFrom(j *job) jobState {
 	if cq != nil {
 		content = clarifyAsContent(cq)
 	}
-	return jobState{ID: j.id, Status: st, Content: content, Error: errMsg, WebSearch: j.webSearch, Clarify: cq != nil, CreatedAt: j.createdAt, Searches: j.searchSnapshot(), Questions: cq}
+	return jobState{ID: j.id, Status: st, Content: content, Error: errMsg, WebSearch: j.webSearch, Clarify: cq != nil, Agent: j.agent, CreatedAt: j.createdAt, Searches: j.searchSnapshot(), Questions: cq, Steps: j.stepSnapshot()}
 }
 
 // handleGenerate persists the user's turn and enqueues a detached background
@@ -412,6 +433,7 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		Messages  []Message `json:"messages"`
 		WebSearch bool      `json:"web_search"`
 		Clarify   bool      `json:"clarify"`
+		Agent     bool      `json:"agent"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, "invalid request", http.StatusBadRequest)
@@ -420,6 +442,14 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	if body.Model == "" {
 		jsonError(w, "model is required", http.StatusBadRequest)
 		return
+	}
+	// Agent mode supersedes the web_search/clarify toggles: when on, the general
+	// loop runs with its own tool allowlist (which includes web_search + ask_user
+	// as registered tools, so they compose within one run instead of being
+	// mutually exclusive).
+	if body.Agent {
+		body.WebSearch = false
+		body.Clarify = false
 	}
 
 	c, err := s.store.getConversation(email, convID)
@@ -445,7 +475,7 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	j := newJob(convID, email, body.Model, body.WebSearch, body.Clarify)
+	j := newJob(convID, email, body.Model, body.WebSearch, body.Clarify, body.Agent)
 	if err := s.jobs.enqueue(j); err != nil {
 		if errors.Is(err, errJobActive) {
 			if existing := s.jobs.get(convID); existing != nil {
@@ -547,6 +577,12 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		qdata, _ := json.Marshal(cq)
 		writeSSE("event: questions\ndata: " + string(qdata) + "\n\n")
 	}
+	// Replay the agent tool-call trace accumulated so far as one "steps" event
+	// so a reconnect/reload re-paints the steps drawer.
+	if steps := j.stepSnapshot(); len(steps) > 0 {
+		stdata, _ := json.Marshal(steps)
+		writeSSE("event: steps\ndata: " + string(stdata) + "\n\n")
+	}
 	// Replay the current phase hint. A queued job reports "queued"; a generating
 	// web-search job may have already fired "searching" before this stream opened,
 	// so replay the stored phase so the UI shows the right waiting state on connect.
@@ -590,6 +626,9 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	flushQuestions := func(text string) {
 		writeSSE("event: questions\ndata: " + text + "\n\n")
 	}
+	flushTool := func(text string) {
+		writeSSE("event: tool\ndata: " + text + "\n\n")
+	}
 	flushError := func(text string) {
 		d, _ := json.Marshal(text)
 		writeSSE("event: joberror\ndata: " + string(d) + "\n\n")
@@ -609,6 +648,8 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 				flushSearch(ev.text)
 			case "questions":
 				flushQuestions(ev.text)
+			case "tool":
+				flushTool(ev.text)
 			case "done":
 				writeSSE("event: done\ndata: \n\n")
 				return
@@ -632,6 +673,8 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 						flushSearch(ev.text)
 					case "questions":
 						flushQuestions(ev.text)
+					case "tool":
+						flushTool(ev.text)
 					case "done":
 						writeSSE("event: done\ndata: \n\n")
 						return
@@ -652,4 +695,57 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+// --- Agent config (global defaults) ----------------------------------------
+
+// handleAgentConfigGet returns the global agent system prompt + tool allowlist
+// plus the full menu of available tools (so the UI can render checkboxes).
+func (s *server) handleAgentConfigGet(w http.ResponseWriter, r *http.Request) {
+	tools := parseToolList(s.store.getSetting("agent_tools"))
+	if len(tools) == 0 {
+		tools = defaultAgentTools()
+	}
+	writeJSON(w, map[string]any{
+		"system":    s.store.getSetting("agent_system"),
+		"tools":     tools,
+		"available": availableTools(s.cfg.fetchPageEnabled),
+	})
+}
+
+// handleAgentConfigPut sets the global agent system prompt + tool allowlist.
+// An empty tool list clears the override (falls back to built-in defaults).
+func (s *server) handleAgentConfigPut(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		System string   `json:"system"`
+		Tools  []string `json:"tools"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		jsonError(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	// Validate tool names against the menu so a stale client can't enable a
+	// removed/renamed tool.
+	menu := map[string]bool{}
+	for _, t := range availableTools(s.cfg.fetchPageEnabled) {
+		menu[t.Name] = true
+	}
+	var valid []string
+	for _, t := range body.Tools {
+		t = strings.TrimSpace(t)
+		if menu[t] {
+			valid = append(valid, t)
+		}
+	}
+	if err := s.store.setSetting("agent_system", body.System); err != nil {
+		log.Printf("setSetting agent_system: %v", err)
+		jsonError(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	if err := s.store.setSetting("agent_tools", strings.Join(valid, ",")); err != nil {
+		log.Printf("setSetting agent_tools: %v", err)
+		jsonError(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"system": body.System, "tools": valid, "available": availableTools(s.cfg.fetchPageEnabled)})
 }

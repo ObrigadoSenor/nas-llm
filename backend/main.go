@@ -23,23 +23,40 @@ type config struct {
 	searxngURL       string
 	maxSearchRounds  int
 	maxClarifyRounds int
+	// Agent harness: hard cap on tool-calling rounds per run. Small models loop
+	// on tools; the budget forces a final synthesized answer. Env-tunable.
+	maxAgentSteps int
+	// Agent harness: enable the fetch_page tool (off by default). It raises the
+	// prompt-injection surface — the model reads untrusted web content — so it is
+	// gated behind an explicit env opt-in rather than on for everyone.
+	fetchPageEnabled bool
 	// Model-management fit/perf guidance. contextLength mirrors the Ollama
 	// container's OLLAMA_CONTEXT_LENGTH so the backend can estimate the KV-cache
 	// RAM a model will consume at the configured context.
 	contextLength      int
 	nasRamGB           float64
 	nasSystemReserveGB float64
+	// Optional secondary Ollama backend (e.g. a Mac on the LAN/Tailscale) with
+	// more RAM for bigger models. Empty macURL disables it; the NAS stays the
+	// only backend and behavior is unchanged from the single-host design.
+	macURL             string
+	macRamGB           float64
+	macSystemReserveGB float64
 }
 
 type server struct {
-	cfg         config
-	store       *store
-	limiter     *rateLimiter
-	mailer      mailer
-	modelsProxy http.Handler
-	chatProxy   http.Handler
-	jobs        *jobManager
-	pulls       *pullManager
+	cfg     config
+	store   *store
+	limiter *rateLimiter
+	mailer  mailer
+	// hosts is the multi-backend routing authority (NAS default + optional Mac).
+	// chatProxies/modelsProxies are per-host streaming reverse proxies, keyed by
+	// host.name, built once at startup from the registry's host URLs.
+	hosts         *hostRegistry
+	chatProxies   map[string]http.Handler
+	modelsProxies map[string]http.Handler
+	jobs          *jobManager
+	pulls         *pullManager
 }
 
 type ctxKey int
@@ -58,9 +75,14 @@ func main() {
 		searxngURL:         env("SEARXNG_URL", ""),
 		maxSearchRounds:    envInt("MAX_SEARCH_ROUNDS", 1),
 		maxClarifyRounds:   envInt("MAX_CLARIFY_ROUNDS", 3),
+		maxAgentSteps:      envInt("MAX_AGENT_STEPS", 6),
+		fetchPageEnabled:   envBool("FETCH_PAGE_ENABLED", false),
 		contextLength:      envInt("OLLAMA_CONTEXT_LENGTH", 16384),
 		nasRamGB:           envFloat("NAS_RAM_GB", 8),
 		nasSystemReserveGB: envFloat("NAS_SYSTEM_RESERVE_GB", 1.5),
+		macURL:             env("OLLAMA_MAC_URL", ""),
+		macRamGB:           envFloat("MAC_RAM_GB", 16),
+		macSystemReserveGB: envFloat("MAC_SYSTEM_RESERVE_GB", 2),
 	}
 	cfg.cookieSecure = strings.HasPrefix(cfg.appBaseURL, "https://")
 	cfg.allowedEmails = parseAllowed(os.Getenv("ALLOWED_EMAILS"))
@@ -71,13 +93,29 @@ func main() {
 	}
 	defer st.close()
 
+	// Build the backend host list. The NAS is always present (always-on, small
+	// models); a Mac is added only when OLLAMA_MAC_URL is set, becoming a second
+	// backend whose RAM holds bigger models. The registry probes each host's
+	// /api/tags and resolves model→host so inference routes to the right one.
+	hosts := []*host{{name: "nas", url: cfg.ollamaURL, ramGB: cfg.nasRamGB, reserveGB: cfg.nasSystemReserveGB}}
+	if cfg.macURL != "" {
+		hosts = append(hosts, &host{name: "mac", url: cfg.macURL, ramGB: cfg.macRamGB, reserveGB: cfg.macSystemReserveGB})
+	}
+	hostReg := newHostRegistry(hosts)
+	hostReg.start()
+
 	srv := &server{
-		cfg:         cfg,
-		store:       st,
-		limiter:     newRateLimiter(),
-		mailer:      &brevoMailer{apiKey: cfg.brevoKey, from: cfg.mailFrom},
-		modelsProxy: buildProxy(cfg.ollamaURL, "/v1/models"),
-		chatProxy:   buildProxy(cfg.ollamaURL, "/v1/chat/completions"),
+		cfg:           cfg,
+		store:         st,
+		limiter:       newRateLimiter(),
+		mailer:        &brevoMailer{apiKey: cfg.brevoKey, from: cfg.mailFrom},
+		hosts:         hostReg,
+		chatProxies:   map[string]http.Handler{},
+		modelsProxies: map[string]http.Handler{},
+	}
+	for _, h := range hostReg.all() {
+		srv.chatProxies[h.name] = buildProxy(h.url, "/v1/chat/completions")
+		srv.modelsProxies[h.name] = buildProxy(h.url, "/v1/models")
 	}
 	srv.jobs = newJobManager(st, srv)
 	srv.pulls = newPullManager(srv)
@@ -114,6 +152,13 @@ func envFloat(k string, def float64) float64 {
 		if n, err := strconv.ParseFloat(v, 64); err == nil && n > 0 {
 			return n
 		}
+	}
+	return def
+}
+
+func envBool(k string, def bool) bool {
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv(k))); v != "" {
+		return v == "1" || v == "true" || v == "yes" || v == "on"
 	}
 	return def
 }
@@ -173,6 +218,8 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /api/folders", s.requireAuth(s.handleCreateFolder))
 	mux.HandleFunc("PUT /api/folders/{id}", s.requireAuth(s.handleRenameFolder))
 	mux.HandleFunc("DELETE /api/folders/{id}", s.requireAuth(s.handleDeleteFolder))
+	mux.HandleFunc("GET /api/agent/config", s.requireAuth(s.handleAgentConfigGet))
+	mux.HandleFunc("PUT /api/agent/config", s.requireAuth(s.handleAgentConfigPut))
 	return mux
 }
 

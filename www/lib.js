@@ -34,6 +34,7 @@ const ICONS = {
   'paperclip':   '<path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 17.93 8.83l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/>',
   'image':       '<rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/>',
   'help':        '<circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><path d="M12 17h.01"/>',
+  'wrench':      '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>',
 };
 
 // Render an icon by name. Returns an SVG string (currentColor stroke).
@@ -244,6 +245,70 @@ export function clearSearchPending(container) {
   if (!container.children.length) container.classList.add('hidden');
 }
 
+// --- Agent tool-call trace (steps drawer) ----------------------------------
+// renderAgentSteps replaces the drawer with the full trace (SSE replay / reload).
+// appendAgentStep adds one live step as it streams. Each row shows the step
+// number, tool name, arguments, and a result preview; a web_search row also
+// shows the query and numbered source links. An ask_user row shows its preview
+// text only — the interactive question card is rendered separately by the
+// questions event / persisted Clarify, so the row is just a trace entry.
+function stepIcon(tool) {
+  return { web_search: 'globe', ask_user: 'help', get_time: 'clock', calculator: 'gauge',
+    memory_read: 'boxes', memory_write: 'boxes', fetch_page: 'search' }[tool] || 'wrench';
+}
+function truncateArgs(s) {
+  s = String(s || '').replace(/\s+/g, ' ').trim();
+  if (s.length > 80) return s.slice(0, 80) + '…';
+  return s;
+}
+function buildStepRow(st) {
+  const row = document.createElement('div');
+  row.className = 'step' + (st.isError ? ' err' : '');
+  const head = document.createElement('div'); head.className = 'step-head';
+  const num = document.createElement('span'); num.className = 'step-num'; num.textContent = String(st.step ?? '');
+  const ic = document.createElement('span'); ic.className = 'status-ic'; ic.innerHTML = icon(stepIcon(st.tool), 14);
+  const name = document.createElement('span'); name.className = 'step-tool'; name.textContent = st.tool || '';
+  head.appendChild(num); head.appendChild(ic); head.appendChild(name);
+  if (st.args) {
+    const a = document.createElement('span'); a.className = 'step-args'; a.textContent = truncateArgs(st.args);
+    head.appendChild(a);
+  }
+  if (st.durationMs && st.durationMs > 0) {
+    const d = document.createElement('span'); d.className = 'step-dur muted'; d.textContent = st.durationMs + 'ms';
+    head.appendChild(d);
+  }
+  row.appendChild(head);
+  if (st.preview) {
+    const p = document.createElement('div'); p.className = 'step-preview'; p.textContent = st.preview;
+    row.appendChild(p);
+  }
+  const search = st.search && st.search.searches ? st.search.searches[0] : null;
+  if (search && !search.skipped) {
+    const src = document.createElement('div'); src.className = 'step-sources';
+    if (search.query) { const q = document.createElement('span'); q.className = 'step-query'; q.textContent = search.query; src.appendChild(q); }
+    (search.sources || []).forEach((s, i) => {
+      const a = document.createElement('a'); a.className = 'src-link'; a.target = '_blank'; a.rel = 'noopener noreferrer';
+      if (/^https?:\/\//i.test(s.url || '')) a.href = s.url; else { a.href = '#'; a.addEventListener('click', e => e.preventDefault()); }
+      a.textContent = String(i + 1); a.title = s.title || s.url || 'source';
+      src.appendChild(a);
+    });
+    row.appendChild(src);
+  }
+  return row;
+}
+export function renderAgentSteps(container, steps) {
+  if (!container) return;
+  container.replaceChildren();
+  if (!steps || !steps.length) { container.classList.add('hidden'); return; }
+  container.classList.remove('hidden');
+  steps.forEach(st => container.appendChild(buildStepRow(st)));
+}
+export function appendAgentStep(container, st) {
+  if (!container || !st) return;
+  container.classList.remove('hidden');
+  container.appendChild(buildStepRow(st));
+}
+
 // --- Clarifying questions (agent loop) --------------------------------------
 // renderClarifyCard paints the model's clarifying question(s) as a card with
 // one button per option (single-select) or a "type your answer" hint (free).
@@ -359,6 +424,18 @@ export class StreamRenderer {
     if (this.phase === 'clarifying') {
       const ic = document.createElement('span'); ic.className = 'status-ic'; ic.innerHTML = icon('help', 15);
       const t = document.createElement('span'); t.textContent = 'Thinking of a question to ask…';
+      wrap.appendChild(ic); wrap.appendChild(t);
+      return wrap;
+    }
+    if (this.phase === 'agent') {
+      const ic = document.createElement('span'); ic.className = 'status-ic'; ic.innerHTML = icon('sparkles', 15);
+      const t = document.createElement('span'); t.textContent = 'Working…';
+      wrap.appendChild(ic); wrap.appendChild(t);
+      return wrap;
+    }
+    if (this.phase && this.phase.startsWith('tool:')) {
+      const ic = document.createElement('span'); ic.className = 'status-ic'; ic.innerHTML = icon('wrench', 15);
+      const t = document.createElement('span'); t.textContent = 'Using ' + this.phase.slice(5) + '…';
       wrap.appendChild(ic); wrap.appendChild(t);
       return wrap;
     }

@@ -1,6 +1,6 @@
 // nas-llm chat UI — app logic, split out of the old single-file index.html.
 // Imports UI helpers (icons, markdown rendering) from lib.js. No build step.
-import { icon, setIcon, renderMessage, escapeHtml, StreamRenderer, thinkingDots, renderSearchBlock, appendSearchEntry, showSearchPending, clearSearchPending, renderSourceLinks, appendSourceLinks, renderClarifyCard } from './lib.js?v=23';
+import { icon, setIcon, renderMessage, escapeHtml, StreamRenderer, thinkingDots, renderSearchBlock, appendSearchEntry, showSearchPending, clearSearchPending, renderSourceLinks, appendSourceLinks, renderClarifyCard, renderAgentSteps, appendAgentStep } from './lib.js?v=24';
 
 const $ = id => document.getElementById(id);
 const app=$("app"), loginView=$("login");
@@ -24,6 +24,7 @@ setIcon(attachBtn,"paperclip",16);
 setIcon($("logout"), "logout", 15); $("logout").insertAdjacentHTML("beforeend", '<span>Log out</span>');
 setIcon($("manageModels"), "boxes", 16); $("manageModels").setAttribute("aria-label", "Manage models");
 setIcon($("closeModels"), "close", 18);
+setIcon($("closeAgent"), "close", 18);
 
 let me = null;                 // {email} once logged in
 let models = [];
@@ -38,8 +39,9 @@ let dragConv = null;           // conversation being dragged onto a folder
 // Extras: add-ons the user toggles via the + menu. Active ones ride along on
 // the next generate request and show as removable pills above the input.
 const EXTRA_DEFS = [
-  { id:"web", label:"Web search", icon:"globe", exclusive:"clarify" },
-  { id:"clarify", label:"Clarify", icon:"help", exclusive:"web" },
+  { id:"web", label:"Web search", icon:"globe", exclusive:["clarify","agent"] },
+  { id:"clarify", label:"Clarify", icon:"help", exclusive:["web","agent"] },
+  { id:"agent", label:"Agent", icon:"sparkles", exclusive:["web","clarify"] },
 ];
 let activeExtras = loadExtras();
 function loadExtras(){
@@ -52,6 +54,7 @@ function loadExtras(){
 function saveExtras(){ localStorage.setItem("nas-llm-extras", JSON.stringify([...activeExtras])); }
 function webSearchOn(){ return activeExtras.has("web"); }
 function clarifyOn(){ return activeExtras.has("clarify"); }
+function agentOn(){ return activeExtras.has("agent"); }
 let generatingIds = new Set(); // conversation IDs with an active background job
 let activeES = null;           // the current EventSource tail (active conversation)
 let activeJobConvId = null;    // conversation whose tail is currently open
@@ -83,9 +86,14 @@ function renderPlusPopup(){
     const b=document.createElement("button"); b.type="button"; b.className="plus-item"+(on?" on":"");
     b.setAttribute("role","menuitemcheckbox"); b.setAttribute("aria-checked",String(on));
     b.innerHTML=icon(def.icon,16)+'<span>'+escapeHtml(def.label)+'</span>'+(on?icon("check",14):'');
-    b.addEventListener("click",e=>{ e.stopPropagation(); if(activeExtras.has(def.id)){ activeExtras.delete(def.id); } else { activeExtras.add(def.id); if(def.exclusive) activeExtras.delete(def.exclusive); } saveExtras(); renderExtras(); });
+    b.addEventListener("click",e=>{ e.stopPropagation(); if(activeExtras.has(def.id)){ activeExtras.delete(def.id); } else { activeExtras.add(def.id); (def.exclusive||[]).forEach(x=>activeExtras.delete(x)); } saveExtras(); renderExtras(); });
     plusPopup.appendChild(b);
   });
+  const sep=document.createElement("div"); sep.className="plus-sep";
+  const cfg=document.createElement("button"); cfg.type="button"; cfg.className="plus-item plus-cfg";
+  cfg.innerHTML=icon("wrench",16)+'<span>Agent settings…</span>';
+  cfg.addEventListener("click",e=>{ e.stopPropagation(); setPlusPopup(false); openAgentPanel(); });
+  plusPopup.appendChild(sep); plusPopup.appendChild(cfg);
 }
 function renderExtras(){ renderPills(); renderPlusPopup(); }
 function setPlusPopup(open){ plusPopup.classList.toggle("hidden", !open); plusBtn.classList.toggle("on", open); plusBtn.setAttribute("aria-expanded", String(open)); }
@@ -573,8 +581,8 @@ async function resumeIfGenerating(id){
   generatingIds.add(id); renderSidebar();
   activeJobConvId=id; renderSend();
   const hasQ = !!(job.questions && job.questions.questions && job.questions.questions.length);
-  const {bubble, searchWrap, srcLinks}=addMsg("assistant", hasQ ? "" : (job.content||""), job.createdAt||Date.now(), job.searches||null, null, job.questions||null, false);
-  tailJob(id, bubble, hasQ ? "" : (job.content||""), searchWrap, srcLinks, job.questions||null);
+  const {bubble, searchWrap, srcLinks, stepsWrap}=addMsg("assistant", hasQ ? "" : (job.content||""), job.createdAt||Date.now(), job.searches||null, null, job.questions||null, false, job.steps||null);
+  tailJob(id, bubble, hasQ ? "" : (job.content||""), searchWrap, srcLinks, job.questions||null, stepsWrap, job.steps||null);
 }
 
 // tailJob opens an EventSource to /events and renders into bubble via a
@@ -584,7 +592,7 @@ async function resumeIfGenerating(id){
 // bubble to a clickable option card and suspends the renderer so a queued
 // flush can't wipe it. "done" reloads the conversation from the server
 // (source of truth — the assistant reply is persisted there).
-function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarify){
+function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarify, stepsWrap, initialSteps){
   closeTail();
   const renderer = new StreamRenderer(bubble);
   const onAnswer=(value)=>sendClarifyAnswer(value, bubble);
@@ -596,6 +604,7 @@ function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarif
   } else {
     renderer.set(initialAcc);
   }
+  if(initialSteps && stepsWrap) renderAgentSteps(stepsWrap, initialSteps);
   let esClosed=false;
   activeJobConvId=convId;
   const es=new EventSource("/api/conversations/"+encodeURIComponent(convId)+"/events");
@@ -604,6 +613,8 @@ function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarif
   es.addEventListener("searches", e=>{ let arr=[]; try{ arr=JSON.parse(e.data)||[]; }catch{} renderSearchBlock(searchWrap, arr); renderSourceLinks(srcLinks, arr); });
   es.addEventListener("search", e=>{ let entry=null; try{ entry=JSON.parse(e.data); }catch{} appendSearchEntry(searchWrap, entry); appendSourceLinks(srcLinks, entry); });
   es.addEventListener("questions", e=>{ let q=null; try{ q=JSON.parse(e.data); }catch{} renderer.suspend(); renderClarifyCard(bubble, q, false, onAnswer); });
+  es.addEventListener("steps", e=>{ let arr=[]; try{ arr=JSON.parse(e.data)||[]; }catch{} renderAgentSteps(stepsWrap, arr); });
+  es.addEventListener("tool", e=>{ let st=null; try{ st=JSON.parse(e.data); }catch{} appendAgentStep(stepsWrap, st); });
   es.addEventListener("phase", e=>{
     const p=e.data;
     renderer.setPhase(p);
@@ -681,7 +692,7 @@ function bubbleError(bubble, msg){
   bubble.appendChild(s);
 }
 
-function addMsg(role, text, ts, searches, images, clarify, answered){
+function addMsg(role, text, ts, searches, images, clarify, answered, steps){
   const d=document.createElement("div"); d.className="msg "+role;
   if(role==="user"){
     // Questions: text + any attached images — no header, right-aligned.
@@ -695,12 +706,17 @@ function addMsg(role, text, ts, searches, images, clarify, answered){
     d.appendChild(b);
     chat.appendChild(d);
     chat.scrollTop=chat.scrollHeight;
-    return {bubble:b, searchWrap:null, srcLinks:null};
+    return {bubble:b, searchWrap:null, srcLinks:null, stepsWrap:null};
   }
-  // Answers: search evidence (readable snippets) above, then the answer, then a
-  // meta row (date/time + source-link chips + copy icon) below. Left-aligned.
-  // The search wrap lives outside the StreamRenderer's container so streaming
-  // re-parses never wipe it; srcLinks is filled from searches or during stream.
+  // Answers: agent tool-call trace (steps drawer) and search evidence (readable
+  // snippets) above the answer, then a meta row (date/time + source-link chips +
+  // copy icon) below. Left-aligned. The steps + search wraps live outside the
+  // StreamRenderer's container so streaming re-parses never wipe them; srcLinks
+  // is filled from searches or during stream.
+  let stepsWrap=document.createElement("div"); stepsWrap.className="msg-steps";
+  if(steps && steps.length) renderAgentSteps(stepsWrap, steps);
+  else stepsWrap.classList.add("hidden");
+  d.appendChild(stepsWrap);
   let searchWrap=document.createElement("div"); searchWrap.className="msg-search";
   if(searches && searches.length) renderSearchBlock(searchWrap, searches);
   else searchWrap.classList.add("hidden");
@@ -726,7 +742,7 @@ function addMsg(role, text, ts, searches, images, clarify, answered){
   d.appendChild(meta);
   chat.appendChild(d);
   chat.scrollTop=chat.scrollHeight;
-  return {bubble:b, searchWrap, srcLinks};
+  return {bubble:b, searchWrap, srcLinks, stepsWrap};
 }
 function addCopyMsg(roleRow, text){
   const btn=document.createElement("button"); btn.type="button";
@@ -747,7 +763,7 @@ function rerenderChat(){
     // A clarifying question is "answered" once a user turn follows it, so on a
     // reload we render its option buttons disabled.
     const answered = m.role==="assistant" && !!m.clarify && i<messages.length-1 && messages[i+1] && messages[i+1].role==="user";
-    addMsg(m.role, m.content, m.ts, m.search ? m.search.searches : null, m.images||null, m.clarify||null, answered);
+    addMsg(m.role, m.content, m.ts, m.search ? m.search.searches : null, m.images||null, m.clarify||null, answered, m.steps||null);
   });
 }
 function updateHeader(){
@@ -789,7 +805,7 @@ async function stream(){
   if(!activeId) return;
 
   const aTs=Date.now();
-  const {bubble, searchWrap, srcLinks}=addMsg("assistant","",aTs);
+  const {bubble, searchWrap, srcLinks, stepsWrap}=addMsg("assistant","",aTs);
   send.disabled=true;
   generatingIds.add(activeId); renderSidebar();
   activeJobConvId=activeId;
@@ -804,7 +820,7 @@ async function stream(){
       const r=await fetch("/api/conversations/"+encodeURIComponent(activeId)+"/generate",{
         method:"POST",
         headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({model:selectedModel, messages, web_search:webSearchOn(), clarify:clarifyOn()})
+        body:JSON.stringify({model:selectedModel, messages, web_search:webSearchOn(), clarify:clarifyOn(), agent:agentOn()})
       });
       if(r.ok || r.status===409){ job=await r.json(); break; }
       genErr=new Error("HTTP "+r.status);
@@ -827,7 +843,7 @@ async function stream(){
 
   // Tail the job. Generation keeps running on the NAS even if the user switches
   // chats; "done" reloads this conversation from the server (source of truth).
-  tailJob(activeId, bubble, job.content||"", searchWrap, srcLinks);
+  tailJob(activeId, bubble, job.content||"", searchWrap, srcLinks, null, stepsWrap, null);
   renderSend();
 }
 
@@ -1217,4 +1233,58 @@ function speedBadge(m, v){
   return badge(`≈ ${lo}–${hi} tok/s`, cls);
 }
 
+// --- Agent settings (global system prompt + tool allowlist) ----------------
+const agentModal=$("agentModal"), agentSystem=$("agentSystem"), agentToolsBox=$("agentTools"), agentSaved=$("agentSaved");
+let agentAvailable=[];      // [{name,label,description}] from the server
+let agentSelectedTools=null; // null = not yet loaded; the checkbox set mirrors this
+$("closeAgent").addEventListener("click", closeAgentPanel);
+agentModal.addEventListener("click", e=>{ if(e.target===agentModal) closeAgentPanel(); });
+document.addEventListener("keydown", e=>{ if(e.key==="Escape" && agentModal.classList.contains("open")) closeAgentPanel(); });
+function openAgentPanel(){ agentModal.classList.add("open"); loadAgentConfig(); }
+function closeAgentPanel(){ agentModal.classList.remove("open"); }
+async function loadAgentConfig(){
+  try{
+    const r=await fetchRetry("/api/agent/config",{},{label:"Agent config"});
+    const j=await r.json();
+    agentAvailable=j.available||[];
+    agentSystem.value=j.system||"";
+    const selected=new Set(j.tools||[]);
+    agentSelectedTools=selected;
+    renderAgentTools();
+  }catch(e){ /* leave panel empty */ }
+}
+function renderAgentTools(){
+  agentToolsBox.innerHTML="";
+  agentAvailable.forEach(t=>{
+    const id="agt-"+t.name;
+    const on=agentSelectedTools && agentSelectedTools.has(t.name);
+    const lbl=document.createElement("label"); lbl.className="agent-tool"+(on?" on":"");
+    lbl.htmlFor=id;
+    const cb=document.createElement("input"); cb.type="checkbox"; cb.id=id; cb.checked=!!on;
+    cb.addEventListener("change",()=>{
+      if(!agentSelectedTools) agentSelectedTools=new Set();
+      if(cb.checked) agentSelectedTools.add(t.name); else agentSelectedTools.delete(t.name);
+      lbl.classList.toggle("on", cb.checked);
+    });
+    const txt=document.createElement("span"); txt.className="agent-tool-text";
+    txt.innerHTML='<b>'+escapeHtml(t.label)+'</b><span class="muted">'+escapeHtml(t.description)+'</span>';
+    lbl.appendChild(cb); lbl.appendChild(txt);
+    agentToolsBox.appendChild(lbl);
+  });
+}
+$("saveAgent").addEventListener("click", async ()=>{
+  const system=agentSystem.value||"";
+  const tools=agentSelectedTools?[...agentSelectedTools]:[];
+  try{
+    await fetchRetry("/api/agent/config",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({system,tools})},{label:"Save agent config"});
+    agentSaved.classList.remove("hidden");
+    setTimeout(()=>agentSaved.classList.add("hidden"), 1500);
+  }catch(e){ flashAgentErr(String(e.message||e)); }
+});
+function flashAgentErr(msg){
+  const saved=agentSaved; saved.classList.remove("hidden"); saved.classList.add("err-note"); saved.textContent=String(msg||"save failed");
+  setTimeout(()=>{ saved.classList.add("hidden"); saved.classList.remove("err-note"); saved.textContent="Saved."; }, 4000);
+}
+
 boot();
+
