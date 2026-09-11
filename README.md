@@ -125,29 +125,50 @@ includes `json` — off by default, and without it every consumer silently gets
 HTML) and disables the rate limiter (no Redis). It is internal-only (no
 published port); rotate `server.secret_key` if you ever expose it.
 
-## Clarifying questions (optional)
+## Clarifying questions
 
-The chat page's + menu has a **Clarify** toggle. When on, the backend gives the
-model an `ask_user` tool and runs a small agent loop: if the task is ambiguous,
-the model emits a clarifying question with concrete options, shown as a
-clickable card; the user picks one (or types a free-text answer) and that
-becomes the next turn, so the model asks again or answers. It reuses the
-existing background-generation + SSE machinery — each question is a persisted
-assistant turn, each answer a normal user turn — so a half-answered question
-survives a reload or a backend restart (it lives in the conversation, not in
-memory). Back-to-back questions are capped at `MAX_CLARIFY_ROUNDS` (default 3):
-once the cap is reached the `ask_user` tool is withheld and the model must
-answer.
+The chat page turns a clarifying question into an interactive card instead of
+plain text, in two ways:
+
+- **Every chat (default).** On a tool-capable model, the backend offers the
+  model an `ask_user` tool on each plain turn (no toggle needed): if the task
+  is ambiguous, the model calls `ask_user` with a clear question and concrete
+  options, and the backend renders them as a card. This is why a question that
+  used to arrive as prose now arrives as something you can click through. A
+  small/non-tool model that writes the question as prose is still caught:
+  `CLARIFY_PROSE_DETECT` best-effort detects a question shape ("Question: …?
+  (e.g., A, B, C)") and turns it into the same card.
+- **Clarify toggle (interrogation mode).** The + menu's **Clarify** toggle
+  forces the question-first loop and caps back-to-back questions at
+  `MAX_CLARIFY_ROUNDS` (default 3): once the cap is reached the `ask_user` tool
+  is withheld and the model must answer. Use it when you want the model to
+  interrogate you before answering.
+
+The card shows a selectable list — radio for a single-select question,
+checkbox for multi-select — plus an inline **"Or type your own answer…"** input
++ Send, so you can pick an option or write your own when none fit. The user's
+pick (or typed text) becomes the next turn, so the model asks again or answers.
+It reuses the existing background-generation + SSE machinery — each question is
+a persisted assistant turn, each answer a normal user turn — so a half-answered
+question survives a reload or a backend restart (it lives in the conversation,
+not in memory).
 
 Clarify and Web search are mutually exclusive in the UI (turning one on turns
-the other off). Clarify needs a tool-calling model — `qwen3:1.7b`,
+the other off). The `ask_user` tool needs a tool-calling model — `qwen3:1.7b`,
 `qwen2.5:3b`, or `llama3.1:8b` (`deepseek-r1` and the non-tool 3B models just
-answer directly instead of asking). The pure-API host `llm.selected.systems`
-and the browser extension are unaffected; everything rides the existing
-session-cookie `/api/*` surface.
+answer directly, though the prose detector can still catch a question they
+write as text). The pure-API host `llm.selected.systems` and the browser
+extension are unaffected; everything rides the existing session-cookie
+`/api/*` surface.
 
-Env (`.env`, with a safe default): `MAX_CLARIFY_ROUNDS=3` — raise it for more
-thorough interrogation, lower it to force a faster answer.
+Env (`.env`, with safe defaults):
+- `MAX_CLARIFY_ROUNDS=3` — back-to-back question cap under the Clarify toggle.
+- `ASK_USER_IN_PLAIN_CHAT=true` — offer `ask_user` on every plain turn for
+  tool-capable models. Set false to skip the tool-schema overhead on every
+  turn (a question can still become a card via the detector).
+- `CLARIFY_PROSE_DETECT=true` — detect a question the model wrote as prose and
+  render it as a card (fallback for small/non-tool models). Set false to keep
+  such turns as plain text.
 
 ## Agent mode
 

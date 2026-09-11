@@ -373,13 +373,17 @@ export function buildThoughtsWrap() {
 }
 
 // --- Clarifying questions (agent loop) --------------------------------------
-// renderClarifyCard paints the model's clarifying question(s) as a card with
-// one button per option (single-select) or a "type your answer" hint (free).
-// It replaces the bubble's streamed preamble so the card is the whole answer.
-// When answered=true the option buttons render disabled (the user already
-// replied, e.g. on a reload of history); onAnswer(value) fires on click for a
+// renderClarifyCard paints the model's clarifying question(s) as a card with a
+// selectable option list — radio rows for a single-select question, checkbox
+// rows for a multi-select question — plus an inline free-text input + Send so
+// the user can type their own answer when none of the options fit. It replaces
+// the bubble's streamed preamble so the card is the whole answer.
+// When answered=true the controls render disabled (the user already replied,
+// e.g. on a reload of history); selectedValue is the user's recorded answer
+// (the next user message's content), used to highlight the chosen option or
+// fill the free-text input on reload. onAnswer(value) fires on submit for a
 // live, unanswered card and is expected to send the value as the next turn.
-export function renderClarifyCard(container, clarify, answered, onAnswer) {
+export function renderClarifyCard(container, clarify, answered, onAnswer, selectedValue) {
   if (!container) return;
   container.replaceChildren();
   const qs = (clarify && clarify.questions) || [];
@@ -389,27 +393,87 @@ export function renderClarifyCard(container, clarify, answered, onAnswer) {
     head.textContent = q.text || '';
     card.appendChild(head);
     const opts = q.options || [];
-    if (q.type === 'free' || !opts.length) {
-      const hint = document.createElement('div'); hint.className = 'clarify-hint muted';
-      hint.textContent = 'Type your answer below and send.';
-      card.appendChild(hint);
-    } else {
-      const row = document.createElement('div'); row.className = 'clarify-options';
-      opts.forEach(o => {
+    const multi = q.type === 'multi';
+    const isFree = q.type === 'free' || !opts.length;
+    const selected = new Set(); // indices of selected options
+
+    let rowsWrap = null;
+    if (!isFree) {
+      rowsWrap = document.createElement('div'); rowsWrap.className = 'clarify-options';
+      opts.forEach((o, i) => {
         const v = o.value || o.label;
-        const btn = document.createElement('button'); btn.type = 'button'; btn.className = 'clarify-option';
-        btn.textContent = o.label || v || '';
+        const label = o.label || v || '';
+        const row = document.createElement('button'); row.type = 'button';
+        row.className = 'clarify-row ' + (multi ? 'multi' : 'single');
+        row.setAttribute('role', multi ? 'checkbox' : 'radio');
+        row.setAttribute('aria-checked', 'false');
+        const ind = document.createElement('span'); ind.className = 'clarify-row-ind';
+        const lab = document.createElement('span'); lab.className = 'clarify-row-label';
+        lab.textContent = label;
+        row.appendChild(ind); row.appendChild(lab);
         if (answered) {
-          btn.disabled = true;
+          row.disabled = true;
+          if (optionMatches(label, v, selectedValue, multi)) {
+            row.classList.add('selected'); row.setAttribute('aria-checked', 'true');
+          }
         } else if (onAnswer) {
-          btn.addEventListener('click', () => onAnswer(v));
+          row.addEventListener('click', () => {
+            if (multi) {
+              if (selected.has(i)) { selected.delete(i); row.classList.remove('selected'); row.setAttribute('aria-checked', 'false'); }
+              else { selected.add(i); row.classList.add('selected'); row.setAttribute('aria-checked', 'true'); }
+            } else {
+              selected.clear(); selected.add(i);
+              rowsWrap.querySelectorAll('.clarify-row').forEach(r => { r.classList.remove('selected'); r.setAttribute('aria-checked', 'false'); });
+              row.classList.add('selected'); row.setAttribute('aria-checked', 'true');
+            }
+          });
         }
-        row.appendChild(btn);
+        rowsWrap.appendChild(row);
       });
-      card.appendChild(row);
+      card.appendChild(rowsWrap);
     }
+
+    // Inline free-text input — always present so the user can type their own
+    // answer even when the model offered options.
+    const free = document.createElement('div'); free.className = 'clarify-free';
+    const inp = document.createElement('input'); inp.type = 'text';
+    inp.className = 'clarify-input';
+    inp.placeholder = isFree ? 'Type your answer…' : 'Or type your own answer…';
+    if (answered) {
+      inp.disabled = true;
+      if (isFree && selectedValue) inp.value = selectedValue;
+    }
+    const send = document.createElement('button'); send.type = 'button';
+    send.className = 'clarify-send'; send.textContent = 'Send';
+    if (answered) send.disabled = true;
+    const submit = () => {
+      if (answered || !onAnswer) return;
+      const typed = inp.value.trim();
+      if (typed) { onAnswer(typed); return; }
+      if (isFree || selected.size === 0) { inp.focus(); return; }
+      const chosen = [...selected].sort((a, b) => a - b).map(i => opts[i].value || opts[i].label);
+      onAnswer(multi ? chosen.join('\n') : chosen[0]);
+    };
+    send.addEventListener('click', submit);
+    inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+    free.appendChild(inp); free.appendChild(send);
+    card.appendChild(free);
+
     container.appendChild(card);
   });
+}
+
+// optionMatches checks whether a given option was the user's recorded answer
+// (used to highlight the chosen row on reload). For multi-select the stored
+// answer is the selected values joined (newline/comma/semicolon), so each
+// option is checked for membership.
+function optionMatches(label, value, answer, multi) {
+  if (answer == null) return false;
+  const a = String(answer).trim();
+  if (!a) return false;
+  if (!multi) return a === (value || label) || a === label;
+  const parts = a.split(/[\n,;]/).map(s => s.trim()).filter(Boolean);
+  return parts.includes(value || label) || parts.includes(label);
 }
 
 // Escape plain text (used for user messages, which are NOT rendered as markdown

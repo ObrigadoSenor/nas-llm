@@ -959,7 +959,7 @@ function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarif
     // Reattaching to a job that already reached a clarifying question: paint
     // the card now and freeze the renderer so a queued flush can't wipe it.
     renderer.suspend();
-    renderClarifyCard(bubble, initialClarify, false, onAnswer);
+    renderClarifyCard(bubble, initialClarify, false, onAnswer, null);
   } else {
     renderer.set(initialAcc);
   }
@@ -980,7 +980,7 @@ function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarif
   es.addEventListener("reset", e=>{ let acc=""; try{ acc=JSON.parse(e.data); }catch{} renderer.set(acc); });
   es.addEventListener("searches", e=>{ let arr=[]; try{ arr=JSON.parse(e.data)||[]; }catch{} renderSearchBlock(searchWrap, arr); renderSourceLinks(srcLinks, arr); });
   es.addEventListener("search", e=>{ let entry=null; try{ entry=JSON.parse(e.data); }catch{} appendSearchEntry(searchWrap, entry); appendSourceLinks(srcLinks, entry); });
-  es.addEventListener("questions", e=>{ let q=null; try{ q=JSON.parse(e.data); }catch{} renderer.suspend(); renderClarifyCard(bubble, q, false, onAnswer); });
+  es.addEventListener("questions", e=>{ let q=null; try{ q=JSON.parse(e.data); }catch{} renderer.suspend(); renderClarifyCard(bubble, q, false, onAnswer, null); });
   es.addEventListener("steps", e=>{ let arr=[]; try{ arr=JSON.parse(e.data)||[]; }catch{} renderAgentSteps(stepsWrap, arr); });
   es.addEventListener("tool", e=>{ let st=null; try{ st=JSON.parse(e.data); }catch{} appendAgentStep(stepsWrap, st); });
   es.addEventListener("thoughts", e=>{ let arr=[]; try{ arr=JSON.parse(e.data)||[]; }catch{} renderThoughts(thoughtsWrap, arr); if(arr&&arr.length){ if(!thoughtStart) thoughtStart=Date.now(); setThoughtsSummary(thoughtsDet,"Thinking",{streaming:true}); if(thoughtsDet) thoughtsDet.open=true; } });
@@ -1075,7 +1075,7 @@ function bubbleError(bubble, msg){
   bubble.appendChild(s);
 }
 
-function addMsg(role, text, ts, searches, images, clarify, answered, steps, thoughts, live=true){
+function addMsg(role, text, ts, searches, images, clarify, answered, steps, thoughts, live=true, selectedValue=null){
   const d=document.createElement("div"); d.className="msg "+role;
   if(role==="user"){
     // Questions: text + any attached images — no header, right-aligned.
@@ -1130,7 +1130,7 @@ function addMsg(role, text, ts, searches, images, clarify, answered, steps, thou
     // prose. The question text is also persisted as Content for the model's own
     // context next round, but we don't show it twice.
     b.classList.remove("prose");
-    renderClarifyCard(b, clarify, !!answered, (value)=>sendClarifyAnswer(value, b));
+    renderClarifyCard(b, clarify, !!answered, (value)=>sendClarifyAnswer(value, b), selectedValue);
   } else if(text){
     renderMessage(b, text);
   }
@@ -1208,9 +1208,11 @@ function rerenderChat(){
   chat.innerHTML="";
   messages.forEach((m,i)=>{
     // A clarifying question is "answered" once a user turn follows it, so on a
-    // reload we render its option buttons disabled.
+    // reload we render its option controls disabled and highlight the chosen
+    // one. selectedValue is that following user turn's content.
     const answered = m.role==="assistant" && !!m.clarify && i<messages.length-1 && messages[i+1] && messages[i+1].role==="user";
-    addMsg(m.role, m.content, m.ts, m.search ? m.search.searches : null, m.images||null, m.clarify||null, answered, m.steps||null, m.thoughts||null, false);
+    const selectedValue = answered ? (messages[i+1] && messages[i+1].content) : null;
+    addMsg(m.role, m.content, m.ts, m.search ? m.search.searches : null, m.images||null, m.clarify||null, answered, m.steps||null, m.thoughts||null, false, selectedValue);
   });
 }
 function updateHeader(){
@@ -1312,7 +1314,7 @@ async function stream(){
 // question is still finalizing (job active), defer until it's done. Disables
 // the card's buttons immediately so the user can't double-send.
 function sendClarifyAnswer(value, bubble){
-  if(bubble) bubble.querySelectorAll(".clarify-option").forEach(btn=>{ btn.disabled=true; });
+  if(bubble) bubble.querySelectorAll(".clarify-row, .clarify-input, .clarify-send").forEach(el=>{ el.disabled=true; });
   if(activeJobConvId===activeId){
     pendingClarifyAnswer=value;
     return;

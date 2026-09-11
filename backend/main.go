@@ -23,6 +23,14 @@ type config struct {
 	searxngURL       string
 	maxSearchRounds  int
 	maxClarifyRounds int
+	// askUserInPlainChat offers the ask_user tool on every plain-chat turn for
+	// tool-capable models (not just under the Clarify extra), so a clarifying
+	// question renders as an interactive card instead of prose. Default on.
+	askUserInPlainChat bool
+	// clarifyProseDetect best-effort turns a question the model wrote as prose
+	// into an interactive card (fallback for small/non-tool models that don't
+	// call ask_user). Default on.
+	clarifyProseDetect bool
 	// Agent harness: hard cap on tool-calling rounds per run. Small models loop
 	// on tools; the budget forces a final synthesized answer. Env-tunable.
 	maxAgentSteps int
@@ -75,6 +83,8 @@ func main() {
 		searxngURL:         env("SEARXNG_URL", ""),
 		maxSearchRounds:    envInt("MAX_SEARCH_ROUNDS", 1),
 		maxClarifyRounds:   envInt("MAX_CLARIFY_ROUNDS", 3),
+		askUserInPlainChat: envBool("ASK_USER_IN_PLAIN_CHAT", true),
+		clarifyProseDetect: envBool("CLARIFY_PROSE_DETECT", true),
 		maxAgentSteps:      envInt("MAX_AGENT_STEPS", 6),
 		fetchPageEnabled:   envBool("FETCH_PAGE_ENABLED", false),
 		contextLength:      envInt("OLLAMA_CONTEXT_LENGTH", 16384),

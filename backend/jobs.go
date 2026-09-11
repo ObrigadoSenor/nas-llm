@@ -832,12 +832,37 @@ func (s *server) runGeneration(j *job) error {
 		}
 		return s.runSearchLoop(ctx, mb, j.model, msgs, j.emitChunk, j.emitPhase, j.emitSearch)
 	}
-	// Plain turn: emit an honest phase so a connect-time "queued" hint clears as
-	// soon as the worker starts the job. A vision turn reports "vision" — the
-	// SigLIP encoder runs before the first token, which takes tens of seconds on
-	// the N100, so without this the stale "queued" label (set at enqueue) would
-	// mislead the user into thinking another reply is blocking. A text turn
-	// reports "answering". The web-search path emits its own "searching" phase.
+	// Plain turn. For tool-capable text models, offer the ask_user tool so a
+	// clarifying question renders as an interactive card instead of prose — the
+	// default chat path used to stream with no tools, so a model that wanted to
+	// clarify could only emit text. If the model calls ask_user, the pass stashes
+	// the card (emitQuestions) and returns; if it answers directly we fall through
+	// to the prose-question detector as a fallback for small/non-tool models that
+	// write the question as text. Vision turns and non-tool models skip the pass
+	// (no tool-schema overhead on the slow vision path; non-tool models can't
+	// emit tool_calls). Gated by ASK_USER_IN_PLAIN_CHAT / CLARIFY_PROSE_DETECT.
+	if s.cfg.askUserInPlainChat && !hasImages && s.supportsTools(j.model, j.local, j.supportsTools) {
+		asked, err := s.runAskUserPass(ctx, mb, j.model, msgs, j.emitChunk, j.emitPhase, j.emitQuestions, phaseForImages(hasImages), askUserLightNudgeText())
+		if err != nil {
+			return err
+		}
+		if asked {
+			return nil
+		}
+		if s.cfg.clarifyProseDetect {
+			if meta := detectClarifyFromContent(j.contentString()); meta != nil {
+				j.emitQuestions(*meta)
+				return nil
+			}
+		}
+		return nil
+	}
+	// Non-tool / vision / disabled: a plain streamed pass. Emit an honest phase
+	// so a connect-time "queued" hint clears as soon as the worker starts the
+	// job. A vision turn reports "vision" — the SigLIP encoder runs before the
+	// first token, which takes tens of seconds on the N100, so without this the
+	// stale "queued" label (set at enqueue) would mislead the user into thinking
+	// another reply is blocking. A text turn reports "answering".
 	j.emitPhase(phaseForImages(hasImages))
 	return s.runStreamPass(ctx, mb, j.model, msgs, j.emitChunk)
 }

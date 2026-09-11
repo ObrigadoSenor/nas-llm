@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -97,28 +98,45 @@ var askUserTool = oaiTool{
 	},
 }
 
-func clarifyNudge() oaiMessage {
-	return oaiMessage{Role: "system", Content: jsonString(
-		"You have an ask_user tool to clarify ambiguous requests. " +
-			"If the user's task is unclear or missing a key detail, call ask_user with a clear question and concrete, distinct options. " +
-			"Ask only what you truly need, and at most a couple of questions across the conversation, then answer directly. " +
-			"Do not call ask_user if the request is already clear enough to answer.")}
+func clarifyNudgeText() string {
+	return "You have an ask_user tool to clarify ambiguous requests. " +
+		"If the user's task is unclear or missing a key detail, call ask_user with a clear question and concrete, distinct options. " +
+		"Ask only what you truly need, and at most a couple of questions across the conversation, then answer directly. " +
+		"Do not call ask_user if the request is already clear enough to answer."
 }
 
-// runClarifyLoop runs one tool-calling pass with the ask_user tool. If the
-// model calls ask_user, it stashes the parsed questions on the job (via
-// emitQuestions) and returns nil — the worker then persists a clarifying turn.
-// If the model answers directly (no tool call), the streamed content is the
-// answer and the worker persists a normal assistant message. The modelBackend
-// performs the inference round (a direct server dial, or a browser relay for a
-// local model).
-func (s *server) runClarifyLoop(ctx context.Context, mb modelBackend, model string, msgs []oaiMessage, emit func(string), emitPhase func(string), emitQuestions func(clarifyMeta)) error {
-	emitPhase("clarifying")
-	messages := append([]oaiMessage{clarifyNudge()}, msgs...)
+// askUserLightNudgeText is the lighter system nudge used for plain-chat turns
+// (no Clarify extra). It steers a tool-capable model to call ask_user when it
+// genuinely needs a detail, without the dedicated-Clarify framing. Kept short
+// to limit the token overhead added to every plain turn on the N100.
+func askUserLightNudgeText() string {
+	return "You have an ask_user tool. If the user's request is ambiguous or missing a key detail you need before you can help, " +
+		"call ask_user with a clear question and concrete, distinct options. Otherwise answer directly — do not ask unnecessary questions."
+}
+
+// runAskUserPass runs one tool-calling pass with the ask_user tool. If the
+// model calls ask_user with a parseable question, it stashes the structured
+// card on the job (emitQuestions) so the worker persists a clarifying turn and
+// the UI paints the card; returns asked=true. If the model answers directly
+// (no tool call, or a malformed call), the streamed content stays as the
+// answer and asked=false so the caller can fall through (e.g. the prose
+// detector). phase is emitted before the pass ("" = none); on a direct answer
+// the phase transitions to "answering" so a special wait state clears. nudge
+// is prepended as a system message when non-empty. The modelBackend performs
+// the inference round (a direct server dial, or a browser relay for a local
+// model).
+func (s *server) runAskUserPass(ctx context.Context, mb modelBackend, model string, msgs []oaiMessage, emit func(string), emitPhase func(string), emitQuestions func(clarifyMeta), phase, nudge string) (asked bool, err error) {
+	if phase != "" {
+		emitPhase(phase)
+	}
+	messages := msgs
+	if strings.TrimSpace(nudge) != "" {
+		messages = append([]oaiMessage{{Role: "system", Content: jsonString(nudge)}}, messages...)
+	}
 
 	msg, _, err := mb.Call(ctx, model, messages, []oaiTool{askUserTool})
 	if err != nil {
-		return fmt.Errorf("clarify failed: %w", err)
+		return false, fmt.Errorf("ask_user pass failed: %w", err)
 	}
 
 	var askCall *oaiToolCall
@@ -134,20 +152,29 @@ func (s *server) runClarifyLoop(ctx context.Context, mb modelBackend, model stri
 		if len(msg.Content) == 0 {
 			emit("(no response)")
 		}
-		return nil
+		return false, nil
 	}
 
 	meta := parseClarifyQuestions(askCall.Function.Arguments)
 	if meta == nil || len(meta.Questions) == 0 {
 		// Malformed call — fall back to whatever was streamed as the answer.
 		emitPhase("answering")
-		return nil
+		return false, nil
 	}
 
 	// Terminal clarifying outcome: stash the card on the job and tell the UI.
 	emitQuestions(*meta)
 	emitPhase("clarifying")
-	return nil
+	return true, nil
+}
+
+// runClarifyLoop runs one tool-calling pass with the ask_user tool under the
+// Clarify extra. It is a thin wrapper over runAskUserPass with the dedicated
+// "clarifying" phase + nudge. Returns nil on a clean finish (asked or not), an
+// error otherwise.
+func (s *server) runClarifyLoop(ctx context.Context, mb modelBackend, model string, msgs []oaiMessage, emit func(string), emitPhase func(string), emitQuestions func(clarifyMeta)) error {
+	_, err := s.runAskUserPass(ctx, mb, model, msgs, emit, emitPhase, emitQuestions, "clarifying", clarifyNudgeText())
+	return err
 }
 
 // parseClarifyQuestions decodes the ask_user tool-call arguments into a
@@ -226,4 +253,123 @@ func countRecentClarify(msgs []Message) int {
 		break
 	}
 	return n
+}
+
+// --- Prose-question fallback detector ----------------------------------------
+//
+// Small or non-tool models sometimes write a clarifying question as plain prose
+// ("Question: What is your primary use case? (e.g., A, B, C)") instead of
+// calling ask_user. detectClarifyFromContent best-effort extracts a structured
+// card from that prose so the UI can render it interactively. It is
+// deliberately conservative: only short, question-shaped turns with at least
+// two extractable options become a card; everything else returns nil so a
+// normal answer stays prose. Gated by cfg.clarifyProseDetect.
+
+const (
+	clarifyProseMaxChars     = 600 // the whole turn must be this short
+	clarifyProseQuestionMax  = 200 // the question sentence itself
+	clarifyProseOptionMax    = 60  // an option label must be this short
+)
+
+var (
+	clarifyLabelRe     = regexp.MustCompile(`(?i)^\s*question\s*[:：]\s*`)
+	clarifyParenRe     = regexp.MustCompile(`\(([^)]*)\)`)
+	clarifyListRe      = regexp.MustCompile(`(?m)^\s*(?:\d+[.)]|[-*•])\s+(.+?)\s*$`)
+	clarifyParenLeadRe = regexp.MustCompile(`(?i)^\s*(?:e\.g\.|eg\.|i\.e\.|ie\.|for\s+example|such\s+as|like)\s*[:，,]?\s*`)
+	clarifyOptLeadRe   = regexp.MustCompile(`(?i)^\s*(?:and|or)\s+`)
+	clarifySplitRe     = regexp.MustCompile(`[,;、]`)
+)
+
+// detectClarifyFromContent returns a single single-select clarifyMeta if
+// content looks like a clarifying question with extractable options, else nil.
+func detectClarifyFromContent(content string) *clarifyMeta {
+	content = strings.TrimSpace(content)
+	if content == "" || !strings.Contains(content, "?") {
+		return nil
+	}
+	if len([]rune(content)) > clarifyProseMaxChars {
+		return nil
+	}
+	// Strip a leading "Question:" label.
+	s := clarifyLabelRe.ReplaceAllString(content, "")
+	qEnd := strings.Index(s, "?")
+	if qEnd < 0 {
+		return nil
+	}
+	question := strings.TrimSpace(s[:qEnd+1])
+	if question == "" || len([]rune(question)) > clarifyProseQuestionMax {
+		return nil
+	}
+	rest := strings.TrimSpace(s[qEnd+1:])
+	opts := detectClarifyOptions(rest)
+	if len(opts) < 2 {
+		return nil
+	}
+	return &clarifyMeta{Questions: []clarifyQuestion{{Text: question, Type: "single", Options: opts}}}
+}
+
+// detectClarifyOptions pulls ≥2 options from the text after the question mark:
+// first an inline parenthetical ("(e.g., A, B, C)"), then a following
+// numbered/bulleted list.
+func detectClarifyOptions(rest string) []clarifyOption {
+	if opts := detectParenOptions(rest); len(opts) >= 2 {
+		return opts
+	}
+	if opts := detectListOptions(rest); len(opts) >= 2 {
+		return opts
+	}
+	return nil
+}
+
+func detectParenOptions(rest string) []clarifyOption {
+	m := clarifyParenRe.FindStringSubmatch(rest)
+	if m == nil {
+		return nil
+	}
+	inner := clarifyParenLeadRe.ReplaceAllString(strings.TrimSpace(m[1]), "")
+	if inner == "" || !clarifySplitRe.MatchString(inner) {
+		return nil
+	}
+	return filterClarifyOptions(splitClarifyOptions(inner))
+}
+
+func detectListOptions(rest string) []clarifyOption {
+	matches := clarifyListRe.FindAllStringSubmatch(rest, -1)
+	if len(matches) < 2 {
+		return nil
+	}
+	parts := make([]string, 0, len(matches))
+	for _, m := range matches {
+		parts = append(parts, m[1])
+	}
+	return filterClarifyOptions(parts)
+}
+
+// splitClarifyOptions splits an option string on common delimiters.
+func splitClarifyOptions(s string) []string {
+	var out []string
+	for _, p := range clarifySplitRe.Split(s, -1) {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// filterClarifyOptions cleans and keeps short, label-like option strings,
+// dropping "and "/"or " leftovers and over-long or prose-like fragments.
+func filterClarifyOptions(parts []string) []clarifyOption {
+	var out []clarifyOption
+	for _, p := range parts {
+		p = clarifyOptLeadRe.ReplaceAllString(strings.TrimSpace(p), "")
+		p = strings.TrimRight(p, ".;,:：，。")
+		if p == "" {
+			continue
+		}
+		if len([]rune(p)) > clarifyProseOptionMax {
+			continue
+		}
+		out = append(out, clarifyOption{Label: p, Value: p})
+	}
+	return out
 }
