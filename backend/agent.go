@@ -292,7 +292,7 @@ func agentSystemNudge() string {
 // answering with no tool call, a terminal tool, the step budget, or repeated
 // identical calls. On step-budget exhaustion it forces one final streamed
 // answer with the tools removed so the model must synthesize.
-func (s *server) runAgentLoop(ctx context.Context, model, email string, msgs []oaiMessage, allow []string, systemPrompt string,
+func (s *server) runAgentLoop(ctx context.Context, target, model, email string, msgs []oaiMessage, allow []string, systemPrompt string,
 	emit func(string), emitPhase func(string), emitTool func(agentStep), emitQuestions func(clarifyMeta), addUsage func(int, int)) error {
 	emitPhase("agent")
 	reg := s.toolRegistry(email)
@@ -305,9 +305,9 @@ func (s *server) runAgentLoop(ctx context.Context, model, email string, msgs []o
 	if len(tools) == 0 {
 		// No tools enabled: degenerate to a plain streamed pass.
 		emitPhase("answering")
-		return s.runStreamPass(ctx, model, msgs, emit)
+		return s.runStreamPass(ctx, target, model, msgs, emit)
 	}
-	ollamaChatURL := strings.TrimRight(s.cfg.ollamaURL, "/") + "/v1/chat/completions"
+	ollamaChatURL := target
 	sys := systemPrompt
 	if strings.TrimSpace(sys) == "" {
 		sys = agentSystemNudge()
@@ -324,7 +324,7 @@ func (s *server) runAgentLoop(ctx context.Context, model, email string, msgs []o
 	for step := 0; step < s.cfg.maxAgentSteps; step++ {
 		// Bound the running transcript before each model call so a long multi-step
 		// run can't overflow the 8-16k context window (Tier 3 compaction).
-		req.Messages = s.maybeCompact(ctx, model, req.Messages)
+		req.Messages = s.maybeCompact(ctx, target, model, req.Messages)
 		msg, usage, err := s.streamOllamaChatWithTools(ctx, ollamaChatURL, &req, emit)
 		if err != nil {
 			return fmt.Errorf("agent step %d: %w", step+1, err)
@@ -885,7 +885,7 @@ func truncateOldToolResults(msgs []oaiMessage, keepLast int) []oaiMessage {
 // summarizeTurns asks the model (non-streaming) to compress a slice of older
 // text turns into a short summary. It is the expensive phase of compaction; the
 // caller keeps the most recent tail verbatim so in-flight tool pairs stay intact.
-func (s *server) summarizeTurns(ctx context.Context, model string, msgs []oaiMessage) (string, error) {
+func (s *server) summarizeTurns(ctx context.Context, target, model string, msgs []oaiMessage) (string, error) {
 	var b strings.Builder
 	for _, m := range msgs {
 		if len(m.Content) == 0 {
@@ -904,7 +904,6 @@ func (s *server) summarizeTurns(ctx context.Context, model string, msgs []oaiMes
 	if b.Len() == 0 {
 		return "", nil
 	}
-	target := strings.TrimRight(s.cfg.ollamaURL, "/") + "/v1/chat/completions"
 	payload, _ := json.Marshal(chatRequest{
 		Model:  model,
 		Stream: false,
@@ -955,7 +954,7 @@ func (s *server) summarizeTurns(ctx context.Context, model string, msgs []oaiMes
 // model call, keeping the system + summary + a recent tail (with all tool-call /
 // result pairs intact) verbatim. Summarization failure is non-fatal: it falls
 // back to the truncated list and lets Ollama handle any overflow.
-func (s *server) maybeCompact(ctx context.Context, model string, msgs []oaiMessage) []oaiMessage {
+func (s *server) maybeCompact(ctx context.Context, target, model string, msgs []oaiMessage) []oaiMessage {
 	limit := s.cfg.contextLength
 	if limit <= 0 {
 		limit = 8192
@@ -982,7 +981,7 @@ func (s *server) maybeCompact(ctx context.Context, model string, msgs []oaiMessa
 		return msgs
 	}
 	head := msgs[1:cut]
-	summary, err := s.summarizeTurns(ctx, model, head)
+	summary, err := s.summarizeTurns(ctx, target, model, head)
 	if err != nil || strings.TrimSpace(summary) == "" {
 		return msgs // summarization failed — run as-is
 	}

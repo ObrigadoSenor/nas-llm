@@ -74,6 +74,10 @@ services:
       OLLAMA_CONTEXT_LENGTH: ${OLLAMA_CONTEXT_LENGTH:-16384}
       NAS_RAM_GB: ${NAS_RAM_GB:-8}
       NAS_SYSTEM_RESERVE_GB: ${NAS_SYSTEM_RESERVE_GB:-1.5}
+      # Optional remote Mac backend (leave OLLAMA_MAC_URL empty for NAS-only).
+      OLLAMA_MAC_URL: ${OLLAMA_MAC_URL:-}
+      MAC_RAM_GB: ${MAC_RAM_GB:-16}
+      MAC_SYSTEM_RESERVE_GB: ${MAC_SYSTEM_RESERVE_GB:-2}
     volumes:
       - ${DOCKER_VOLUME}/docker/nas-llm/backend/data:/data
     networks:

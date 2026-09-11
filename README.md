@@ -204,6 +204,61 @@ directory and per-invocation approved.
 
 Env (`.env`, with safe defaults): `MAX_AGENT_STEPS=6`, `FETCH_PAGE_ENABLED=false`.
 
+## Remote Mac backend (optional, bigger models)
+
+The NAS (8 GB) caps you at ~3B models. If you have a Mac with more RAM on the
+same network (or over Tailscale), run a second Ollama there and let the NAS
+backend route bigger models to it — all behind the same `chat.selected.systems`
+URL. The NAS keeps the small, always-on models; the Mac holds the big ones.
+
+**How routing works.** The backend maintains a list of Ollama hosts (the NAS is
+always present; the Mac is added when `OLLAMA_MAC_URL` is set). It probes each
+host's `/api/tags` every 30 s, merges their model lists, and routes each
+inference (and pull/benchmark/delete) to whichever host has that model
+installed — a NAS model runs on the NAS, a Mac model runs on the Mac. The
+browser never talks to the Mac directly: the path is still browser → Cloudflare
+→ Caddy → backend → (NAS or Mac). If the Mac is offline, its models drop out
+of the selector and a request for one fails fast with a clear "backend offline"
+message instead of hanging. Every outbound call reuses the existing
+`Host: localhost:11434` + stripped `Origin`/`Referer` trick, so a remote
+Ollama accepts it without extra CORS/auth config.
+
+**Make the Mac's Ollama reachable (choose one):**
+
+- *Tailscale (recommended).* Install Tailscale on the Mac, bind Ollama to the
+  Mac's Tailscale IP, set `OLLAMA_MAC_URL=http://<mac-tailscale-host>:11434`.
+  Works on any network, no router ports, IP-churn-proof.
+- *LAN IP (simplest).* `launchctl setenv OLLAMA_HOST 0.0.0.0:11434` (and
+  `launchctl setenv OLLAMA_ORIGINS "*"` if the backend's Origin is rejected),
+  restart Ollama, set `OLLAMA_MAC_URL=http://<mac-lan-ip>:11434`. Brittle if
+  the IP changes.
+- *SSH reverse tunnel.* Keep Ollama on localhost on the Mac and run
+  `autossh -R 11434:localhost:11434 <nas>`; point `OLLAMA_MAC_URL` at the
+  forwarded port on the NAS. Most secure, but needs a persistent tunnel.
+
+**NAS `.env` (empty `OLLAMA_MAC_URL` = disabled, NAS-only, original behavior):**
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `OLLAMA_MAC_URL` | (empty) | Base URL of the Mac's Ollama. Empty disables the Mac backend. |
+| `MAC_RAM_GB` | `16` | Total RAM (GB) on the Mac, for Mac-model fit verdicts. |
+| `MAC_SYSTEM_RESERVE_GB` | `2` | RAM reserved for macOS + apps, subtracted before fit comparison. |
+
+Then `scripts/deploy.sh` (the vars pass through `docker-compose.yml` to the
+backend container). The catalog gains Mac-tagged entries (e.g. `mistral:7b`,
+`qwen2.5:14b`) whose fit is judged against the Mac's RAM; pulling one lands it
+on the Mac. You can also pull any model onto a specific host with
+`{"model":"…","host":"mac"}` to `/api/models/pull`.
+
+**Tradeoff.** Big models are only available while the Mac is on and reachable;
+NAS small models stay always-on. Over Tailscale-away, the Mac's upload bandwidth
+affects token-stream latency. The Mac should stay plugged in for big models.
+
+**Security.** The Mac's Ollama is unauthenticated. NEVER put it behind a public
+Cloudflare tunnel or open a router port to it — keep it LAN/Tailscale/SSH only.
+Only `chat.selected.systems` is public; the Mac is a private hop the browser
+never sees.
+
 ## Prerequisites on the NAS (phase 1)
 
 1. **Docker** — install from UGOS Pro **App Center > Docker**.

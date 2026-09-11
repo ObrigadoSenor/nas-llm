@@ -567,13 +567,25 @@ func messageContent(m Message) json.RawMessage {
 
 // runGeneration loads the conversation, builds the message list, and drives
 // Ollama on a background context. Content deltas flow through the job's
-// broadcast. Returns nil on a clean finish, an error otherwise.
+// broadcast. The backend host that owns j.model is resolved once here (via the
+// host registry) and its chat URL is threaded through every dispatch branch so
+// a NAS model runs on the NAS and a Mac model runs on the Mac. Returns nil on a
+// clean finish, an error otherwise.
 func (s *server) runGeneration(j *job) error {
 	ctx, cancel := context.WithTimeout(context.Background(), genTimeout)
 	defer cancel()
 	j.mu.Lock()
 	j.cancelFn = cancel // let handleCancel abort the in-flight Ollama request
 	j.mu.Unlock()
+
+	// Resolve the backend host that owns this model. If no online host has it
+	// (e.g. it lives on the Mac and the Mac is asleep/offline), fail fast with a
+	// clear message instead of dialing the NAS and getting a bare not-found.
+	h := s.hosts.onlineHostForModel(j.model)
+	if h == nil {
+		return fmt.Errorf("model %q is unavailable — its backend may be offline. Try a smaller model or reconnect the host.", j.model)
+	}
+	chatURL := h.chatURL()
 
 	conv, err := s.store.getConversation(j.email, j.convID)
 	if err != nil {
@@ -594,7 +606,7 @@ func (s *server) runGeneration(j *job) error {
 
 	if j.agent {
 		allow, sys := s.agentConfig(j)
-		return s.runAgentLoop(ctx, j.model, j.email, msgs, allow, sys, j.emitChunk, j.emitPhase, j.emitTool, j.emitQuestions, j.addUsage)
+		return s.runAgentLoop(ctx, chatURL, j.model, j.email, msgs, allow, sys, j.emitChunk, j.emitPhase, j.emitTool, j.emitQuestions, j.addUsage)
 	}
 	if j.clarify {
 		// Cap back-to-back clarifying questions at MAX_CLARIFY_ROUNDS: once the
@@ -604,9 +616,9 @@ func (s *server) runGeneration(j *job) error {
 		// ask_user (it stashes the card on the job and returns nil).
 		if countRecentClarify(conv.Messages) >= s.cfg.maxClarifyRounds {
 			j.emitPhase(phaseForImages(hasImages))
-			return s.runStreamPass(ctx, j.model, msgs, j.emitChunk)
+			return s.runStreamPass(ctx, chatURL, j.model, msgs, j.emitChunk)
 		}
-		return s.runClarifyLoop(ctx, j.model, msgs, j.emitChunk, j.emitPhase, j.emitQuestions)
+		return s.runClarifyLoop(ctx, chatURL, j.model, msgs, j.emitChunk, j.emitPhase, j.emitQuestions)
 	}
 	if j.webSearch {
 		if s.cfg.searxngURL == "" {
@@ -614,9 +626,9 @@ func (s *server) runGeneration(j *job) error {
 			// of silently answering as if search were off.
 			j.emitSearch(searchEntry{Skipped: true, Reason: "web search not configured"})
 			j.emitPhase(phaseForImages(hasImages))
-			return s.runStreamPass(ctx, j.model, msgs, j.emitChunk)
+			return s.runStreamPass(ctx, chatURL, j.model, msgs, j.emitChunk)
 		}
-		return s.runSearchLoop(ctx, j.model, msgs, j.emitChunk, j.emitPhase, j.emitSearch)
+		return s.runSearchLoop(ctx, chatURL, j.model, msgs, j.emitChunk, j.emitPhase, j.emitSearch)
 	}
 	// Plain turn: emit an honest phase so a connect-time "queued" hint clears as
 	// soon as the worker starts the job. A vision turn reports "vision" — the
@@ -625,7 +637,7 @@ func (s *server) runGeneration(j *job) error {
 	// mislead the user into thinking another reply is blocking. A text turn
 	// reports "answering". The web-search path emits its own "searching" phase.
 	j.emitPhase(phaseForImages(hasImages))
-	return s.runStreamPass(ctx, j.model, msgs, j.emitChunk)
+	return s.runStreamPass(ctx, chatURL, j.model, msgs, j.emitChunk)
 }
 
 // phaseForImages returns the generation phase hint for a non-search turn:
@@ -639,10 +651,11 @@ func phaseForImages(hasImages bool) string {
 }
 
 // runStreamPass streams a plain (no-tools) completion from Ollama, emitting
-// content deltas. Returns nil on a clean finish, an error otherwise.
-func (s *server) runStreamPass(ctx context.Context, model string, msgs []oaiMessage, emit func(string)) error {
+// content deltas. The target host's chat URL is resolved by the caller
+// (runGeneration / handleChat) so the request reaches the backend that owns the
+// model. Returns nil on a clean finish, an error otherwise.
+func (s *server) runStreamPass(ctx context.Context, target, model string, msgs []oaiMessage, emit func(string)) error {
 	req := chatRequest{Model: model, Messages: msgs}
-	target := strings.TrimRight(s.cfg.ollamaURL, "/") + "/v1/chat/completions"
 	return s.streamFromOllama(ctx, target, &req, emit)
 }
 

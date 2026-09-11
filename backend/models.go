@@ -82,11 +82,16 @@ type benchmark struct {
 	EvaluatedAt     int64   `json:"evaluatedAt"`
 }
 
-// ollamaRequest issues a request to the native Ollama API, forcing Host to
-// localhost:11434 and stripping Origin/Referer — the same dance the Caddy
-// reverse proxy and streamFromOllama do, because Ollama 403s non-localhost
-// Hosts and any request carrying an Origin.
-func (s *server) ollamaRequest(ctx context.Context, method, path string, body any) (*http.Response, error) {
+// ollamaRequest issues a request to the native Ollama API on the given backend
+// host, forcing Host to localhost:11434 and stripping Origin/Referer — the same
+// dance the Caddy reverse proxy and streamFromOllama do, because Ollama 403s
+// non-localhost Hosts and any request carrying an Origin. A nil host falls back
+// to the default (NAS) so management ops still work when a model isn't found on
+// any online host (Ollama then returns a clean not-found).
+func (s *server) ollamaRequest(ctx context.Context, h *host, method, path string, body any) (*http.Response, error) {
+	if h == nil {
+		h = s.hosts.defaultHost()
+	}
 	var rdr io.Reader
 	if body != nil {
 		payload, err := json.Marshal(body)
@@ -95,7 +100,7 @@ func (s *server) ollamaRequest(ctx context.Context, method, path string, body an
 		}
 		rdr = bytes.NewReader(payload)
 	}
-	target := strings.TrimRight(s.cfg.ollamaURL, "/") + path
+	target := strings.TrimRight(h.url, "/") + path
 	req, err := http.NewRequestWithContext(ctx, method, target, rdr)
 	if err != nil {
 		return nil, err
@@ -109,8 +114,8 @@ func (s *server) ollamaRequest(ctx context.Context, method, path string, body an
 	return http.DefaultClient.Do(req)
 }
 
-func (s *server) ollamaTags(ctx context.Context) ([]ollamaModel, error) {
-	resp, err := s.ollamaRequest(ctx, http.MethodGet, "/api/tags", nil)
+func (s *server) ollamaTags(ctx context.Context, h *host) ([]ollamaModel, error) {
+	resp, err := s.ollamaRequest(ctx, h, http.MethodGet, "/api/tags", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -147,6 +152,7 @@ type pullEvent struct {
 type pullJob struct {
 	id        string
 	model     string
+	host      *host // backend to pull onto (NAS or Mac)
 	createdAt int64
 
 	mu              sync.Mutex
@@ -180,10 +186,11 @@ func newPullJobID() string {
 	return hex.EncodeToString(b)
 }
 
-func newPullJob(model string) *pullJob {
+func newPullJob(model string, h *host) *pullJob {
 	return &pullJob{
 		id:        newPullJobID(),
 		model:     model,
+		host:      h,
 		createdAt: time.Now().UnixMilli(),
 		status:    "queued",
 		layers:    map[string]layerProg{},
@@ -405,11 +412,12 @@ func (pm *pullManager) worker() {
 			// download, without an extra click. Non-fatal: a benchmark failure
 			// (e.g. an unloadable model) never undoes a successful pull.
 			j.emitPhase("benchmarking")
-			if br, berr := pm.srv.runBenchmark(j.model); berr != nil {
+			if br, berr := pm.srv.runBenchmark(j.model, j.host); berr != nil {
 				log.Printf("auto-benchmark %s: %v", j.model, berr)
 			} else {
 				_ = pm.srv.store.upsertBenchmark(j.model, br.TokPerSec, br.PromptTokPerSec, br.LoadMs)
 			}
+			pm.srv.hosts.refreshOne(j.host) // new model appears in the merged list now
 			j.notifyTerminal("success", "")
 		}
 		pm.mu.Lock()
@@ -428,7 +436,7 @@ func (s *server) runPull(j *pullJob) error {
 	j.cancelFn = cancel
 	j.mu.Unlock()
 
-	resp, err := s.ollamaRequest(ctx, http.MethodPost, "/api/pull", map[string]any{"model": j.model, "stream": true})
+	resp, err := s.ollamaRequest(ctx, j.host, http.MethodPost, "/api/pull", map[string]any{"model": j.model, "stream": true})
 	if err != nil {
 		return fmt.Errorf("pull request failed: %w", err)
 	}
@@ -483,6 +491,10 @@ type catalogEntry struct {
 	Blurb          string     `json:"blurb"`
 	EstTokPerSec   [2]float64 `json:"estTokPerSec"` // [lo, hi]; [0,0] = n/a
 	RecommendedFor string     `json:"recommendedFor"`
+	// Host names the backend this catalog entry is intended for ("mac" for big
+	// models that need the Mac's RAM; "" or "nas" for the always-on NAS). Drives
+	// the default pull target and the host used for fit verdicts.
+	Host string `json:"host,omitempty"`
 	// Architecture dims (hidden from JSON) power the pre-download KV-cache
 	// estimate; real dims come from /api/show once installed.
 	Layers  int `json:"-"`
@@ -547,9 +559,23 @@ var curatedCatalog = []catalogEntry{
 	{
 		Name: "llama3.1:8b", Family: "llama3", Params: "8B", Quant: "Q4_K_M",
 		SizeGB: 4.7, ContextWindow: 128000, Capabilities: []string{"tools", "completion"},
-		Blurb:        "Best quality here, but slow and RAM-heavy on 8 GB. Shorten its context.",
+		Blurb: "Best quality here, but slow and RAM-heavy on 8 GB. Shorten its context.",
 		EstTokPerSec: [2]float64{2, 4}, RecommendedFor: "Best quality (slow)",
 		Layers: 32, KVHeads: 8, HeadDim: 128,
+	},
+	{
+		Name: "mistral:7b", Family: "llama", Params: "7B", Quant: "Q4_K_M",
+		SizeGB: 4.4, ContextWindow: 32768, Capabilities: []string{"completion"},
+		Blurb: "Mistral 7B — solid general chat. Runs on the Mac backend, not the 8 GB NAS.",
+		EstTokPerSec: [2]float64{20, 45}, RecommendedFor: "Bigger chat (Mac)",
+		Layers: 32, KVHeads: 8, HeadDim: 128, Host: "mac",
+	},
+	{
+		Name: "qwen2.5:14b", Family: "qwen2.5", Params: "14B", Quant: "Q4_K_M",
+		SizeGB: 8.4, ContextWindow: 32768, Capabilities: []string{"tools", "completion"},
+		Blurb: "Qwen2.5 14B — strong reasoning + tool calls. Needs the Mac's RAM.",
+		EstTokPerSec: [2]float64{10, 28}, RecommendedFor: "Best reasoning (Mac)",
+		Layers: 40, KVHeads: 2, HeadDim: 128, Host: "mac",
 	},
 	{
 		Name: "nomic-embed-text", Family: "nomic-bert", Params: "0.1B", Quant: "f16",
@@ -557,6 +583,18 @@ var curatedCatalog = []catalogEntry{
 		Blurb:        "Embeddings for search/RAG — not a chat model. Tiny and fast.",
 		EstTokPerSec: [2]float64{0, 0}, RecommendedFor: "Embeddings",
 	},
+}
+
+// catalogEntryByName returns the curated catalog entry for a model id, or nil.
+// Used by handleModelPull to pick the default pull target (NAS vs Mac) from a
+// catalog entry's Host tag when the caller didn't name a host explicitly.
+func catalogEntryByName(name string) *catalogEntry {
+	for i := range curatedCatalog {
+		if curatedCatalog[i].Name == name {
+			return &curatedCatalog[i]
+		}
+	}
+	return nil
 }
 
 // estimateKV approximates the fp16 KV-cache RAM (GB, decimal) a model needs at
@@ -569,7 +607,15 @@ func (s *server) estimateKV(layers, kvHeads, headDim, ctx int) float64 {
 }
 
 func (s *server) verdictFor(e catalogEntry) modelVerdict {
-	available := s.cfg.nasRamGB - s.cfg.nasSystemReserveGB
+	// Fit is judged against the host that would actually run the model: catalog
+	// entries tagged Host:"mac" are measured against the Mac's RAM budget, the
+	// rest against the default (NAS). Falls back to the default host if the named
+	// host isn't configured (e.g. OLLAMA_MAC_URL unset).
+	h := s.hosts.hostByName(e.Host)
+	if h == nil {
+		h = s.hosts.defaultHost()
+	}
+	available := h.availableGB()
 	ctx := s.cfg.contextLength
 	if ctx <= 0 {
 		ctx = e.ContextWindow
@@ -611,16 +657,10 @@ func (s *server) verdictFor(e catalogEntry) modelVerdict {
 
 func (s *server) installedModelSet(ctx context.Context) map[string]bool {
 	out := map[string]bool{}
-	models, err := s.ollamaTags(ctx)
-	if err != nil {
-		return out
-	}
-	for _, m := range models {
-		name := m.Name
-		if name == "" {
-			name = m.Model
+	for _, p := range s.hosts.onlineTagPairs() {
+		for _, m := range p.tags {
+			out[modelTagName(m)] = true
 		}
-		out[name] = true
 	}
 	return out
 }
@@ -653,36 +693,46 @@ func dimsFromModelInfo(m map[string]any, family string) (layers, kvHeads, headDi
 
 // --- Handlers (all session-auth-gated, registered in main.go) ---------------
 
-// handleModels lists installed models with size/details + last benchmark. It
-// keeps the OpenAI {data:[{id}]} shape the existing selector expects, falling
-// back to the plain /v1/models proxy if /api/tags is unavailable.
+// handleModels lists installed models with size/details + last benchmark,
+// merged across every online backend host. Each item carries the host it lives
+// on (and its online state) so the selector can badge and grey out offline-host
+// models. Keeps the OpenAI {data:[{id}]} shape the existing selector expects,
+// falling back to the default host's /v1/models proxy if no host is online.
 func (s *server) handleModels(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-	defer cancel()
-	models, err := s.ollamaTags(ctx)
-	if err != nil {
-		s.modelsProxy.ServeHTTP(w, r)
+	pairs := s.hosts.onlineTagPairs()
+	if len(pairs) == 0 {
+		if p := s.modelsProxies[s.hosts.defaultHost().name]; p != nil {
+			p.ServeHTTP(w, r)
+		} else {
+			writeJSON(w, map[string]any{"data": []map[string]any{}})
+		}
 		return
 	}
-	out := make([]map[string]any, 0, len(models))
-	for _, m := range models {
-		name := m.Name
-		if name == "" {
-			name = m.Model
+	out := make([]map[string]any, 0)
+	seen := map[string]bool{}
+	for _, p := range pairs {
+		for _, m := range p.tags {
+			name := modelTagName(m)
+			if name == "" || seen[name] {
+				continue
+			}
+			seen[name] = true
+			item := map[string]any{
+				"id":         name,
+				"name":       name,
+				"size":       m.Size,
+				"sizeGB":     float64(m.Size) / 1e9,
+				"digest":     m.Digest,
+				"modifiedAt": m.ModifiedAt,
+				"details":    m.Details,
+				"host":       p.host.name,
+				"hostOnline": true,
+			}
+			if b := s.store.getBenchmark(name); b != nil {
+				item["benchmark"] = b
+			}
+			out = append(out, item)
 		}
-		item := map[string]any{
-			"id":         name,
-			"name":       name,
-			"size":       m.Size,
-			"sizeGB":     float64(m.Size) / 1e9,
-			"digest":     m.Digest,
-			"modifiedAt": m.ModifiedAt,
-			"details":    m.Details,
-		}
-		if b := s.store.getBenchmark(name); b != nil {
-			item["benchmark"] = b
-		}
-		out = append(out, item)
 	}
 	writeJSON(w, map[string]any{"data": out})
 }
@@ -695,20 +745,36 @@ func (s *server) handleModelCatalog(w http.ResponseWriter, r *http.Request) {
 	for _, e := range curatedCatalog {
 		out = append(out, catalogItem{catalogEntry: e, Installed: installed[e.Name], Verdict: s.verdictFor(e)})
 	}
+	// Per-host RAM info so the UI can show "Fits on Mac · 32 GB" per model. The
+	// default (NAS) host is also echoed under `nas` for the existing frontend.
+	hinfo := make([]map[string]any, 0, len(s.hosts.all()))
+	for _, h := range s.hosts.all() {
+		hinfo = append(hinfo, map[string]any{
+			"name":        h.name,
+			"ramGB":       h.ramGB,
+			"reserveGB":   h.reserveGB,
+			"availableGB": h.availableGB(),
+			"online":      s.hosts.isOnline(h),
+		})
+	}
+	nas := s.hosts.defaultHost()
 	writeJSON(w, map[string]any{
 		"models": out,
 		"nas": map[string]any{
-			"ramGB":         s.cfg.nasRamGB,
-			"reserveGB":     s.cfg.nasSystemReserveGB,
+			"ramGB":         nas.ramGB,
+			"reserveGB":     nas.reserveGB,
 			"contextLength": s.cfg.contextLength,
-			"availableGB":   s.cfg.nasRamGB - s.cfg.nasSystemReserveGB,
+			"availableGB":   nas.availableGB(),
 		},
+		"hosts":         hinfo,
+		"contextLength": s.cfg.contextLength,
 	})
 }
 
 func (s *server) handleModelPull(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Model string `json:"model"`
+		Host  string `json:"host"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, "invalid request", http.StatusBadRequest)
@@ -719,12 +785,27 @@ func (s *server) handleModelPull(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "model is required", http.StatusBadRequest)
 		return
 	}
+	// Resolve the backend to pull onto. An explicit host wins; otherwise pick by
+	// catalog intent (entries tagged Host:"mac" pull onto the Mac), falling back
+	// to the default (NAS). Lets big models land on the Mac's RAM without the
+	// user naming a host, while a manual pull of a NAS model stays on the NAS.
+	targetHost := s.hosts.hostByName(body.Host)
+	if targetHost == nil {
+		if e := catalogEntryByName(model); e != nil && e.Host != "" {
+			if h := s.hosts.hostByName(e.Host); h != nil {
+				targetHost = h
+			}
+		}
+	}
+	if targetHost == nil {
+		targetHost = s.hosts.defaultHost()
+	}
 	if existing := s.pulls.activeJob(); existing != nil {
 		w.WriteHeader(http.StatusConflict)
 		writeJSON(w, pullStateFrom(existing))
 		return
 	}
-	j := newPullJob(model)
+	j := newPullJob(model, targetHost)
 	if err := s.pulls.enqueue(j); err != nil {
 		if existing := s.pulls.activeJob(); existing != nil {
 			w.WriteHeader(http.StatusConflict)
@@ -892,7 +973,11 @@ func (s *server) handleModelDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	resp, err := s.ollamaRequest(ctx, http.MethodDelete, "/api/delete", map[string]any{"model": name})
+	h := s.hosts.onlineHostForModel(name)
+	if h == nil {
+		h = s.hosts.defaultHost()
+	}
+	resp, err := s.ollamaRequest(ctx, h, http.MethodDelete, "/api/delete", map[string]any{"model": name})
 	if err != nil {
 		jsonError(w, "could not reach ollama", http.StatusBadGateway)
 		return
@@ -907,6 +992,7 @@ func (s *server) handleModelDelete(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "ollama: "+strings.TrimSpace(string(body)), resp.StatusCode)
 		return
 	}
+	s.hosts.refreshOne(h) // merged model list should drop the removed model now
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -923,10 +1009,13 @@ type benchmarkResult struct {
 // tok/s from Ollama's eval stats: tok/s = eval_count / eval_duration * 1e9.
 // It runs on a background context so it works detached from any HTTP request
 // (used by both the manual benchmark handler and the post-pull auto-benchmark).
-func (s *server) runBenchmark(model string) (*benchmarkResult, error) {
+func (s *server) runBenchmark(model string, h *host) (*benchmarkResult, error) {
+	if h == nil {
+		h = s.hosts.defaultHost()
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	resp, err := s.ollamaRequest(ctx, http.MethodPost, "/api/generate", map[string]any{
+	resp, err := s.ollamaRequest(ctx, h, http.MethodPost, "/api/generate", map[string]any{
 		"model":   model,
 		"prompt":  "Write a numbered list of three short facts about the ocean.",
 		"stream":  false,
@@ -962,7 +1051,11 @@ func (s *server) handleModelBenchmark(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "model is required", http.StatusBadRequest)
 		return
 	}
-	br, err := s.runBenchmark(name)
+	h := s.hosts.onlineHostForModel(name)
+	if h == nil {
+		h = s.hosts.defaultHost()
+	}
+	br, err := s.runBenchmark(name, h)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusBadGateway)
 		return
@@ -992,7 +1085,12 @@ func (s *server) handleModelInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	resp, err := s.ollamaRequest(ctx, http.MethodPost, "/api/show", map[string]any{"model": name})
+	// /api/show and the size lookup run on the backend host that owns the model.
+	h := s.hosts.onlineHostForModel(name)
+	if h == nil {
+		h = s.hosts.defaultHost()
+	}
+	resp, err := s.ollamaRequest(ctx, h, http.MethodPost, "/api/show", map[string]any{"model": name})
 	if err != nil {
 		jsonError(w, "could not reach ollama", http.StatusBadGateway)
 		return
@@ -1025,19 +1123,15 @@ func (s *server) handleModelInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	kv := s.estimateKV(layers, kvHeads, headDim, ctxLen)
 	sizeGB := 0.0
-	if models, err := s.ollamaTags(ctx); err == nil {
+	if models, err := s.ollamaTags(ctx, h); err == nil {
 		for _, m := range models {
-			mn := m.Name
-			if mn == "" {
-				mn = m.Model
-			}
-			if mn == name {
+			if modelTagName(m) == name {
 				sizeGB = float64(m.Size) / 1e9
 				break
 			}
 		}
 	}
-	available := s.cfg.nasRamGB - s.cfg.nasSystemReserveGB
+	available := h.availableGB()
 	used := sizeGB + kv
 	fit := "fits"
 	switch {

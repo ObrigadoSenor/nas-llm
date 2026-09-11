@@ -138,9 +138,9 @@ func jsonString(s string) json.RawMessage {
 // once per real search (query + source URLs) so the UI can prove a lookup ran,
 // or a Skipped entry when the model answers without ever calling the tool.
 // Returns nil on success, an error otherwise.
-func (s *server) runSearchLoop(ctx context.Context, model string, msgs []oaiMessage, emit func(string), emitPhase func(string), emitSearch func(searchEntry)) error {
+func (s *server) runSearchLoop(ctx context.Context, target, model string, msgs []oaiMessage, emit func(string), emitPhase func(string), emitSearch func(searchEntry)) error {
 	emitPhase("searching")
-	ollamaChatURL := strings.TrimRight(s.cfg.ollamaURL, "/") + "/v1/chat/completions"
+	ollamaChatURL := target
 	req := chatRequest{
 		Model:    model,
 		Messages: append([]oaiMessage{systemNudge()}, msgs...),
@@ -450,7 +450,7 @@ func cleanSnippet(raw string, max int) string {
 // emitting OpenAI-format SSE. The tool loop itself lives in runSearchLoop; here
 // we only wire it to the ResponseWriter with a keepalive goroutine so the
 // Cloudflare 100s edge timeout (524) never fires while the N100 thinks.
-func (s *server) handleChatWithSearch(w http.ResponseWriter, r *http.Request, body []byte) {
+func (s *server) handleChatWithSearch(w http.ResponseWriter, r *http.Request, body []byte, chatURL string) {
 	var req chatRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		jsonError(w, "invalid request", http.StatusBadRequest)
@@ -513,7 +513,7 @@ func (s *server) handleChatWithSearch(w http.ResponseWriter, r *http.Request, bo
 	ctx, cancel := context.WithTimeout(r.Context(), searchCallTimeout)
 	defer cancel()
 
-	err := s.runSearchLoop(ctx, req.Model, req.Messages, emit, emitPhase, func(searchEntry) {})
+	err := s.runSearchLoop(ctx, chatURL, req.Model, req.Messages, emit, emitPhase, func(searchEntry) {})
 	close(stop)
 	wg.Wait()
 

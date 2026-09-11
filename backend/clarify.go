@@ -110,9 +110,9 @@ func clarifyNudge() oaiMessage {
 // emitQuestions) and returns nil — the worker then persists a clarifying turn.
 // If the model answers directly (no tool call), the streamed content is the
 // answer and the worker persists a normal assistant message.
-func (s *server) runClarifyLoop(ctx context.Context, model string, msgs []oaiMessage, emit func(string), emitPhase func(string), emitQuestions func(clarifyMeta)) error {
+func (s *server) runClarifyLoop(ctx context.Context, target, model string, msgs []oaiMessage, emit func(string), emitPhase func(string), emitQuestions func(clarifyMeta)) error {
 	emitPhase("clarifying")
-	ollamaChatURL := strings.TrimRight(s.cfg.ollamaURL, "/") + "/v1/chat/completions"
+	ollamaChatURL := target
 	req := chatRequest{
 		Model:    model,
 		Messages: append([]oaiMessage{clarifyNudge()}, msgs...),

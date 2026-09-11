@@ -36,17 +36,27 @@ type config struct {
 	contextLength      int
 	nasRamGB           float64
 	nasSystemReserveGB float64
+	// Optional secondary Ollama backend (e.g. a Mac on the LAN/Tailscale) with
+	// more RAM for bigger models. Empty macURL disables it; the NAS stays the
+	// only backend and behavior is unchanged from the single-host design.
+	macURL             string
+	macRamGB           float64
+	macSystemReserveGB float64
 }
 
 type server struct {
-	cfg         config
-	store       *store
-	limiter     *rateLimiter
-	mailer      mailer
-	modelsProxy http.Handler
-	chatProxy   http.Handler
-	jobs        *jobManager
-	pulls       *pullManager
+	cfg     config
+	store   *store
+	limiter *rateLimiter
+	mailer  mailer
+	// hosts is the multi-backend routing authority (NAS default + optional Mac).
+	// chatProxies/modelsProxies are per-host streaming reverse proxies, keyed by
+	// host.name, built once at startup from the registry's host URLs.
+	hosts         *hostRegistry
+	chatProxies   map[string]http.Handler
+	modelsProxies map[string]http.Handler
+	jobs          *jobManager
+	pulls         *pullManager
 }
 
 type ctxKey int
@@ -70,6 +80,9 @@ func main() {
 		contextLength:      envInt("OLLAMA_CONTEXT_LENGTH", 16384),
 		nasRamGB:           envFloat("NAS_RAM_GB", 8),
 		nasSystemReserveGB: envFloat("NAS_SYSTEM_RESERVE_GB", 1.5),
+		macURL:             env("OLLAMA_MAC_URL", ""),
+		macRamGB:           envFloat("MAC_RAM_GB", 16),
+		macSystemReserveGB: envFloat("MAC_SYSTEM_RESERVE_GB", 2),
 	}
 	cfg.cookieSecure = strings.HasPrefix(cfg.appBaseURL, "https://")
 	cfg.allowedEmails = parseAllowed(os.Getenv("ALLOWED_EMAILS"))
@@ -80,13 +93,29 @@ func main() {
 	}
 	defer st.close()
 
+	// Build the backend host list. The NAS is always present (always-on, small
+	// models); a Mac is added only when OLLAMA_MAC_URL is set, becoming a second
+	// backend whose RAM holds bigger models. The registry probes each host's
+	// /api/tags and resolves model→host so inference routes to the right one.
+	hosts := []*host{{name: "nas", url: cfg.ollamaURL, ramGB: cfg.nasRamGB, reserveGB: cfg.nasSystemReserveGB}}
+	if cfg.macURL != "" {
+		hosts = append(hosts, &host{name: "mac", url: cfg.macURL, ramGB: cfg.macRamGB, reserveGB: cfg.macSystemReserveGB})
+	}
+	hostReg := newHostRegistry(hosts)
+	hostReg.start()
+
 	srv := &server{
-		cfg:         cfg,
-		store:       st,
-		limiter:     newRateLimiter(),
-		mailer:      &brevoMailer{apiKey: cfg.brevoKey, from: cfg.mailFrom},
-		modelsProxy: buildProxy(cfg.ollamaURL, "/v1/models"),
-		chatProxy:   buildProxy(cfg.ollamaURL, "/v1/chat/completions"),
+		cfg:           cfg,
+		store:         st,
+		limiter:       newRateLimiter(),
+		mailer:        &brevoMailer{apiKey: cfg.brevoKey, from: cfg.mailFrom},
+		hosts:         hostReg,
+		chatProxies:   map[string]http.Handler{},
+		modelsProxies: map[string]http.Handler{},
+	}
+	for _, h := range hostReg.all() {
+		srv.chatProxies[h.name] = buildProxy(h.url, "/v1/chat/completions")
+		srv.modelsProxies[h.name] = buildProxy(h.url, "/v1/models")
 	}
 	srv.jobs = newJobManager(st, srv)
 	srv.pulls = newPullManager(srv)

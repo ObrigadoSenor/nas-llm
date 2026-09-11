@@ -361,19 +361,36 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	r.Body.Close()
 
 	// Branch on the optional web_search flag. Flag off (or no SearXNG
-	// configured) -> the existing streaming passthrough to Ollama, unchanged.
+	// configured) -> a streaming passthrough to the Ollama backend that owns the
+	// requested model; otherwise the tool loop runs on that same backend.
 	var probe struct {
-		WebSearch bool `json:"web_search"`
+		Model     string `json:"model"`
+		WebSearch bool   `json:"web_search"`
 	}
 	_ = json.Unmarshal(body, &probe)
+
+	// Resolve the backend host that owns the model. If no online host has it
+	// (e.g. it lives on the Mac and the Mac is offline), fall back to the default
+	// host so Ollama returns a clean not-found instead of the backend 500ing.
+	h := s.hosts.onlineHostForModel(probe.Model)
+	if h == nil {
+		h = s.hosts.defaultHost()
+	}
+
 	if !probe.WebSearch || s.cfg.searxngURL == "" {
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		r.ContentLength = int64(len(body))
-		s.chatProxy.ServeHTTP(w, r)
+		if p := s.chatProxies[h.name]; p != nil {
+			p.ServeHTTP(w, r)
+		} else if p := s.chatProxies[s.hosts.defaultHost().name]; p != nil {
+			p.ServeHTTP(w, r)
+		} else {
+			jsonError(w, "no inference backend configured", http.StatusBadGateway)
+		}
 		return
 	}
 
-	s.handleChatWithSearch(w, r, body)
+	s.handleChatWithSearch(w, r, body, h.chatURL())
 }
 
 // --- Background generation (chat UI) ---
