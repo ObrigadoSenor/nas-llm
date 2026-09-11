@@ -1464,7 +1464,13 @@ function buildPullTargetSelect(){
   if(hosts.some(h=>h.name==="mac")) sel.appendChild(new Option("Mac","mac"));
   sel.appendChild(new Option("Local (this computer)","local"));
   sel.value=pullTarget;
-  sel.addEventListener("change",()=>{ pullTarget=sel.value; localStorage.setItem("nas-llm-pull-target", pullTarget); renderBrowseList(); });
+  sel.addEventListener("change",()=>{
+    pullTarget=sel.value; localStorage.setItem("nas-llm-pull-target", pullTarget);
+    // Re-render the visible list so its preflight badges reflect the new target
+    // (preflight is cached → badges reappear instantly). Recommended cards are
+    // rebuilt; library cards are re-badged in place to avoid a library refetch.
+    if(browseMode==="library") reattachLibraryPreflight(); else renderBrowseList();
+  });
   return sel;
 }
 function collectCategories(models){ const set=new Set(); models.forEach(m=>(m.categories||[]).forEach(c=>set.add(c))); return [...set]; }
@@ -1485,6 +1491,7 @@ function renderBrowseList(){
   });
   if(!filtered.length){ list.appendChild(mutedNote("No models match your search.")); return; }
   filtered.forEach(m=>list.appendChild(renderBrowseCard(m)));
+  filtered.forEach(m=>attachPreflightBadge(list, m.name, pullTarget, false));
 }
 // The download targets offered on per-card Download menus and the top chooser.
 function availablePullTargets(){
@@ -1498,12 +1505,28 @@ function availablePullTargets(){
 // Reuses the row-action menu infra (closeMenu/openMenu).
 function openDownloadMenu(anchor, model){
   closeMenu();
-  const m=document.createElement("div"); m.className="menu";
+  const m=document.createElement("div"); m.className="menu dl-menu";
   const title=document.createElement("div"); title.className="menu-msg"; title.textContent="Download "+model+" to:"; m.appendChild(title);
   availablePullTargets().forEach(t=>{
-    const b=document.createElement("button"); b.innerHTML='<span>'+escapeHtml(t.label)+'</span>';
+    const b=document.createElement("button"); b.className="dl-target";
+    const label=document.createElement("span"); label.className="dl-label"; label.textContent=t.label;
+    const sub=document.createElement("span"); sub.className="dl-sub muted"; sub.textContent="…";
+    b.appendChild(label); b.appendChild(sub);
     b.addEventListener("click",e=>{ e.stopPropagation(); closeMenu(); startPull(model, t.value); });
     m.appendChild(b);
+    // Enrich this item with the real download size + per-host fit once the
+    // preflight resolves (cached, so a reopen is instant). Fails silently to a
+    // muted "size unknown" when the registry endpoint is unreachable.
+    preflightModel(model, t.value).then(pf=>{
+      if(!pf || pf.downloadGB == null){ sub.textContent="size unknown"; sub.classList.add("dl-unknown"); return; }
+      sub.replaceChildren(); sub.classList.remove("muted");
+      const gb=document.createElement("span"); gb.className="dl-gb"; gb.textContent=pf.downloadGB.toFixed(1)+" GB"; sub.appendChild(gb);
+      const fit=preflightFitLabel(pf);
+      if(fit){
+        const sep=document.createElement("span"); sep.className="dl-sep"; sep.textContent="·"; sub.appendChild(sep);
+        const f=document.createElement("span"); f.className="dl-fit "+fit.cls; f.textContent=fit.label; sub.appendChild(f);
+      }
+    });
   });
   document.body.appendChild(m);
   const r=anchor.getBoundingClientRect();
@@ -1523,6 +1546,20 @@ async function renderBrowseTab(){
   const targetRow=document.createElement("div"); targetRow.className="pull-target-row";
   const tl=document.createElement("span"); tl.className="muted"; tl.textContent="Download to:";
   targetRow.appendChild(tl); targetRow.appendChild(buildPullTargetSelect());
+  // Local RAM budget: the backend can't know the visitor's RAM, so Local-target
+  // fit is estimated in-browser against this number (persisted, default 16 GB).
+  const ramWrap=document.createElement("span"); ramWrap.className="local-ram-wrap";
+  const ramLabel=document.createElement("span"); ramLabel.className="muted"; ramLabel.textContent="Local RAM:";
+  const ramInp=document.createElement("input"); ramInp.type="number"; ramInp.className="local-ram";
+  ramInp.min=2; ramInp.max=128; ramInp.step=1; ramInp.value=localRamGB;
+  ramInp.title="Your computer's RAM (GB) — used to estimate whether Local-target downloads fit";
+  ramInp.addEventListener("change",()=>{
+    const v=parseFloat(ramInp.value);
+    if(!(v>0)){ ramInp.value=localRamGB; return; }
+    localRamGB=v; saveLocalRamGB(); refreshLocalPreflightBadges();
+  });
+  ramWrap.appendChild(ramLabel); ramWrap.appendChild(ramInp);
+  targetRow.appendChild(ramWrap);
   body.appendChild(targetRow);
   // Pull-by-name.
   const pbn=document.createElement("div"); pbn.className="pullbyname";
@@ -1619,6 +1656,7 @@ async function renderLibraryList(){
     list.replaceChildren();
     if(!mods.length){ list.appendChild(mutedNote("No models found. Try a different search or capability.")); return; }
     mods.forEach(m=>list.appendChild(renderLibraryCard(m)));
+    mods.forEach(m=>attachPreflightBadge(list, m.name, pullTarget, true));
   }catch(e){ list.replaceChildren(mutedNote("Library search failed: "+errText(e))); }
 }
 
@@ -1627,7 +1665,7 @@ async function renderLibraryList(){
 // backend can't estimate KV cache without known arch dims); capabilities +
 // sizes help the user judge, and the pull auto-benchmarks once installed.
 function renderLibraryCard(m){
-  const card=document.createElement("div"); card.className="mcard lib-card";
+  const card=document.createElement("div"); card.className="mcard lib-card"; card.dataset.preflight=m.name;
   const head=document.createElement("div"); head.className="mcard-head";
   const title=document.createElement("div"); title.className="mcard-title"; title.textContent=m.name;
   const sub=document.createElement("div"); sub.className="mcard-sub";
@@ -1657,7 +1695,7 @@ function renderLibraryCard(m){
 }
 
 function renderBrowseCard(m){
-  const card=document.createElement("div"); card.className="mcard";
+  const card=document.createElement("div"); card.className="mcard"; card.dataset.preflight=m.name;
   const v=m.verdict||{};
   const head=document.createElement("div"); head.className="mcard-head";
   const title=document.createElement("div"); title.className="mcard-title"; title.textContent=m.name;
@@ -1947,6 +1985,129 @@ function speedBadge(m, v){
   if(lo<=0 && hi<=0) return badge("est. speed n/a", "");
   const cls=v.speed==="fast"?"speed-fast":v.speed==="usable"?"speed-ok":"speed-slow";
   return badge(`≈ ${lo}–${hi} tok/s`, cls);
+}
+
+// --- Preflight (registry size + fit before download) -----------------------
+// preflightModel fetches /api/models/preflight?model=&host= once per name|host
+// and caches the parsed JSON so repeated card renders / menu opens don't
+// refetch. Returns the response, or null on any failure (the UI fails silently
+// — no badge, or a muted "size unknown"). A 404 (tag not in the registry) is
+// cached as null so a re-render doesn't re-hammer the registry; transient
+// 502/network errors are NOT cached so a later render can retry.
+const preflightCache = new Map();
+async function preflightModel(name, host){
+  if(!name) return null;
+  const key = name + "|" + (host || "auto");
+  if(preflightCache.has(key)) return preflightCache.get(key);
+  try{
+    const url = "/api/models/preflight?model=" + encodeURIComponent(name) + "&host=" + encodeURIComponent(host || "auto");
+    const r = await fetchRetry(url, {}, {label:"Preflight"});
+    const j = await r.json();
+    if(!j || j.error){ preflightCache.set(key, null); return null; }
+    preflightCache.set(key, j);
+    return j;
+  }catch(e){
+    if(e && e.status === 404) preflightCache.set(key, null);   // unknown tag — won't come back
+    return null;
+  }
+}
+
+// Visitor's local RAM budget (GB) for in-browser Local-target fit estimates.
+// The backend can't know the visitor's RAM, so host=local returns a null fit and
+// we compute a rough verdict client-side against this budget.
+let localRamGB = loadLocalRamGB();
+function loadLocalRamGB(){ const v = parseFloat(localStorage.getItem("nas-llm-local-ram-gb")); return v > 0 ? v : 16; }
+function saveLocalRamGB(){ localStorage.setItem("nas-llm-local-ram-gb", String(localRamGB)); }
+
+// Rough client-side local fit, mirroring the backend's reserve logic: weights
+// must fit under the budget with a ~1.5 GB OS/context reserve. Returns
+// "fits" | "tight" | "no", or null when no size is known.
+function localFitFor(pf){
+  if(!pf) return null;
+  const w = pf.weightsGB != null ? pf.weightsGB : pf.downloadGB;
+  if(w == null || w <= 0) return null;
+  if(w <= localRamGB - 1.5) return "fits";
+  if(w <= localRamGB) return "tight";
+  return "no";
+}
+
+// Resolve a fit verdict {cls,label} for a preflight response. Uses the
+// backend's fit for nas/mac; for host=local (or a null fit) falls back to the
+// client-side local-budget verdict. Returns null when there's nothing to show.
+function preflightFitLabel(pf){
+  if(!pf) return null;
+  const host = pf.host;
+  if(host === "local" || pf.fit == null){
+    const lf = localFitFor(pf);
+    if(!lf) return null;
+    return { cls: lf === "fits" ? "fit-good" : lf === "tight" ? "fit-tight" : "fit-bad",
+             label: lf === "fits" ? "Fits local" : lf === "tight" ? "Tight local" : "Won't fit local" };
+  }
+  const cls = pf.fit === "fits" ? "fit-good" : pf.fit === "tight" ? "fit-tight" : "fit-bad";
+  const hn = host === "nas" ? "NAS" : host === "mac" ? "Mac" : (hostLabel(host) || "NAS");
+  const label = pf.fit === "fits" ? "Fits " + hn : pf.fit === "tight" ? "Tight — shorten context" : "Won't fit " + hn;
+  return { cls, label };
+}
+
+// Build a compact preflight badge: download icon + real download GB, plus an
+// optional colored fit verdict. showFit=false (cataloged browse cards) shows
+// only the GB alongside the curated fitBadge; showFit=true (library cards and
+// the download menu) appends the fit verdict. The response is retained on the
+// element (_pf/_showFit) so a local-RAM-budget change can refresh just the fit.
+function preflightBadgeEl(pf, showFit){
+  if(!pf || pf.error || pf.downloadGB == null) return null;
+  const b = document.createElement("span");
+  b.className = "preflight-badge";
+  b.innerHTML = icon("download", 12);
+  const gb = document.createElement("span"); gb.className = "pf-gb";
+  gb.textContent = pf.downloadGB.toFixed(1) + " GB";
+  b.appendChild(gb);
+  b._pf = pf; b._showFit = !!showFit;
+  if(!showFit) return b;
+  const fit = preflightFitLabel(pf);
+  if(fit){ const f = document.createElement("span"); f.className = "pf-fit " + fit.cls; f.textContent = fit.label; b.appendChild(f); }
+  return b;
+}
+
+// Lazy-append a preflight badge into a card already in the DOM. Mirrors the
+// ensureCaps -> refreshRowBadges pattern: find the card by its stable
+// data-preflight attribute (tolerating re-renders / filters), append into the
+// .mcard-meta or .badges row, and skip if a badge is already present or the
+// card was filtered away. Fails silently when the endpoint is absent.
+function attachPreflightBadge(containerEl, name, host, showFit){
+  preflightModel(name, host).then(pf=>{
+    if(!pf) return;
+    const card = containerEl && containerEl.querySelector('[data-preflight="' + name + '"]');
+    if(!card || card.querySelector(".preflight-badge")) return;
+    const meta = card.querySelector(".mcard-meta") || card.querySelector(".badges");
+    if(!meta) return;
+    const b = preflightBadgeEl(pf, showFit);
+    if(b) meta.appendChild(b);
+  });
+}
+
+// Re-attach preflight badges to the current library cards when the download
+// target changes (avoids refetching the library search — preflight is cached).
+function reattachLibraryPreflight(){
+  const list = $("browseLibList"); if(!list) return;
+  list.querySelectorAll(".preflight-badge").forEach(b=>b.remove());
+  list.querySelectorAll("[data-preflight]").forEach(card=>{
+    attachPreflightBadge(list, card.dataset.preflight, pullTarget, true);
+  });
+}
+
+// Re-compute Local-budget fit badges when the visitor's RAM budget changes.
+// Only badges that depend on the local budget (host=local or null fit) and were
+// showing a fit are touched; cataloged browse badges (GB only) are unaffected.
+function refreshLocalPreflightBadges(){
+  document.querySelectorAll(".preflight-badge").forEach(b=>{
+    const pf = b._pf; if(!pf || !b._showFit) return;
+    if(pf.host !== "local" && pf.fit != null) return;
+    const old = b.querySelector(".pf-fit"); if(old) old.remove();
+    const fit = preflightFitLabel(pf); if(!fit) return;
+    const f = document.createElement("span"); f.className = "pf-fit " + fit.cls; f.textContent = fit.label;
+    b.appendChild(f);
+  });
 }
 
 // --- Agent settings (global system prompt + tool allowlist) ----------------
