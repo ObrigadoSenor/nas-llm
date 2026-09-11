@@ -1833,8 +1833,13 @@ async function startLocalPull(model){
         let p; try{ p=JSON.parse(line); }catch{ continue; }
         const status=String(p.status||"");
         if(status==="success"){ gotSuccess=true; finished=true; break; }
-        if(p.digest && p.total){ layers.set(p.digest, {completed:p.completed||0, total:p.total}); }
-        if(status.startsWith("downloading")){
+        // Ollama reports byte progress on lines carrying digest+total, under
+        // status "pulling <hash>" (current Ollama) or "downloading" (older).
+        // Key the bar on digest+total, not the status string — the old
+        // status.startsWith("downloading") check left the bar stuck at 0%
+        // because the Mac app's Ollama never sends "downloading".
+        if(p.digest && p.total){
+          layers.set(p.digest, {completed:p.completed||0, total:p.total});
           let completed=0,total=0; for(const l of layers.values()){ completed+=l.completed; total+=l.total; }
           if(pullEls){ pullEls.fill.style.width=(total>0?(completed/total*100):0)+"%"; pullEls.bytes.textContent=fmtPullBytes(completed,total); pullEls.phase.textContent=prettyPhase("pulling"); }
         } else if(status && pullEls){ pullEls.phase.textContent=prettyPhase(status); }

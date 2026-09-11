@@ -303,13 +303,13 @@ func (j *pullJob) ingestProgress(p ollamaProgressResponse) {
 		j.emitPhase("success")
 		return
 	}
+	// Byte progress rides on lines carrying digest+total, under status
+	// "pulling <hash>" (current Ollama) or "downloading" (older). Key the bar
+	// on digest+total, not status=="downloading" — current Ollama never sends
+	// "downloading", so the old check left the bar at 0%.
 	if p.Digest != "" && p.Total > 0 {
 		j.mu.Lock()
 		j.layers[p.Digest] = layerProg{p.Completed, p.Total}
-		j.mu.Unlock()
-	}
-	if strings.HasPrefix(status, "downloading") {
-		j.mu.Lock()
 		var completed, total int64
 		for _, l := range j.layers {
 			completed += l.completed
