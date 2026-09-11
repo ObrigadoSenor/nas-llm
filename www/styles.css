@@ -183,6 +183,19 @@ header h1{font-size:var(--fs-l);font-weight:600;margin:0}
 .plus-item.on{color:var(--accent)}
 .plus-item .icon{color:var(--muted)}
 .plus-item.on .icon{color:var(--accent)}
+/* Slash command palette (anchored above the input, like the + menu) */
+.slash-popup{position:absolute;left:0;bottom:calc(100% + 8px);background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:4px;min-width:260px;max-width:360px;max-height:50vh;overflow-y:auto;box-shadow:0 6px 24px rgba(0,0,0,.4);z-index:30}
+.slash-popup.hidden{display:none!important}
+.slash-item{display:flex;align-items:center;gap:8px;width:100%;text-align:left;background:transparent;border:none;border-radius:6px;padding:6px 10px;font-size:var(--fs-m);color:var(--text);cursor:pointer}
+.slash-item:hover,.slash-item.selected{background:var(--hover)}
+.slash-item .icon{color:var(--muted);flex:0 0 auto}
+.slash-item-text{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}
+.slash-item-name{font-weight:600;color:var(--text)}
+.slash-item-desc{font-size:var(--fs-s);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.slash-item.on .icon,.slash-item.on .slash-item-name{color:var(--accent)}
+/* Transient toast for command feedback (e.g. "Web search on", "Renamed to …") */
+.slash-note{position:fixed;left:50%;bottom:72px;transform:translateX(-50%) translateY(8px);background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:8px 14px;font-size:var(--fs-m);color:var(--text);box-shadow:0 6px 24px rgba(0,0,0,.4);z-index:70;opacity:0;pointer-events:none;transition:opacity .15s,transform .15s;max-width:80vw}
+.slash-note.show{opacity:1;transform:translateX(-50%) translateY(0)}
 #send{position:absolute;right:6px;bottom:6px;width:30px;height:30px;padding:0;display:inline-flex;align-items:center;justify-content:center;border-radius:50%}
 #send.stop{border-color:#e0556b;background:color-mix(in srgb,#e0556b 22%,transparent);color:#e0556b}
 #send.stop:hover:not(:disabled){border-color:#e0556b;background:color-mix(in srgb,#e0556b 30%,transparent)}

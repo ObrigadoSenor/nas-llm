@@ -9,7 +9,7 @@ const convList=$("convList"), whoEmail=$("whoEmail");
 const chatTitle=$("chatTitle"), chatMeta=$("chatMeta");
 const loginEmail=$("loginEmail"), loginBtn=$("loginBtn"), loginInfo=$("loginInfo");
 const sidebar=$("sidebar"), scrim=$("scrim"), menuBtn=$("menuBtn"), closeSide=$("closeSide");
-const plusBtn=$("plusBtn"), plusPopup=$("plusPopup"), pills=$("pills");
+const plusBtn=$("plusBtn"), plusPopup=$("plusPopup"), slashPopup=$("slashPopup"), pills=$("pills");
 const attachBtn=$("attachBtn"), fileInput=$("fileInput"), imgPills=$("imgPills");
 
 // Static button icons (set once; the buttons live inside #app, which is hidden
@@ -122,7 +122,11 @@ function modelCapabilities(name){
   return e ? (e.capabilities||[]) : [];
 }
 // modelSupportsTools returns true/false when the model's capabilities are known,
-// or null when unknown — callers must NOT gate on null (don't false-block).
+// or null when unknown. renderPlusPopup blocks new activation on null
+// ("checking tool support…") and on false (no tool support); enforceToolGating
+// only drops an existing pill on false, leaving a stale unknown pill for the
+// backend's runGeneration guard to catch (so a reload never wipes a tool-capable
+// user's Web search toggle while the lazy /info probe is still in flight).
 function modelSupportsTools(name){
   const caps=modelCapabilities(name);
   if(!caps.length) return null;
@@ -159,10 +163,12 @@ function renderPlusPopup(){
   const toolsOk=modelSupportsTools(selectedModel); // null=unknown, true, false
   EXTRA_DEFS.forEach(def=>{
     const on=activeExtras.has(def.id);
-    const blocked=!!def.needsTools && toolsOk===false;
+    const blocked=!!def.needsTools && toolsOk!==true; // also block while unknown (null)
     const b=document.createElement("button"); b.type="button"; b.className="plus-item"+(on?" on":"")+(blocked?" disabled":"");
     b.setAttribute("role","menuitemcheckbox"); b.setAttribute("aria-checked",String(on));
-    if(blocked) b.title=selectedModel+" has no tool support — use a tool-capable model (e.g. llama3.1:8b, qwen3:1.7b) for "+def.label+".";
+    if(blocked) b.title = toolsOk===false
+      ? selectedModel+" has no tool support — use a tool-capable model (e.g. llama3.1:8b, qwen3:1.7b) for "+def.label+"."
+      : selectedModel+" — checking tool support…";
     b.disabled=blocked;
     b.innerHTML=icon(def.icon,16)+'<span>'+escapeHtml(def.label)+'</span>'+(on?icon("check",14):'');
     b.addEventListener("click",e=>{ e.stopPropagation(); if(blocked) return; if(activeExtras.has(def.id)){ activeExtras.delete(def.id); } else { activeExtras.add(def.id); (def.exclusive||[]).forEach(x=>activeExtras.delete(x)); } saveExtras(); renderExtras(); });
@@ -196,6 +202,18 @@ function isVisionModel(name){ return modelCapsFor(name).includes("vision"); }
 async function ensureCaps(name){
   if(!name || capsChecked.has(name)) return;
   capsChecked.add(name);
+  // A local (browser-relay) model lives on the visitor's own Ollama, which the
+  // NAS backend can't introspect — /api/models/:name/info 404s for it. Query
+  // localhost:11434/api/show directly from the browser instead (text/plain keeps
+  // it a CORS simple request with no preflight, same dodge as the relay/pull).
+  if(isLocalModel(name)){
+    try{
+      const r=await fetch("http://localhost:11434/api/show",{method:"POST",headers:{"Content-Type":"text/plain"},body:JSON.stringify({model:name})});
+      if(r.ok){ const j=await r.json(); modelCaps.set(name, j.capabilities||[]); }
+    }catch{}
+    if(name===selectedModel) enforceToolGating();
+    return;
+  }
   try{
     const r=await fetchRetry("/api/models/"+encodeURIComponent(name)+"/info",{},{label:"Model info"});
     if(!r.ok) return;
@@ -513,11 +531,29 @@ function chooseModel(name){
   selectedModel=name; localStorage.setItem("nas-llm-model", selectedModel);
   syncVision(); renderModels();
   enforceToolGating();
-  // Don't overwrite messages while a background job is mid-generation for this
-  // conversation — the job finalizes by appending to the stored messages, and a
-  // PUT here (which lacks the in-flight assistant reply) would clobber it.
-  if(activeId && !generatingIds.has(activeId)) saveConversation();
+  // Persist the selection immediately so it survives a reload or chat switch
+  // without a refresh. A model-only PATCH is safe even while a background job
+  // is mid-generation: it touches just the model column, so the job's
+  // appendAssistantMessage finalization (which writes messages) is unaffected.
+  // The full saveConversation PUT was previously skipped during generation (it
+  // re-sends messages and would clobber the in-flight reply), which is why a
+  // model change only "stuck" after a page refresh.
+  if(activeId) saveModelSelection();
   setModelPopup(false); modelBtn.focus();
+}
+// Persist just the selected model for the active conversation. Model-only (no
+// messages) so it's safe to call during generation — see chooseModel. Refreshes
+// the sidebar so a changed updated_at stays in sync.
+async function saveModelSelection(){
+  if(!activeId) return;
+  try{
+    await fetchRetry("/api/conversations/"+encodeURIComponent(activeId),{
+      method:"PATCH",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({model:selectedModel})
+    },{label:"Save model"});
+    await loadConversations();
+  }catch{}
 }
 // Background-fetch capabilities for every known model so the dropdown can badge
 // vision/tools/thinking. Cached per session via capsChecked; re-renders each
@@ -1026,19 +1062,6 @@ async function deleteConversation(id){
   if(id===activeId) newChat();
   await loadConversations();
 }
-async function saveConversation(){
-  if(!activeId) return;
-  const firstUser=messages.find(m=>m.role==="user");
-  const title=firstUser ? titleFrom(firstUser.content) : "New chat";
-  try{
-    await fetch("/api/conversations/"+encodeURIComponent(activeId),{
-      method:"PUT",
-      headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({title, model:selectedModel, messages})
-    });
-    await loadConversations();
-  }catch{}
-}
 
 // --- Chat rendering ---------------------------------------------------------
 // Render an error line (icon + message) into an assistant bubble. Used when
@@ -1148,6 +1171,19 @@ function updateHeader(){
 // --- Streaming (enqueue a background job, then tail it over SSE) ------------
 async function stream(){
   const text=input.value.trim();
+  // Slash command: a "/name [args]" line runs the matching command instead
+  // of being sent. Unknown /-prefixed text falls through and sends normally,
+  // so "/etc/hosts" or code paths aren't hijacked.
+  const parsed=parseSlash(text);
+  if(parsed){
+    const c=findCommand(parsed.name);
+    if(c){
+      input.value=""; autosize(); closeSlashPopup();
+      if(c.args && !parsed.args){ slashNote("Usage: /"+c.name+" "+argHint(c.name)); input.value="/"+c.name+" "; autosize(); input.focus(); return; }
+      runCommand(c, parsed.args);
+      return;
+    }
+  }
   const images=pendingImages.slice();
   if((!text && images.length===0) || send.disabled) return;
   if(images.length){ pendingImages=[]; renderImgPills(); }
@@ -1191,7 +1227,7 @@ async function stream(){
       const r=await fetch("/api/conversations/"+encodeURIComponent(activeId)+"/generate",{
         method:"POST",
         headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({model:selectedModel, messages, web_search:webSearchOn(), clarify:clarifyOn(), agent:agentOn(), local:isLocalModel(selectedModel)})
+        body:JSON.stringify({model:selectedModel, messages, web_search:webSearchOn(), clarify:clarifyOn(), agent:agentOn(), local:isLocalModel(selectedModel), supportsTools:modelSupportsTools(selectedModel)===true})
       });
       if(r.ok || r.status===409){ job=await r.json(); break; }
       genErr=new Error("HTTP "+r.status);
@@ -1234,6 +1270,16 @@ function sendClarifyAnswer(value, bubble){
 
 send.addEventListener("click",()=>{ if(send.classList.contains("stop")) stopActive(); else stream(); });
 input.addEventListener("keydown",e=>{
+  if(slashPopupOpen()){
+    if(e.key==="ArrowDown"){ e.preventDefault(); if(slashItems.length){ slashSelected=Math.min(slashItems.length-1,slashSelected+1); markSlashSelected(); } return; }
+    if(e.key=="ArrowUp"){ e.preventDefault(); if(slashItems.length){ slashSelected=Math.max(0,slashSelected-1); markSlashSelected(); } return; }
+    if(e.key==="Tab"){ e.preventDefault(); if(slashItems.length) completeSlash(); return; }
+    if(e.key==="Escape"){ e.preventDefault(); closeSlashPopup(); return; }
+    if(e.key==="Enter"&&!e.shiftKey){
+      if(slashItems.length){ e.preventDefault(); runSlashIndex(slashSelected); return; }
+      closeSlashPopup(); // no matches — let this Enter send the text normally
+    }
+  }
   if(e.key==="Enter"&&!e.shiftKey){ e.preventDefault(); stream(); return; }
   if(e.key==="ArrowUp"||e.key==="ArrowDown"){
     const sel=input.selectionStart, v=input.value;
@@ -1253,7 +1299,7 @@ input.addEventListener("keydown",e=>{
     }
   }
 });
-input.addEventListener("input", autosize);
+input.addEventListener("input", e=>{ autosize(); updateSlashPopup(); });
 
 // --- Sidebar toggle (mobile) ------------------------------------------------
 function openSidebar(){ sidebar.classList.add("open"); scrim.classList.remove("hidden"); document.body.classList.add("drawer-open"); }
@@ -1959,7 +2005,7 @@ function useModel(name){
   syncVision();
   renderModels();
   enforceToolGating();
-  if(activeId && !generatingIds.has(activeId)) saveConversation();
+  if(activeId) saveModelSelection();   // model-only PATCH; safe during generation
   closeModelsPanel();
 }
 
@@ -2236,6 +2282,156 @@ function flashAgentErr(msg){
   const saved=agentSaved; saved.classList.remove("hidden"); saved.classList.add("err-note"); saved.textContent=String(msg||"save failed");
   setTimeout(()=>{ saved.classList.add("hidden"); saved.classList.remove("err-note"); saved.textContent="Saved."; }, 4000);
 }
+
+// --- Slash commands (input command palette) --------------------------------
+// Typing "/" in the input opens a filtered list of commands; arrow keys / mouse
+// navigate, Enter runs, Tab completes. Commands map to existing actions — no
+// backend changes. A "/name ..." line sent via Enter also runs (so the popup
+// isn't required); unknown /-prefixed text falls through and sends normally.
+const PLAN_TEMPLATE = `Produce a concise, step-by-step plan for the following task. Break it into ordered phases, note assumptions, and call out risks or open questions.
+
+Task: {task}
+
+Plan:`;
+const COMMANDS = [
+  { name:"clear", aliases:["new"], desc:"Start a new chat", icon:"new-chat", args:false, run(){ newChat(); } },
+  { name:"delete", desc:"Delete this conversation", icon:"trash", args:false, run(){ if(activeId) confirmSlash("Delete this conversation?", null, ()=>deleteConversation(activeId)); else slashNote("No active chat to delete."); } },
+  { name:"rename", desc:"Rename this conversation", icon:"rename", args:true, run(a){ if(!activeId){ slashNote("No active chat to rename."); return; } const t=(a||"").trim(); if(!t){ slashNote("Usage: /rename <title>"); return; } renameActiveTo(t); } },
+  { name:"stop", desc:"Stop the active generation", icon:"stop", args:false, run(){ stopActive(); } },
+  { name:"web", desc:"Toggle Web search mode", icon:"globe", args:false, run(){ toggleExtra("web"); } },
+  { name:"clarify", desc:"Toggle Clarify mode", icon:"help", args:false, run(){ toggleExtra("clarify"); } },
+  { name:"agent", desc:"Toggle Agent mode", icon:"sparkles", args:false, run(){ toggleExtra("agent"); } },
+  { name:"models", desc:"Open Manage models", icon:"boxes", args:false, run(){ openModelsPanel(); } },
+  { name:"model", desc:"Open the model selector", icon:"chevron-down", args:false, run(){ setModelPopup(true); } },
+  { name:"agent-settings", desc:"Open Agent settings", icon:"wrench", args:false, run(){ openAgentPanel(); } },
+  { name:"plan", desc:"Pre-fill a planning prompt", icon:"sparkles", args:true, run(a){ const task=(a||"").trim(); if(!task){ slashNote("Usage: /plan <task>"); return; } input.value=PLAN_TEMPLATE.replace("{task}", task); autosize(); closeSlashPopup(); input.focus(); } },
+  { name:"logout", desc:"Sign out", icon:"logout", args:false, run(){ logout(); } },
+  { name:"help", desc:"Show available commands", icon:"help", args:false, run(){ renderSlashItems(COMMANDS); } },
+];
+let slashItems=[], slashSelected=0;
+function slashPopupOpen(){ return !slashPopup.classList.contains("hidden"); }
+function closeSlashPopup(){ slashPopup.classList.add("hidden"); }
+function findCommand(name){ return COMMANDS.find(c=>c.name===name||(c.aliases||[]).includes(name))||null; }
+function argHint(name){ return {rename:"<title>", plan:"<task>"}[name]||"<args>"; }
+// Parse a "/name args" line. Returns {name,args} or null when it isn't a slash
+// line. args is everything after the first space (trimmed); a bare "/" yields
+// null so it isn't treated as a command.
+function parseSlash(text){
+  const t=(text||"").trim();
+  if(!t.startsWith("/")) return null;
+  const body=t.slice(1);
+  if(!body) return null;
+  const sp=body.indexOf(" ");
+  return { name:(sp===-1?body:body.slice(0,sp)).toLowerCase(), args: sp===-1?"":body.slice(sp+1).trim() };
+}
+function renderSlashItems(list){
+  slashItems=list; slashSelected=0;
+  slashPopup.replaceChildren();
+  if(!list.length){
+    const n=document.createElement("div"); n.className="slash-item"; n.style.cursor="default"; n.style.color="var(--muted)";
+    n.textContent="No matching commands"; slashPopup.appendChild(n);
+    slashPopup.classList.remove("hidden"); return;
+  }
+  list.forEach((c,i)=>{
+    const b=document.createElement("button"); b.type="button"; b.className="slash-item"+(i===0?" selected":""); b.setAttribute("role","option");
+    b.innerHTML=icon(c.icon,16);
+    const txt=document.createElement("span"); txt.className="slash-item-text";
+    const nm=document.createElement("span"); nm.className="slash-item-name"; nm.textContent="/"+c.name;
+    const ds=document.createElement("span"); ds.className="slash-item-desc"; ds.textContent=c.desc;
+    txt.appendChild(nm); txt.appendChild(ds); b.appendChild(txt);
+    if(["web","clarify","agent"].includes(c.name)) b.classList.toggle("on", activeExtras.has(c.name));
+    b.addEventListener("mouseenter",()=>{ slashSelected=i; markSlashSelected(); });
+    b.addEventListener("click",e=>{ e.stopPropagation(); e.preventDefault(); runSlashIndex(i); });
+    slashPopup.appendChild(b);
+  });
+  slashPopup.classList.remove("hidden");
+}
+function markSlashSelected(){
+  const items=[...slashPopup.querySelectorAll(".slash-item")];
+  items.forEach((el,i)=>el.classList.toggle("selected", i===slashSelected));
+  const sel=items[slashSelected];
+  if(sel && sel.scrollIntoView) sel.scrollIntoView({block:"nearest"});
+}
+// Surface the list only while the first line is a "/token" with no space yet
+// (once args start, the command is determined and suggestions hide).
+function updateSlashPopup(){
+  const v=input.value;
+  if(v.startsWith("/") && v.indexOf("\n")===-1 && v.indexOf(" ")===-1){
+    const token=v.slice(1).toLowerCase();
+    renderSlashItems(COMMANDS.filter(c=>c.name.includes(token)||(c.aliases||[]).some(a=>a.includes(token))));
+  } else {
+    closeSlashPopup();
+  }
+}
+// Complete the selected command into the input (Tab). No-arg commands run at
+// once; arg commands expand to "/name " so the user can type the argument.
+function completeSlash(){
+  const c=slashItems[slashSelected]; if(!c){ closeSlashPopup(); return; }
+  if(c.args){ input.value="/"+c.name+" "; autosize(); closeSlashPopup(); input.focus(); }
+  else { input.value="/"+c.name; runCommand(c,""); }
+}
+// Run the command at a popup index. For arg commands without args typed yet,
+// expand to "/name " for the user to fill in instead of erroring.
+function runSlashIndex(i){
+  const c=slashItems[i]; if(!c){ closeSlashPopup(); return; }
+  const v=input.value, sp=v.indexOf(" ");
+  if(c.args && sp===-1){ input.value="/"+c.name+" "; autosize(); closeSlashPopup(); input.focus(); return; }
+  runCommand(c, c.args ? v.slice(sp+1) : "");
+}
+// Execute a command: clear the input, close the popup, run, then refocus the
+// composer unless a modal or the model dropdown took over the view.
+function runCommand(c, args){
+  input.value=""; autosize(); closeSlashPopup();
+  try{ c.run(args); }catch(err){ slashNote(String(err&&err.message||err)); }
+  if($("modelsModal").classList.contains("open")||agentModal.classList.contains("open")||!modelPopup.classList.contains("hidden")) return;
+  input.focus();
+}
+// Toggle a tool mode (web/clarify/agent) with the same gating + exclusivity as
+// the + menu: blocked when the model lacks tool support, mutually exclusive.
+function toggleExtra(id){
+  const def=EXTRA_DEFS.find(d=>d.id===id); if(!def) return;
+  if(def.needsTools && modelSupportsTools(selectedModel)!==true){
+    slashNote(selectedModel+" has no tool support — use a tool-capable model for "+def.label+"."); return;
+  }
+  if(activeExtras.has(id)){ activeExtras.delete(id); slashNote(def.label+" off"); }
+  else { activeExtras.add(id); (def.exclusive||[]).forEach(x=>activeExtras.delete(x)); slashNote(def.label+" on"); }
+  saveExtras(); renderExtras();
+}
+async function renameActiveTo(title){
+  if(!activeId) return;
+  try{ await fetchRetry("/api/conversations/"+encodeURIComponent(activeId),{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({title})},{label:"Rename chat"}); await loadConversations(); slashNote("Renamed to \""+title+"\""); }
+  catch(e){ slashNote("Rename failed: "+errText(e)); }
+}
+// Small floating confirm anchored above the input (replaces native confirm(),
+// which the browser can block — same reason openConvMenu uses confirmInMenu).
+function confirmSlash(message, sub, onConfirm){
+  closeMenu();
+  const m=document.createElement("div"); m.className="menu"; document.body.appendChild(m);
+  const msg=document.createElement("div"); msg.className="menu-msg"; msg.textContent=message; m.appendChild(msg);
+  if(sub){ const s=document.createElement("div"); s.className="menu-sub muted"; s.textContent=sub; m.appendChild(s); }
+  const sep=document.createElement("div"); sep.className="sep"; m.appendChild(sep);
+  const cancel=document.createElement("button"); cancel.textContent="Cancel";
+  cancel.addEventListener("click",e=>{ e.stopPropagation(); closeMenu(); input.focus(); });
+  const ok=document.createElement("button"); ok.className="danger"; ok.textContent="Delete";
+  ok.addEventListener("click",e=>{ e.stopPropagation(); closeMenu(); onConfirm(); });
+  m.appendChild(cancel); m.appendChild(ok);
+  const r=input.getBoundingClientRect();
+  m.style.left=Math.min(r.left, window.innerWidth-m.offsetWidth-8)+"px";
+  m.style.top=Math.max(8, r.top-m.offsetHeight-4)+"px";
+  openMenu=m;
+  setTimeout(()=>document.addEventListener("click",closeMenu),0);
+}
+let slashNoteTimer=null;
+function slashNote(text){
+  let el=document.getElementById("slashNote");
+  if(!el){ el=document.createElement("div"); el.id="slashNote"; el.className="slash-note"; document.body.appendChild(el); }
+  el.textContent=String(text||"");
+  el.classList.add("show");
+  if(slashNoteTimer) clearTimeout(slashNoteTimer);
+  slashNoteTimer=setTimeout(()=>el.classList.remove("show"), 2600);
+}
+document.addEventListener("click", e=>{ if(slashPopupOpen() && !slashPopup.contains(e.target) && e.target!==input) closeSlashPopup(); });
+document.addEventListener("keydown", e=>{ if(e.key==="Escape" && slashPopupOpen()) closeSlashPopup(); });
 
 boot();
 

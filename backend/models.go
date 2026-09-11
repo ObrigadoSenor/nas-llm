@@ -1225,3 +1225,62 @@ func (s *server) handleModelInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, out)
 }
+
+// showCapabilities fetches /api/show for a model on the host that owns it and
+// returns the reported capabilities. ok is true only when /api/show succeeded
+// AND reported a non-empty capability list; otherwise callers fall back to the
+// curated catalog (catalogEntryByName) so a model is never misclassified just
+// because an Ollama build omits capabilities from /api/show.
+func (s *server) showCapabilities(ctx context.Context, model string) (caps []string, ok bool) {
+	h := s.hosts.onlineHostForModel(model)
+	if h == nil {
+		h = s.hosts.defaultHost()
+	}
+	if h == nil {
+		return nil, false
+	}
+	resp, err := s.ollamaRequest(ctx, h, http.MethodPost, "/api/show", map[string]any{"model": model})
+	if err != nil {
+		return nil, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, false
+	}
+	var show ollamaShowResponse
+	if err := json.NewDecoder(resp.Body).Decode(&show); err != nil {
+		return nil, false
+	}
+	if len(show.Capabilities) == 0 {
+		return nil, false
+	}
+	return show.Capabilities, true
+}
+
+// supportsTools reports whether the model can emit OpenAI tool_calls, so the
+// generation loops can decide whether to enter a tool-calling round at all.
+// A non-tool model given the tool schema narrates the call in prose and
+// hallucinates a result instead of emitting structured tool_calls. Resolution:
+//   - Local (browser-relay) models: the backend cannot dial the visitor's
+//     Ollama, so it trusts the frontend-supplied supportsTools flag (derived
+//     from /api/show + /api/tags on localhost by the browser).
+//   - Server models: /api/show on the owning host, falling back to the curated
+//     catalog when /api/show reports no capabilities (older Ollama builds).
+//   - A server model that still can't be classified (not in the catalog, no
+//     /api/show caps) is allowed through so a genuinely tool-capable model the
+//     backend can't introspect isn't regressed; the frontend gates the visible
+//     UI, so this path is reached only by a direct/race caller.
+func (s *server) supportsTools(model string, local, feSaysTools bool) bool {
+	if local {
+		return feSaysTools
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if caps, ok := s.showCapabilities(ctx, model); ok {
+		return slicesContains(caps, "tools")
+	}
+	if e := catalogEntryByName(model); e != nil {
+		return slicesContains(e.Capabilities, "tools")
+	}
+	return true
+}

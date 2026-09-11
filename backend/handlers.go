@@ -440,6 +440,10 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		// the backend emits modelCall events and awaits POST /model-response
 		// instead of dialing a server host. Such a job is connection-bound.
 		Local bool `json:"local"`
+		// supportsTools is the frontend's verdict that the selected model can
+		// emit OpenAI tool_calls. The backend trusts it only for local
+		// (browser-relay) models; server models are re-checked via /api/show.
+		SupportsTools bool `json:"supportsTools"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, "invalid request", http.StatusBadRequest)
@@ -483,6 +487,7 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 
 	j := newJob(convID, email, body.Model, body.WebSearch, body.Clarify, body.Agent)
 	j.local = body.Local
+	j.supportsTools = body.SupportsTools
 	if err := s.jobs.enqueue(j); err != nil {
 		if errors.Is(err, errJobActive) {
 			if existing := s.jobs.get(convID); existing != nil {

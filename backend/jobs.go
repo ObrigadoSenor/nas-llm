@@ -52,7 +52,12 @@ type job struct {
 	webSearch bool
 	clarify   bool // Clarify extra was on for this generation (drives the agent loop)
 	agent     bool // Agent mode: general ReAct loop over a tool registry
-	createdAt int64
+	// supportsTools is the frontend's verdict that the selected model can emit
+	// OpenAI tool_calls. The backend trusts it only for local (browser-relay)
+	// models, whose Ollama it cannot introspect; server models are re-checked
+	// via /api/show in supportsTools(). Drives the tool-capability guard below.
+	supportsTools bool
+	createdAt     int64
 
 	promptTokens     int // agent-mode: cumulative prompt tokens (observability)
 	completionTokens int // agent-mode: cumulative completion tokens (observability)
@@ -778,6 +783,26 @@ func (s *server) runGeneration(j *job) error {
 		msgs[i] = oaiMessage{Role: m.Role, Content: messageContent(m)}
 		if len(m.Images) > 0 {
 			hasImages = true
+		}
+	}
+
+	// Tool-capability guard. web_search/ask_user are OpenAI-style tools: the
+	// model must emit structured tool_calls deltas to actually trigger a lookup.
+	// A non-tool model given the tool schema can't emit tool_calls, so it
+	// narrates the call in prose and fabricates a "result" (the reported bug:
+	// a hallucinated answer presented as if a search ran). Skip the tool loop
+	// entirely and fall through to a plain streamed answer with an honest
+	// marker, so the user gets a real answer instead of a hallucination.
+	if j.agent || j.clarify || j.webSearch {
+		if !s.supportsTools(j.model, j.local, j.supportsTools) {
+			reason := fmt.Sprintf("%s has no tool support — use a tool-capable model (e.g. qwen3:1.7b, llama3.1:8b) or turn off Web search/Agent/Clarify.", j.model)
+			if j.webSearch {
+				j.emitSearch(searchEntry{Skipped: true, Reason: reason})
+			} else if j.agent {
+				j.emitTool(agentStep{Step: 1, Tool: "(direct)", Preview: reason, IsError: true})
+			}
+			j.emitPhase(phaseForImages(hasImages))
+			return s.runStreamPass(ctx, mb, j.model, msgs, j.emitChunk)
 		}
 	}
 
