@@ -1,6 +1,6 @@
 // nas-llm chat UI — app logic, split out of the old single-file index.html.
 // Imports UI helpers (icons, markdown rendering) from lib.js. No build step.
-import { icon, setIcon, renderMessage, escapeHtml, StreamRenderer, thinkingDots, renderSearchBlock, appendSearchEntry, showSearchPending, clearSearchPending, renderSourceLinks, appendSourceLinks, renderClarifyCard, renderAgentSteps, appendAgentStep, buildThoughtsWrap, renderThoughts, appendThought } from './lib.js?v=25';
+import { icon, setIcon, renderMessage, escapeHtml, StreamRenderer, thinkingDots, renderSearchBlock, appendSearchEntry, showSearchPending, clearSearchPending, renderSourceLinks, appendSourceLinks, renderClarifyCard, renderAgentSteps, appendAgentStep, buildThoughtsWrap, renderThoughts, appendThought } from './lib.js?v=26';
 
 const $ = id => document.getElementById(id);
 const app=$("app"), loginView=$("login");
@@ -65,6 +65,43 @@ let draft = "";                        // in-progress text saved on first ArrowU
 let pendingImages = [];                // staged data URLs for the next send
 const visionModels = new Set();        // model names confirmed vision-capable
 const visionChecked = new Set();       // model names already queried via /info
+// Visitor's local Ollama models (localhost:11434), discovered from the
+// browser. NAMES persist to localStorage so a reload reattaches them in the
+// selector even before the re-probe finishes; rich info (size/details) is
+// kept in memory only. modelEntries merges server + local for the selector.
+let localModelNames = loadLocalModelNames();
+let localModels = [];                  // [{name,sizeGB,details}] from the last successful probe
+let modelEntries = [];                 // merged server+local entries driving the selector
+let lastServerModels = [];             // raw /api/models data, cached for re-merges after a probe
+let activeLocalAbort = null;           // AbortController for the in-flight localhost inference
+let localDiscoverMsg = null;           // last discovery error string (shown in the Local section)
+function loadLocalModelNames(){ try{ return JSON.parse(localStorage.getItem("nas-llm-local-models")||"[]")||[]; }catch{ return []; } }
+function saveLocalModelNames(){ localStorage.setItem("nas-llm-local-models", JSON.stringify(localModelNames)); }
+function isLocalModel(name){ return localModelNames.includes(name); }
+function hostLabel(h){ return {nas:"NAS",mac:"Mac"}[h]||h; }
+// Merge server models (from /api/models, carrying host/hostOnline) with the
+// local set. Dedupe by name: if a name is both local and on a server host,
+// keep the Local entry and drop the server duplicate. Ordered NAS, Mac, Local.
+function buildModelEntries(serverData, localNames){
+  const localSet=new Set(localNames);
+  const entries=[]; const seen=new Set();
+  for(const m of serverData){
+    const name=m.name||m.id; if(!name) continue;
+    if(localSet.has(name)) continue;        // local wins -> drop server duplicate
+    if(seen.has(name)) continue; seen.add(name);
+    entries.push({name, host:m.host||"nas", hostOnline:m.hostOnline!==false, local:false});
+  }
+  for(const n of localNames){ if(seen.has(n)) continue; seen.add(n); entries.push({name:n, host:"local", hostOnline:true, local:true}); }
+  const order={nas:0,mac:1,local:2};
+  entries.sort((a,b)=>(order[a.host]??9)-(order[b.host]??9)||a.name.localeCompare(b.name));
+  return entries;
+}
+function syncSelectedFromEntries(){
+  if(modelEntries.length && !models.includes(selectedModel)){
+    const onl=modelEntries.find(e=>e.hostOnline);
+    selectedModel = onl?onl.name:modelEntries[0].name;
+  }
+}
 
 function renderPills(){
   pills.innerHTML="";
@@ -259,6 +296,7 @@ async function showApp(){
   loginView.classList.add("hidden"); app.classList.remove("hidden");
   whoEmail.textContent=me.email;
   await loadModels();
+  reattachLocalModels();          // re-probe localhost so a reload reattaches
   await loadConversations();
   await loadActiveJobs();
   if(conversations.length) await openConversation(conversations[0].id);
@@ -297,16 +335,57 @@ async function loadModels(){
   try{
     const r=await fetchRetry("/api/models",{},{label:"Load models"});
     const j=await r.json();
-    models=(j.data||[]).map(m=>m.id);
-    if(models.length && !models.includes(selectedModel)) selectedModel=models[0];
+    lastServerModels=j.data||[];
+    modelEntries=buildModelEntries(lastServerModels, localModelNames);
+    models=modelEntries.map(e=>e.name);
+    syncSelectedFromEntries();
     renderModels();
     syncVision();
   }catch(e){ renderModels(); modelSel.title=String(e.message||e); }
 }
+// Re-probe localhost on boot/showApp so a reload reattaches the visitor's
+// local Ollama models without making them click Connect again. Silent on
+// failure: the persisted name list still seeds the selector, and no error is
+// surfaced (the user didn't ask to connect this session).
+async function reattachLocalModels(){
+  const res=await discoverLocalModels();
+  if(res.ok){ localModels=res.models; localModelNames=res.models.map(m=>m.name); saveLocalModelNames(); }
+  modelEntries=buildModelEntries(lastServerModels, localModelNames);
+  models=modelEntries.map(e=>e.name);
+  syncSelectedFromEntries();
+  renderModels();
+  if($("modelsModal").classList.contains("open") && modelsTab==="installed") renderInstalledTab();
+}
+// Discover the visitor's local Ollama (localhost:11434). An HTTPS page makes
+// the fetch trigger Chrome's Local Network Access prompt (the "accept" UX).
+// 403 = Ollama is running but rejected the cross-origin request (needs
+// OLLAMA_ORIGINS); a throw = nothing is listening on 11434.
+async function discoverLocalModels(){
+  let r;
+  try{ r=await fetch("http://localhost:11434/api/tags"); }
+  catch{ return {ok:false, kind:"refused"}; }
+  if(r.status===403) return {ok:false, kind:"origins"};
+  if(!r.ok) return {ok:false, kind:"http", status:r.status};
+  let j; try{ j=await r.json(); }catch{ return {ok:false, kind:"http", status:r.status}; }
+  const mods=(j.models||[]).map(m=>({name:m.name, sizeGB:m.size?m.size/1e9:0, details:m.details||{}}));
+  return {ok:true, models:mods};
+}
 function renderModels(){
   modelSel.innerHTML="";
-  models.forEach(m=>{ const o=document.createElement("option"); o.value=o.textContent=m; modelSel.appendChild(o); });
-  if(models.length) modelSel.value=selectedModel;
+  const groups={};
+  for(const e of modelEntries){ (groups[e.host]=groups[e.host]||[]).push(e); }
+  const labels={nas:"NAS", mac:"Mac", local:"Local (this computer)"};
+  for(const h of ["nas","mac","local"]){
+    const arr=groups[h]; if(!arr||!arr.length) continue;
+    const og=document.createElement("optgroup"); og.label=labels[h]||h;
+    for(const e of arr){
+      const o=document.createElement("option"); o.value=o.textContent=e.name;
+      if(!e.hostOnline) o.disabled=true;       // grey out offline-host models
+      og.appendChild(o);
+    }
+    modelSel.appendChild(og);
+  }
+  if(modelEntries.length) modelSel.value=selectedModel;
 }
 modelSel.addEventListener("change", ()=>{
   selectedModel=modelSel.value;
@@ -560,7 +639,7 @@ async function syncGenerating(){
   if(!same) renderSidebar();
 }
 
-function closeTail(){ if(activeES){ activeES.close(); activeES=null; } }
+function closeTail(){ if(activeLocalAbort){ activeLocalAbort.abort(); activeLocalAbort=null; } if(activeES){ activeES.close(); activeES=null; } }
 
 // If the conversation has an active background job, render its partial content
 // and reopen the SSE tail so switching back resumes live.
@@ -585,6 +664,75 @@ async function resumeIfGenerating(id){
   // A finished/reloaded agent turn collapses its thinking (it's done).
   if(thoughtsDet && (!job.thoughts || !job.thoughts.length)) thoughtsDet.open = false;
   tailJob(id, bubble, hasQ ? "" : (job.content||""), searchWrap, srcLinks, job.questions||null, stepsWrap, job.steps||null, thoughtsWrap, thoughtsDet, job.thoughts||null);
+}
+
+// --- Local-model relay (browser -> visitor's Ollama, results back to NAS) ---
+// On a `modelCall` SSE event the backend hands the browser the OpenAI
+// chat-completions payload it would have sent to a server Ollama. The browser
+// streams it to the visitor's localhost Ollama, paints content into the answer
+// bubble via the same StreamRenderer as server-model chunks, then POSTs the
+// assembled {content, tool_calls} back so the backend can continue the tool
+// loop (web_search/clarify/agent) or finalize. `tools` is null for plain chat.
+function localFetchErrMsg(){
+  return "No Ollama found on this computer — install/start Ollama.";
+}
+function localStatusErrMsg(status){
+  if(status===403) return "Your local Ollama rejected the request — start it with OLLAMA_ORIGINS=https://chat.selected.systems ollama serve (or OLLAMA_ORIGINS=*).";
+  return "Local Ollama returned HTTP "+status+".";
+}
+async function postModelResponse(convId, jobId, content, toolCalls, error){
+  try{
+    const payload = error ? { jobId, error } : { jobId, content, tool_calls: toolCalls||null };
+    await fetch("/api/conversations/"+encodeURIComponent(convId)+"/model-response",{
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(payload)
+    });
+  }catch{}
+}
+// Drive one local-model inference round. Streams content into the renderer as
+// it arrives (the bubble updates live), assembles fragmented tool_calls by
+// index, and returns {content, toolCalls}. On a fetch/HTTP failure it shows
+// the contract error message in the bubble via bubbleError and POSTs
+// {jobId, error} so the backend finalizes the connection-bound job as an
+// error (the message survives the done/reload) instead of an empty success;
+// returns null.
+async function relayLocalModelCall(convId, call, renderer, bubble, signal){
+  const body={ model:call.model, messages:call.messages, stream:true };
+  if(call.tools && call.tools.length) body.tools=call.tools;
+  let resp;
+  try{ resp=await fetch("http://localhost:11434/v1/chat/completions",{ method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body), signal }); }
+  catch(e){ if(signal.aborted) return null; const msg=localFetchErrMsg(); bubbleError(bubble, msg); postModelResponse(convId, call.jobId, null, null, msg); return null; }
+  if(!resp.ok){ const msg=localStatusErrMsg(resp.status); bubbleError(bubble, msg); postModelResponse(convId, call.jobId, null, null, msg); return null; }
+  let content=""; const toolsByIndex=new Map();
+  const reader=resp.body.getReader(); const dec=new TextDecoder(); let buf=""; let finished=false;
+  while(!finished){
+    const {done, value}=await reader.read();
+    if(done) break;
+    buf+=dec.decode(value,{stream:true});
+    let idx;
+    while((idx=buf.indexOf("\n"))>=0){
+      const line=buf.slice(0,idx).trim(); buf=buf.slice(idx+1);
+      if(!line.startsWith("data:")) continue;
+      const data=line.slice(5).trim();
+      if(data==="[DONE]"){ finished=true; break; }
+      let j; try{ j=JSON.parse(data); }catch{ continue; }
+      const delta=j.choices && j.choices[0] && j.choices[0].delta;
+      if(!delta) continue;
+      if(delta.content){ content+=delta.content; renderer.append(delta.content); }
+      if(delta.tool_calls){
+        for(const tc of delta.tool_calls){
+          const i=tc.index??0;
+          let cur=toolsByIndex.get(i);
+          if(!cur){ cur={id:tc.id||null, type:tc.type||"function", function:{name:"", arguments:""}}; toolsByIndex.set(i,cur); }
+          if(tc.id) cur.id=tc.id;
+          if(tc.type) cur.type=tc.type;
+          if(tc.function){ if(tc.function.name) cur.function.name+=tc.function.name; if(tc.function.arguments) cur.function.arguments+=tc.function.arguments; }
+        }
+      }
+    }
+  }
+  const toolCalls=toolsByIndex.size?[...toolsByIndex.entries()].sort((a,b)=>a[0]-b[0]).map(([,v])=>v):null;
+  return { content, toolCalls };
 }
 
 // tailJob opens an EventSource to /events and renders into bubble via a
@@ -621,6 +769,20 @@ function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarif
   es.addEventListener("thoughts", e=>{ let arr=[]; try{ arr=JSON.parse(e.data)||[]; }catch{} renderThoughts(thoughtsWrap, arr); });
   es.addEventListener("thought", e=>{ let t=""; try{ t=JSON.parse(e.data); }catch{} appendThought(thoughtsWrap, t); });
   es.addEventListener("clear", ()=>{ renderer.set(""); });
+  // Local-model relay: the backend needs the visitor's Ollama to infer. Stream
+  // the response into the bubble as it arrives, then POST the assembled result
+  // back. The existing thoughts/clear handlers tolerate this ordering (a
+  // thinking round's content streams first, then thoughts + clear arrive and
+  // move the text to the thinking drawer / wipe the bubble).
+  es.addEventListener("modelCall", async e=>{
+    let d={}; try{ d=JSON.parse(e.data); }catch{ return; }
+    if(!d.jobId || !d.model) return;
+    const ctrl=new AbortController(); activeLocalAbort=ctrl;
+    const res=await relayLocalModelCall(convId, d, renderer, bubble, ctrl.signal);
+    activeLocalAbort=null;
+    if(res===null) return;                  // fetch failed: error shown + empty response posted
+    await postModelResponse(convId, d.jobId, res.content, res.toolCalls);
+  });
   es.addEventListener("phase", e=>{
     const p=e.data;
     renderer.setPhase(p);
@@ -629,9 +791,9 @@ function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarif
     else if(p==="answering") clearSearchPending(searchWrap);
   });
   es.addEventListener("chunk", e=>{ let d=""; try{ d=JSON.parse(e.data); }catch{} renderer.append(d); });
-  es.addEventListener("done", ()=>{ esClosed=true; es.close(); activeES=null; if(thoughtsDet) thoughtsDet.open=false; onGenerationDone(convId); });
+  es.addEventListener("done", ()=>{ esClosed=true; if(activeLocalAbort){ activeLocalAbort.abort(); activeLocalAbort=null; } es.close(); activeES=null; if(thoughtsDet) thoughtsDet.open=false; onGenerationDone(convId); });
   es.addEventListener("joberror", e=>{
-    esClosed=true; es.close(); activeES=null;
+    esClosed=true; if(activeLocalAbort){ activeLocalAbort.abort(); activeLocalAbort=null; } es.close(); activeES=null;
     let msg=e.data; try{ msg=JSON.parse(e.data); }catch{}
     const acc = renderer.acc;
     if(acc) renderer.finalize(acc);
@@ -832,7 +994,7 @@ async function stream(){
       const r=await fetch("/api/conversations/"+encodeURIComponent(activeId)+"/generate",{
         method:"POST",
         headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({model:selectedModel, messages, web_search:webSearchOn(), clarify:clarifyOn(), agent:agentOn()})
+        body:JSON.stringify({model:selectedModel, messages, web_search:webSearchOn(), clarify:clarifyOn(), agent:agentOn(), local:isLocalModel(selectedModel)})
       });
       if(r.ok || r.status===409){ job=await r.json(); break; }
       genErr=new Error("HTTP "+r.status);
@@ -972,14 +1134,80 @@ async function renderInstalledTab(){
   try{ const r=await fetchRetry("/api/models",{},{label:"Load models"}); data=await r.json(); }
   catch(e){ body.appendChild(mutedNote("Could not load models: "+errText(e))); await resumePullIfActive(); return; }
   const list=data.data||[];
-  models=list.map(m=>m.id); renderModels();           // keep the header selector in sync
-  if(!list.length){ body.appendChild(mutedNote("No models installed yet. Go to Browse to download one.")); }
-  else list.forEach(m=>body.appendChild(renderInstalledCard(m)));
+  lastServerModels=list;
+  // Local (this computer) section sits above the server card list. It shows
+  // the visitor's own Ollama models, distinct from NAS/Mac server models.
+  body.appendChild(renderLocalSection());
+  modelEntries=buildModelEntries(list, localModelNames);
+  models=modelEntries.map(e=>e.name);
+  syncSelectedFromEntries();
+  renderModels();                                   // keep the header selector in sync
+  if(!list.length){
+    if(!localModelNames.length) body.appendChild(mutedNote("No models installed yet. Go to Browse to download one."));
+  } else list.forEach(m=>body.appendChild(renderInstalledCard(m)));
   await resumePullIfActive();
+}
+// The Local section: a heading + "Connect local models" button, then either
+// the discovered model cards, a hint (nothing connected yet), or the last
+// discovery error (403/refused) rendered verbatim per the relay contract.
+function renderLocalSection(){
+  const sec=document.createElement("div"); sec.className="local-section";
+  const head=document.createElement("div"); head.className="local-head";
+  const label=document.createElement("div"); label.className="local-label"; label.textContent="Local (this computer)";
+  const connect=document.createElement("button"); connect.type="button"; connect.className="local-connect";
+  connect.innerHTML=icon("boxes",15)+'<span>Connect local models</span>';
+  connect.addEventListener("click", onConnectLocal);
+  head.appendChild(label); head.appendChild(connect); sec.appendChild(head);
+  if(localDiscoverMsg){
+    const err=document.createElement("div"); err.className="err-note local-err"; err.textContent=localDiscoverMsg;
+    sec.appendChild(err);
+  }
+  const known=localModels.length?localModels:localModelNames.map(n=>({name:n}));
+  if(known.length){
+    known.forEach(m=>sec.appendChild(renderLocalCard(m)));
+  } else if(!localDiscoverMsg){
+    const hint=document.createElement("div"); hint.className="muted local-hint";
+    hint.textContent="Connect to Ollama on this computer (localhost:11434) to use your own models here — full feature parity with server models.";
+    sec.appendChild(hint);
+  }
+  return sec;
+}
+// A local model card: name + size/details (if known) + a Use button. We can't
+// remove or benchmark the visitor's models, so no Remove/Benchmark actions.
+function renderLocalCard(m){
+  const card=document.createElement("div"); card.className="mcard local-card";
+  const head=document.createElement("div"); head.className="mcard-head";
+  const title=document.createElement("div"); title.className="mcard-title"; title.textContent=m.name;
+  const sub=document.createElement("div"); sub.className="mcard-sub";
+  const d=m.details||{}; const bits=[d.parameter_size, d.quantization_level, d.family].filter(Boolean);
+  if(m.sizeGB) bits.push(m.sizeGB.toFixed(1)+" GB");
+  sub.textContent=bits.join(" · ");
+  head.appendChild(title); head.appendChild(sub); card.appendChild(head);
+  const actions=document.createElement("div"); actions.className="mcard-actions";
+  const use=document.createElement("button"); use.textContent="Use"; use.addEventListener("click",()=>useModel(m.name));
+  actions.appendChild(use); card.appendChild(actions);
+  return card;
+}
+async function onConnectLocal(){
+  localDiscoverMsg=null;
+  const res=await discoverLocalModels();
+  if(res.ok){ localModels=res.models; localModelNames=res.models.map(m=>m.name); saveLocalModelNames(); }
+  else {
+    localModels=[];
+    if(res.kind==="origins") localDiscoverMsg="Your local Ollama rejected the request — start it with OLLAMA_ORIGINS=https://chat.selected.systems ollama serve (or OLLAMA_ORIGINS=*).";
+    else if(res.kind==="refused") localDiscoverMsg="No Ollama found on this computer — install/start Ollama.";
+    else localDiscoverMsg="Local Ollama returned HTTP "+(res.status||"?")+".";
+  }
+  modelEntries=buildModelEntries(lastServerModels, localModelNames);
+  models=modelEntries.map(e=>e.name);
+  syncSelectedFromEntries();
+  renderModels();
+  await renderInstalledTab();
 }
 
 function renderInstalledCard(m){
   const card=document.createElement("div"); card.className="mcard";
+  if(m.hostOnline===false) card.classList.add("offline");
   const d=m.details||{};
   const head=document.createElement("div"); head.className="mcard-head";
   const title=document.createElement("div"); title.className="mcard-title"; title.textContent=m.name;
@@ -990,6 +1218,8 @@ function renderInstalledCard(m){
   head.appendChild(title); head.appendChild(sub); card.appendChild(head);
 
   const meta=document.createElement("div"); meta.className="mcard-meta";
+  if(m.host) meta.appendChild(badge(hostLabel(m.host), "host"));
+  if(m.hostOnline===false) meta.appendChild(badge("offline", "fit-bad"));
   if(m.benchmark && m.benchmark.tokPerSec>0){
     meta.appendChild(badge(`${m.benchmark.tokPerSec.toFixed(1)} tok/s (measured)`, "speed-fast"));
     const s=document.createElement("span"); s.className="muted bench-sub";
@@ -1007,6 +1237,7 @@ function renderInstalledCard(m){
   const rm=document.createElement("button"); rm.textContent="Remove"; rm.className="danger";
   rm.addEventListener("click",()=>confirmRemoveModel(m.name, card));
   if(activeId && generatingIds.has(activeId) && selectedModel===m.name) rm.disabled=true;
+  if(m.hostOnline===false){ use.disabled=true; bench.disabled=true; }  // can't run on an offline host
   actions.appendChild(use); actions.appendChild(bench); actions.appendChild(det); actions.appendChild(rm);
   card.appendChild(actions);
   return card;

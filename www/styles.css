@@ -347,3 +347,17 @@ header h1{font-size:var(--fs-l);font-weight:600;margin:0}
 .agent-cfg-actions button{height:32px;padding:0 16px}
 .agent-saved{font-size:var(--fs-s)}
 .agent-saved.err-note{color:var(--bad)}
+
+/* --- Local (this computer) models --- */
+.local-section{display:flex;flex-direction:column;gap:8px;padding-bottom:12px;margin-bottom:12px;border-bottom:1px solid var(--border)}
+.local-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.local-label{font-size:var(--fs-m);color:var(--muted);font-weight:600}
+.local-connect{height:30px;padding:0 12px;font-size:var(--fs-m);display:inline-flex;align-items:center;gap:6px}
+.local-hint{line-height:1.45}
+.local-err{margin-top:2px}
+.mcard.local-card{border-style:dashed}
+.mcard.offline{opacity:.55}
+.badge.host{color:var(--muted);background:var(--hover)}
+/* optgroup + disabled-option styling for the grouped model selector */
+select optgroup{color:var(--muted);font-weight:600;font-style:normal}
+select option:disabled{color:var(--muted);opacity:.6}

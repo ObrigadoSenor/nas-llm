@@ -31,7 +31,11 @@ var errJobActive = errors.New("a generation is already running for this conversa
 
 // subEvent is a single event pushed to an SSE subscriber.
 type subEvent struct {
-	kind string // "chunk", "phase", "search", "questions", "tool", "thought", "clear", "done", "error"
+	// kind is one of: chunk, phase, search, questions, tool, thought, clear,
+	// modelCall, done, error. "modelCall" is the browser-relay cue: it carries a
+	// modelCallPayload telling the browser to run inference on its own Ollama and
+	// POST the result back to /model-response.
+	kind string
 	text string
 }
 
@@ -53,6 +57,15 @@ type job struct {
 	promptTokens     int // agent-mode: cumulative prompt tokens (observability)
 	completionTokens int // agent-mode: cumulative completion tokens (observability)
 
+	// local marks a browser-relay (local-model) job: inference runs on the
+	// visitor's Ollama via the browser, so the backend emits modelCall events and
+	// awaits POST /model-response instead of dialing a server host. A local job
+	// is also connection-bound: when the SSE /events tail disconnects (tab closed
+	// or navigated), handleEvents cancels it so the pending relay wait aborts and
+	// the worker finalizes the partial reply as cancelled. Server-model jobs stay
+	// detached and survive a disconnect.
+	local bool
+
 	mu              sync.Mutex
 	status          string // queued, generating, done, error, cancelled
 	content         strings.Builder
@@ -66,6 +79,40 @@ type job struct {
 	finished        chan struct{}      // closed when the job reaches a terminal state
 	cancelFn        context.CancelFunc // set when the job starts running
 	cancelRequested bool               // set by cancel(): survive a queued/unstarted job
+
+	// pendingRelay is set by browserRelay.Call while it awaits the browser's POST
+	// /model-response for the current round. handleModelResponse claims it under
+	// mu (one deliverer wins) and sends the response, then Call clears it. Nil
+	// when no relay round is in flight. Local-model jobs only.
+	pendingRelay chan relayResponse
+	// pendingModelCall is the last modelCall awaiting a browser response. It is
+	// replayed as an SSE event on (re)connect so a browser that attaches after
+	// the cue fired still runs the round. Cleared once the response arrives.
+	pendingModelCall *modelCallPayload
+}
+
+// relayResponse is the browser's assembled inference result for one local-model
+// round, delivered through the job's pendingRelay channel. content is the full
+// text the browser streamed from its Ollama (may be empty); toolCalls are the
+// OpenAI tool_calls it parsed (nil/empty for a plain answer or final round).
+// Error, when non-empty, signals a failed localhost fetch (e.g. Ollama 403 or
+// connection refused): browserRelay.Call returns it as an error so the worker
+// finalizes the job as "error" (no empty assistant message persisted) instead
+// of treating the turn as a successful empty answer.
+type relayResponse struct {
+	content   string
+	toolCalls []oaiToolCall
+	Error     string `json:"error,omitempty"`
+}
+
+// modelCallPayload is the SSE `modelCall` event body: the browser's cue to run
+// one inference round on its own Ollama. tools is omitted for a plain-chat
+// round (the frontend treats a missing tools field as "no tools").
+type modelCallPayload struct {
+	JobID    string       `json:"jobId"`
+	Model    string       `json:"model"`
+	Messages []oaiMessage `json:"messages"`
+	Tools    []oaiTool    `json:"tools,omitempty"`
 }
 
 func newJobID() string {
@@ -90,6 +137,64 @@ func newJob(convID, email, model string, webSearch, clarify, agent bool) *job {
 		subs:      map[chan subEvent]struct{}{},
 		finished:  make(chan struct{}),
 	}
+}
+
+// appendContent adds text to the accumulated content WITHOUT broadcasting a
+// chunk event. Used by the browser-relay backend: the browser streams model
+// content directly into the answer bubble, so the backend must not re-emit it
+// as chunks, but it still needs j.content to hold the assembled reply for
+// SQLite persistence and the SSE "reset" replay on reconnect. emitClear still
+// rewinds this accumulator between agent thinking rounds, matching directOllama.
+func (j *job) appendContent(text string) {
+	if text == "" {
+		return
+	}
+	j.mu.Lock()
+	j.content.WriteString(text)
+	j.mu.Unlock()
+}
+
+// emitModelCall stashes the current inference request on the job (so a browser
+// that attaches after the cue fired gets it replayed on subscribe) and
+// broadcasts a "modelCall" event to every live subscriber. Called by
+// browserRelay.Call at the start of each local-model round.
+func (j *job) emitModelCall(model string, messages []oaiMessage, tools []oaiTool) {
+	payload := modelCallPayload{JobID: j.id, Model: model, Messages: messages, Tools: tools}
+	b, _ := json.Marshal(payload)
+	j.mu.Lock()
+	j.pendingModelCall = &payload
+	subs := make([]chan subEvent, 0, len(j.subs))
+	for ch := range j.subs {
+		subs = append(subs, ch)
+	}
+	j.mu.Unlock()
+	ev := subEvent{kind: "modelCall", text: string(b)}
+	for _, ch := range subs {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
+}
+
+// modelCallSnapshot returns a copy of the pending modelCall for SSE replay on
+// (re)connect, or nil if no round is awaiting a browser response.
+func (j *job) modelCallSnapshot() *modelCallPayload {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.pendingModelCall == nil {
+		return nil
+	}
+	cp := *j.pendingModelCall
+	return &cp
+}
+
+// clearPendingModelCall drops the stashed modelCall once the browser's response
+// has arrived, so a later reconnect does not replay a round already completed.
+func (j *job) clearPendingModelCall() {
+	j.mu.Lock()
+	j.pendingModelCall = nil
+	j.mu.Unlock()
 }
 
 // emitChunk appends delta to the accumulated content and broadcasts it to every
@@ -629,26 +734,35 @@ func messageContent(m Message) json.RawMessage {
 }
 
 // runGeneration loads the conversation, builds the message list, and drives
-// Ollama on a background context. Content deltas flow through the job's
-// broadcast. The backend host that owns j.model is resolved once here (via the
-// host registry) and its chat URL is threaded through every dispatch branch so
-// a NAS model runs on the NAS and a Mac model runs on the Mac. Returns nil on a
-// clean finish, an error otherwise.
+// model inference on a background context. Content deltas flow through the
+// job's broadcast. The modelBackend is chosen once here: a browser relay for a
+// local-model job (the visitor's Ollama is on localhost:11434, which the NAS
+// cannot dial, so the browser runs inference and POSTs the result back), or a
+// direct dial to the server-side host that owns the model otherwise (a NAS
+// model runs on the NAS, a Mac model on the Mac). Returns nil on a clean
+// finish, an error otherwise.
 func (s *server) runGeneration(j *job) error {
 	ctx, cancel := context.WithTimeout(context.Background(), genTimeout)
 	defer cancel()
 	j.mu.Lock()
-	j.cancelFn = cancel // let handleCancel abort the in-flight Ollama request
+	j.cancelFn = cancel // let handleCancel / handleEvents abort the in-flight request
 	j.mu.Unlock()
 
-	// Resolve the backend host that owns this model. If no online host has it
-	// (e.g. it lives on the Mac and the Mac is asleep/offline), fail fast with a
-	// clear message instead of dialing the NAS and getting a bare not-found.
-	h := s.hosts.onlineHostForModel(j.model)
-	if h == nil {
-		return fmt.Errorf("model %q is unavailable — its backend may be offline. Try a smaller model or reconnect the host.", j.model)
+	// Pick the inference backend. A local-model job relays through the browser;
+	// otherwise resolve the server-side host that owns the model and dial it
+	// directly. If no online host has a server model (e.g. it lives on the Mac
+	// and the Mac is asleep/offline), fail fast with a clear message instead of
+	// dialing the NAS and getting a bare not-found.
+	var mb modelBackend
+	if j.local {
+		mb = &browserRelay{j: j}
+	} else {
+		h := s.hosts.onlineHostForModel(j.model)
+		if h == nil {
+			return fmt.Errorf("model %q is unavailable — its backend may be offline. Try a smaller model or reconnect the host.", j.model)
+		}
+		mb = &directOllama{chatURL: h.chatURL(), emit: j.emitChunk}
 	}
-	chatURL := h.chatURL()
 
 	conv, err := s.store.getConversation(j.email, j.convID)
 	if err != nil {
@@ -669,7 +783,7 @@ func (s *server) runGeneration(j *job) error {
 
 	if j.agent {
 		allow, sys := s.agentConfig(j)
-		return s.runAgentLoop(ctx, chatURL, j.model, j.email, msgs, allow, sys, j.emitChunk, j.emitPhase, j.emitTool, j.emitQuestions, j.emitThought, j.emitClear, j.addUsage)
+		return s.runAgentLoop(ctx, mb, j.model, j.email, msgs, allow, sys, j.emitChunk, j.emitPhase, j.emitTool, j.emitQuestions, j.emitThought, j.emitClear, j.addUsage)
 	}
 	if j.clarify {
 		// Cap back-to-back clarifying questions at MAX_CLARIFY_ROUNDS: once the
@@ -679,9 +793,9 @@ func (s *server) runGeneration(j *job) error {
 		// ask_user (it stashes the card on the job and returns nil).
 		if countRecentClarify(conv.Messages) >= s.cfg.maxClarifyRounds {
 			j.emitPhase(phaseForImages(hasImages))
-			return s.runStreamPass(ctx, chatURL, j.model, msgs, j.emitChunk)
+			return s.runStreamPass(ctx, mb, j.model, msgs, j.emitChunk)
 		}
-		return s.runClarifyLoop(ctx, chatURL, j.model, msgs, j.emitChunk, j.emitPhase, j.emitQuestions)
+		return s.runClarifyLoop(ctx, mb, j.model, msgs, j.emitChunk, j.emitPhase, j.emitQuestions)
 	}
 	if j.webSearch {
 		if s.cfg.searxngURL == "" {
@@ -689,9 +803,9 @@ func (s *server) runGeneration(j *job) error {
 			// of silently answering as if search were off.
 			j.emitSearch(searchEntry{Skipped: true, Reason: "web search not configured"})
 			j.emitPhase(phaseForImages(hasImages))
-			return s.runStreamPass(ctx, chatURL, j.model, msgs, j.emitChunk)
+			return s.runStreamPass(ctx, mb, j.model, msgs, j.emitChunk)
 		}
-		return s.runSearchLoop(ctx, chatURL, j.model, msgs, j.emitChunk, j.emitPhase, j.emitSearch)
+		return s.runSearchLoop(ctx, mb, j.model, msgs, j.emitChunk, j.emitPhase, j.emitSearch)
 	}
 	// Plain turn: emit an honest phase so a connect-time "queued" hint clears as
 	// soon as the worker starts the job. A vision turn reports "vision" — the
@@ -700,7 +814,7 @@ func (s *server) runGeneration(j *job) error {
 	// mislead the user into thinking another reply is blocking. A text turn
 	// reports "answering". The web-search path emits its own "searching" phase.
 	j.emitPhase(phaseForImages(hasImages))
-	return s.runStreamPass(ctx, chatURL, j.model, msgs, j.emitChunk)
+	return s.runStreamPass(ctx, mb, j.model, msgs, j.emitChunk)
 }
 
 // phaseForImages returns the generation phase hint for a non-search turn:
@@ -713,13 +827,22 @@ func phaseForImages(hasImages bool) string {
 	return "answering"
 }
 
-// runStreamPass streams a plain (no-tools) completion from Ollama, emitting
-// content deltas. The target host's chat URL is resolved by the caller
-// (runGeneration / handleChat) so the request reaches the backend that owns the
-// model. Returns nil on a clean finish, an error otherwise.
-func (s *server) runStreamPass(ctx context.Context, target, model string, msgs []oaiMessage, emit func(string)) error {
-	req := chatRequest{Model: model, Messages: msgs}
-	return s.streamFromOllama(ctx, target, &req, emit)
+// runStreamPass drives a plain (no-tools) completion through the model backend,
+// emitting content deltas. For a server backend the content streams live to
+// the job as it arrives (and an empty reply surfaces as an error, matching the
+// prior streamFromOllama behavior); for a browser relay the browser streams the
+// output directly and Call returns the assembled text, so a genuinely empty
+// local reply emits a synthetic "(no response)" instead of failing the job.
+// Returns nil on a clean finish, an error otherwise.
+func (s *server) runStreamPass(ctx context.Context, mb modelBackend, model string, msgs []oaiMessage, emit func(string)) error {
+	msg, _, err := mb.Call(ctx, model, msgs, nil)
+	if err != nil {
+		return err
+	}
+	if contentText(msg.Content) == "" {
+		emit("(no response)")
+	}
+	return nil
 }
 
 // streamFromOllama POSTs a streaming chat completion and pipes parsed content

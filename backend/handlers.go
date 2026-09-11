@@ -435,6 +435,11 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		WebSearch bool      `json:"web_search"`
 		Clarify   bool      `json:"clarify"`
 		Agent     bool      `json:"agent"`
+		// Local flags this as a browser-relay (local-model) generation: the
+		// selected model runs on the visitor's own Ollama (localhost:11434), so
+		// the backend emits modelCall events and awaits POST /model-response
+		// instead of dialing a server host. Such a job is connection-bound.
+		Local bool `json:"local"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, "invalid request", http.StatusBadRequest)
@@ -477,6 +482,7 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	j := newJob(convID, email, body.Model, body.WebSearch, body.Clarify, body.Agent)
+	j.local = body.Local
 	if err := s.jobs.enqueue(j); err != nil {
 		if errors.Is(err, errJobActive) {
 			if existing := s.jobs.get(convID); existing != nil {
@@ -598,6 +604,14 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	} else if st, _, _ := j.snapshot(); st == "queued" {
 		writeSSE("event: phase\ndata: queued\n\n")
 	}
+	// Replay a pending local-model inference request last: a browser that
+	// attaches after a `modelCall` cue fired (or reconnects mid-round) still
+	// needs to run that round on its own Ollama and POST the result back. Placed
+	// after the phase/evidence replays so the client re-anchors state first.
+	if mc := j.modelCallSnapshot(); mc != nil {
+		mcdata, _ := json.Marshal(mc)
+		writeSSE("event: modelCall\ndata: " + string(mcdata) + "\n\n")
+	}
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -642,6 +656,9 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	flushClear := func() {
 		writeSSE("event: clear\ndata: \n\n")
 	}
+	flushModelCall := func(text string) {
+		writeSSE("event: modelCall\ndata: " + text + "\n\n")
+	}
 	flushError := func(text string) {
 		d, _ := json.Marshal(text)
 		writeSSE("event: joberror\ndata: " + string(d) + "\n\n")
@@ -650,6 +667,15 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case <-r.Context().Done():
+			// A local-model (browser-relay) job is connection-bound: the SSE tail is
+			// the only channel the browser uses to receive modelCall cues and POST
+			// results, so if it drops (tab closed/navigated) the generation cannot
+			// continue. Cancel the job — aborting any pending relay wait — and let
+			// the worker persist the partial reply as cancelled. Server-model jobs
+			// stay detached and keep generating after a disconnect.
+			if j.local {
+				j.cancel()
+			}
 			return
 		case ev := <-ch:
 			switch ev.kind {
@@ -665,6 +691,8 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 				flushTool(ev.text)
 			case "thought":
 				flushThought(ev.text)
+			case "modelCall":
+				flushModelCall(ev.text)
 			case "clear":
 				flushClear()
 			case "done":
@@ -694,6 +722,8 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 						flushTool(ev.text)
 					case "thought":
 						flushThought(ev.text)
+					case "modelCall":
+						flushModelCall(ev.text)
 					case "clear":
 						flushClear()
 					case "done":
@@ -716,6 +746,63 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+// handleModelResponse receives the browser's assembled inference result for one
+// local-model (browser-relay) generation round. The browser dials its own
+// Ollama at localhost:11434 when it sees a `modelCall` SSE event, streams the
+// output into the answer bubble directly, then POSTs the assembled content and
+// any tool_calls here. On a failed localhost fetch (Ollama 403 / connection
+// refused) it POSTs {error:"..."} instead, which is delivered to the awaiting
+// loop as an error so the worker finalizes the job as "error" (no empty
+// assistant message persisted). This handler correlates the POST to the pending
+// browserRelay.Call via the job's pending-response channel: the first POST to
+// arrive claims and delivers (200); a duplicate/late POST, or one with no
+// pending call, gets 409. Session-auth-gated like /generate (same cookie).
+func (s *server) handleModelResponse(w http.ResponseWriter, r *http.Request) {
+	convID := r.PathValue("id")
+	email := emailFrom(r)
+	var body struct {
+		JobID     string        `json:"jobId"`
+		Content   string        `json:"content"`
+		ToolCalls []oaiToolCall `json:"tool_calls"`
+		Error     string        `json:"error,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		jsonError(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	j := s.jobs.get(convID)
+	if j == nil || j.email != email {
+		jsonError(w, "no active generation for this conversation", http.StatusNotFound)
+		return
+	}
+	if body.JobID != "" && j.id != body.JobID {
+		// A stale POST for an older job on the same conversation (a new
+		// generation may have started after the old one finished).
+		jsonError(w, "job id does not match the active generation", http.StatusConflict)
+		return
+	}
+	// Claim the pending relay channel atomically: only one POST can deliver a
+	// response for this round. A nil channel means no relay round is waiting
+	// (the modelCall hasn't fired yet, or the round already completed/timed out).
+	j.mu.Lock()
+	ch := j.pendingRelay
+	if ch != nil {
+		j.pendingRelay = nil
+	}
+	j.mu.Unlock()
+	if ch == nil {
+		jsonError(w, "no pending model call for this job", http.StatusConflict)
+		return
+	}
+	// The channel is buffered (cap 1) and exclusively claimed, so this send
+	// always has room and never blocks. browserRelay.Call reads exactly once.
+	// A non-empty Error wins over content/tool_calls: the browser POSTs {error}
+	// with no content on a failed localhost fetch, and Call returns it as an
+	// error so the worker finalizes the job as "error".
+	ch <- relayResponse{content: body.Content, toolCalls: body.ToolCalls, Error: body.Error}
+	writeJSON(w, map[string]string{"status": "ok"})
 }
 
 // --- Agent config (global defaults) ----------------------------------------
