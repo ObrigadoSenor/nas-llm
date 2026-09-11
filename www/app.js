@@ -1075,7 +1075,7 @@ function bubbleError(bubble, msg){
   bubble.appendChild(s);
 }
 
-function addMsg(role, text, ts, searches, images, clarify, answered, steps, thoughts){
+function addMsg(role, text, ts, searches, images, clarify, answered, steps, thoughts, live=true){
   const d=document.createElement("div"); d.className="msg "+role;
   if(role==="user"){
     // Questions: text + any attached images — no header, right-aligned.
@@ -1094,29 +1094,37 @@ function addMsg(role, text, ts, searches, images, clarify, answered, steps, thou
   // Answers: agent thinking (per-round reasoning, collapsible) and tool-call
   // trace (steps drawer) above the answer, then search evidence (readable
   // snippets), then the answer bubble, then a meta row (date/time + source-link
-  // chips + copy icon) below. Left-aligned. The thinking/steps/search wraps
-  // live outside the StreamRenderer's container so streaming re-parses never
-  // wipe them; srcLinks is filled from searches or during stream.
-  const { wrap: thoughtsWrap, det: thoughtsDet } = buildThoughtsWrap();
-  if(thoughts && thoughts.length){
-    // Persisted/reloaded reasoning: render collapsed with a static "Thinking"
-    // label (no live timer). A live resume (resumeIfGenerating -> tailJob) flips
-    // it open with the streaming summary; fresh live turns have no thoughts yet.
-    renderThoughts(thoughtsWrap, thoughts);
-    setThoughtsSummary(thoughtsDet,"Thinking",{streaming:false});
-    if(thoughtsDet) thoughtsDet.open=false;
-  } else thoughtsWrap.classList.add("hidden");
-  d.appendChild(thoughtsWrap);
-  let stepsWrap=document.createElement("div"); stepsWrap.className="msg-steps";
-  if(steps && steps.length) renderAgentSteps(stepsWrap, steps);
-  else stepsWrap.classList.add("hidden");
-  d.appendChild(stepsWrap);
-  let searchWrap=document.createElement("div"); searchWrap.className="msg-search";
-  if(searches && searches.length) renderSearchBlock(searchWrap, searches);
-  else searchWrap.classList.add("hidden");
-  d.appendChild(searchWrap);
-  const b=document.createElement("div"); b.className="bubble prose";
+  // chips + tool badge + copy icon) below. Left-aligned.
+  //
+  // Live (streaming / resume) renders the thinking/steps/search wraps inline so
+  // tailJob can fill them in real time. Finalized (rerenderChat) compacts them
+  // into a single tool-badge icon in the meta row; clicking it opens a popup
+  // with the full detail. Clarify turns render an interactive card in the
+  // bubble, so they get no badge. The wraps live outside the StreamRenderer's
+  // container so streaming re-parses never wipe them.
   const hasClarify = !!(clarify && clarify.questions && clarify.questions.length);
+  let thoughtsWrap=null, thoughtsDet=null, stepsWrap=null, searchWrap=null, srcLinks=null;
+  if(live){
+    const built=buildThoughtsWrap(); thoughtsWrap=built.wrap; thoughtsDet=built.det;
+    if(thoughts && thoughts.length){
+      // Persisted/reloaded reasoning: render collapsed with a static "Thinking"
+      // label (no live timer). A live resume (resumeIfGenerating -> tailJob)
+      // flips it open with the streaming summary; fresh live turns have none.
+      renderThoughts(thoughtsWrap, thoughts);
+      setThoughtsSummary(thoughtsDet,"Thinking",{streaming:false});
+      if(thoughtsDet) thoughtsDet.open=false;
+    } else thoughtsWrap.classList.add("hidden");
+    d.appendChild(thoughtsWrap);
+    stepsWrap=document.createElement("div"); stepsWrap.className="msg-steps";
+    if(steps && steps.length) renderAgentSteps(stepsWrap, steps);
+    else stepsWrap.classList.add("hidden");
+    d.appendChild(stepsWrap);
+    searchWrap=document.createElement("div"); searchWrap.className="msg-search";
+    if(searches && searches.length) renderSearchBlock(searchWrap, searches);
+    else searchWrap.classList.add("hidden");
+    d.appendChild(searchWrap);
+  }
+  const b=document.createElement("div"); b.className="bubble prose";
   if(hasClarify){
     // A clarifying turn renders the question/options card instead of markdown
     // prose. The question text is also persisted as Content for the model's own
@@ -1129,9 +1137,13 @@ function addMsg(role, text, ts, searches, images, clarify, answered, steps, thou
   d.appendChild(b);
   const meta=document.createElement("div"); meta.className="msg-meta";
   if(ts){ const t=document.createElement("span"); t.className="ts"; t.textContent=fmtTs(ts); meta.appendChild(t); }
-  const srcLinks=document.createElement("span"); srcLinks.className="src-links";
+  srcLinks=document.createElement("span"); srcLinks.className="src-links";
   if(searches && searches.length) renderSourceLinks(srcLinks, searches);
   meta.appendChild(srcLinks);
+  if(!live && !hasClarify){
+    const badge=toolBadgeFor({searches, steps, thoughts});
+    if(badge){ badge.addEventListener("click",e=>{ e.stopPropagation(); openToolPopup(badge, {searches, steps, thoughts}); }); meta.appendChild(badge); }
+  }
   if(text && !hasClarify) addCopyMsg(meta, text);
   d.appendChild(meta);
   chat.appendChild(d);
@@ -1151,13 +1163,54 @@ function addCopyMsg(roleRow, text){
   });
   roleRow.appendChild(btn);
 }
+// --- Tool-usage indicator (finalized answers) -----------------------------
+// makeToolBadge builds the small meta-row icon button; toolBadgeFor picks the
+// icon from the persisted tool data. Agent (steps or thoughts) → sparkles;
+// pure web search → globe, dimmed when the only entry is a skipped/no-op marker
+// (the old "Web search on — model answered without searching" text). Plain
+// answers and clarify cards get no badge.
+function makeToolBadge(iconName, title){
+  const btn=document.createElement("button"); btn.type="button";
+  btn.className="tool-badge"; btn.setAttribute("aria-label", title); btn.title=title;
+  btn.innerHTML=icon(iconName,14);
+  return btn;
+}
+function toolBadgeFor({searches, steps, thoughts}){
+  if((steps && steps.length) || (thoughts && thoughts.length)) return makeToolBadge("sparkles","Agent mode");
+  if(searches && searches.length){
+    const b=makeToolBadge("globe","Web search");
+    if(searches.every(e=>e && e.skipped)) b.classList.add("dim");
+    return b;
+  }
+  return null;
+}
+// openToolPopup builds a floating panel with the full search/steps/thoughts
+// detail (rendered by the same lib helpers used inline) and closes on
+// outside-click, mirroring the row action menus (closeMenu/positionMenu).
+function openToolPopup(anchor, data){
+  closeMenu();
+  const m=document.createElement("div"); m.className="tool-popup";
+  if(data.searches && data.searches.length){ const sw=document.createElement("div"); sw.className="msg-search"; renderSearchBlock(sw, data.searches); m.appendChild(sw); }
+  if(data.steps && data.steps.length){ const st=document.createElement("div"); st.className="msg-steps"; renderAgentSteps(st, data.steps); m.appendChild(st); }
+  if(data.thoughts && data.thoughts.length){ const tw=buildThoughtsWrap(); renderThoughts(tw.wrap, data.thoughts); setThoughtsSummary(tw.det,"Thinking",{streaming:false}); if(tw.det) tw.det.open=false; m.appendChild(tw.wrap); }
+  if(!m.children.length) return;
+  document.body.appendChild(m);
+  const r=anchor.getBoundingClientRect();
+  let top=r.top-m.offsetHeight-4;
+  if(top<8) top=Math.min(r.bottom+4, window.innerHeight-m.offsetHeight-8);
+  m.style.left=Math.max(8, Math.min(r.left, window.innerWidth-m.offsetWidth-8))+"px";
+  m.style.top=top+"px";
+  openMenu=m;
+  setTimeout(()=>document.addEventListener("click",closeMenu),0);
+}
+
 function rerenderChat(){
   chat.innerHTML="";
   messages.forEach((m,i)=>{
     // A clarifying question is "answered" once a user turn follows it, so on a
     // reload we render its option buttons disabled.
     const answered = m.role==="assistant" && !!m.clarify && i<messages.length-1 && messages[i+1] && messages[i+1].role==="user";
-    addMsg(m.role, m.content, m.ts, m.search ? m.search.searches : null, m.images||null, m.clarify||null, answered, m.steps||null, m.thoughts||null);
+    addMsg(m.role, m.content, m.ts, m.search ? m.search.searches : null, m.images||null, m.clarify||null, answered, m.steps||null, m.thoughts||null, false);
   });
 }
 function updateHeader(){

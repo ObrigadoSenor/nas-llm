@@ -100,6 +100,10 @@ header h1{font-size:var(--fs-l);font-weight:600;margin:0}
 .msg-meta .copy-msg{margin-left:auto;background:transparent;border:none;color:var(--muted);width:22px;height:22px;padding:0;display:inline-flex;align-items:center;justify-content:center;border-radius:5px;opacity:.6;transition:opacity .12s,color .12s}
 .msg-meta .copy-msg:hover{color:var(--text);background:var(--hover);opacity:1}
 .msg-meta .copy-msg.copied{color:var(--accent);opacity:1}
+/* Tool-usage indicator: compact icon in the meta row for finalized answers. */
+.msg-meta .tool-badge{background:transparent;border:none;color:var(--muted);width:22px;height:22px;padding:0;display:inline-flex;align-items:center;justify-content:center;border-radius:5px;opacity:.7;transition:opacity .12s,color .12s}
+.msg-meta .tool-badge:hover{color:var(--accent);background:var(--hover);opacity:1}
+.msg-meta .tool-badge.dim{opacity:.4}
 
 /* Streaming waiting status (icon + text + dots) */
 .status{display:inline-flex;align-items:center;gap:7px;color:var(--muted);font-size:var(--fs-m)}
@@ -196,6 +200,10 @@ header h1{font-size:var(--fs-l);font-weight:600;margin:0}
 /* Transient toast for command feedback (e.g. "Web search on", "Renamed to …") */
 .slash-note{position:fixed;left:50%;bottom:72px;transform:translateX(-50%) translateY(8px);background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:8px 14px;font-size:var(--fs-m);color:var(--text);box-shadow:0 6px 24px rgba(0,0,0,.4);z-index:70;opacity:0;pointer-events:none;transition:opacity .15s,transform .15s;max-width:80vw}
 .slash-note.show{opacity:1;transform:translateX(-50%) translateY(0)}
+/* Floating panel with the full tool-usage detail (search/steps/thoughts). */
+.tool-popup{position:fixed;z-index:60;background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px;min-width:300px;max-width:min(560px,92vw);max-height:60vh;overflow-y:auto;box-shadow:0 8px 28px rgba(0,0,0,.45)}
+.tool-popup .msg-search,.tool-popup .msg-steps,.tool-popup .msg-thoughts{margin-bottom:10px}
+.tool-popup .msg-search:last-child,.tool-popup .msg-steps:last-child,.tool-popup .msg-thoughts:last-child{margin-bottom:0}
 #send{position:absolute;right:6px;bottom:6px;width:30px;height:30px;padding:0;display:inline-flex;align-items:center;justify-content:center;border-radius:50%}
 #send.stop{border-color:#e0556b;background:color-mix(in srgb,#e0556b 22%,transparent);color:#e0556b}
 #send.stop:hover:not(:disabled){border-color:#e0556b;background:color-mix(in srgb,#e0556b 30%,transparent)}
