@@ -1,10 +1,10 @@
 // nas-llm chat UI — app logic, split out of the old single-file index.html.
 // Imports UI helpers (icons, markdown rendering) from lib.js. No build step.
-import { icon, setIcon, renderMessage, escapeHtml, StreamRenderer, thinkingDots, renderSearchBlock, appendSearchEntry, showSearchPending, clearSearchPending, renderSourceLinks, appendSourceLinks, renderClarifyCard, renderAgentSteps, appendAgentStep, buildThoughtsWrap, renderThoughts, appendThought } from './lib.js?v=26';
+import { icon, setIcon, renderMessage, escapeHtml, StreamRenderer, thinkingDots, renderSearchBlock, appendSearchEntry, showSearchPending, clearSearchPending, renderSourceLinks, appendSourceLinks, renderClarifyCard, renderAgentSteps, appendAgentStep, buildThoughtsWrap, renderThoughts, appendThought, setThoughtsSummary } from './lib.js?v=27';
 
 const $ = id => document.getElementById(id);
 const app=$("app"), loginView=$("login");
-const chat=$("chat"), input=$("input"), send=$("send"), modelSel=$("model");
+const chat=$("chat"), input=$("input"), send=$("send"), modelBtn=$("modelBtn"), modelPopup=$("modelPopup");
 const convList=$("convList"), whoEmail=$("whoEmail");
 const chatTitle=$("chatTitle"), chatMeta=$("chatMeta");
 const loginEmail=$("loginEmail"), loginBtn=$("loginBtn"), loginInfo=$("loginInfo");
@@ -63,8 +63,8 @@ let inputHistory = loadInputHistory(); // sent questions, oldest→newest
 let histIndex = inputHistory.length;   // pointer; ==length means "current draft"
 let draft = "";                        // in-progress text saved on first ArrowUp
 let pendingImages = [];                // staged data URLs for the next send
-const visionModels = new Set();        // model names confirmed vision-capable
-const visionChecked = new Set();       // model names already queried via /info
+const modelCaps = new Map();           // name -> string[] (capabilities from /info)
+const capsChecked = new Set();         // model names already queried via /info
 // Visitor's local Ollama models (localhost:11434), discovered from the
 // browser. NAMES persist to localStorage so a reload reattaches them in the
 // selector even before the re-probe finishes; rich info (size/details) is
@@ -89,9 +89,11 @@ function buildModelEntries(serverData, localNames){
     const name=m.name||m.id; if(!name) continue;
     if(localSet.has(name)) continue;        // local wins -> drop server duplicate
     if(seen.has(name)) continue; seen.add(name);
-    entries.push({name, host:m.host||"nas", hostOnline:m.hostOnline!==false, local:false});
+    const b=m.benchmark;                     // measured tok/s from the last benchmark run
+    const tps = b && typeof b.tokPerSec==="number" ? b.tokPerSec : null;
+    entries.push({name, host:m.host||"nas", hostOnline:m.hostOnline!==false, local:false, tokPerSec:tps});
   }
-  for(const n of localNames){ if(seen.has(n)) continue; seen.add(n); entries.push({name:n, host:"local", hostOnline:true, local:true}); }
+  for(const n of localNames){ if(seen.has(n)) continue; seen.add(n); entries.push({name:n, host:"local", hostOnline:true, local:true, tokPerSec:null}); }
   const order={nas:0,mac:1,local:2};
   entries.sort((a,b)=>(order[a.host]??9)-(order[b.host]??9)||a.name.localeCompare(b.name));
   return entries;
@@ -145,18 +147,23 @@ renderExtras();
 // stages them as removable thumbnails above the input and sends them with the
 // next user turn. Attach is only offered when the selected model reports the
 // "vision" capability, queried lazily from /api/models/:name/info.
-function isVisionModel(name){ return visionModels.has(name); }
-async function ensureVision(name){
-  if(!name || visionChecked.has(name)) return;
-  visionChecked.add(name);
+function modelCapsFor(name){ return modelCaps.get(name)||[]; }
+function isVisionModel(name){ return modelCapsFor(name).includes("vision"); }
+// Fetch /api/models/:name/info once per session and cache its capabilities so
+// the model dropdown can badge vision/tools/thinking without a per-click call.
+// syncVision awaits it for the selected model so the composer's attach button
+// appears as soon as the capability is known; prefetchCaps fans it out to all.
+async function ensureCaps(name){
+  if(!name || capsChecked.has(name)) return;
+  capsChecked.add(name);
   try{
     const r=await fetchRetry("/api/models/"+encodeURIComponent(name)+"/info",{},{label:"Model info"});
     if(!r.ok) return;
     const j=await r.json();
-    if((j.capabilities||[]).includes("vision")) visionModels.add(name);
+    modelCaps.set(name, j.capabilities||[]);
   }catch{}
 }
-async function syncVision(){ renderComposer(); await ensureVision(selectedModel); renderComposer(); }
+async function syncVision(){ renderComposer(); await ensureCaps(selectedModel); renderComposer(); }
 function renderComposer(){
   const vision=isVisionModel(selectedModel);
   attachBtn.classList.toggle("hidden", !vision);
@@ -345,7 +352,8 @@ async function loadModels(){
     syncSelectedFromEntries();
     renderModels();
     syncVision();
-  }catch(e){ renderModels(); modelSel.title=String(e.message||e); }
+    prefetchCaps();
+  }catch(e){ renderModels(); modelBtn.title=String(e.message||e); }
 }
 // Re-probe localhost on boot/showApp so a reload reattaches the visitor's
 // local Ollama models without making them click Connect again. Silent on
@@ -358,6 +366,7 @@ async function reattachLocalModels(){
   models=modelEntries.map(e=>e.name);
   syncSelectedFromEntries();
   renderModels();
+  prefetchCaps();
   if($("modelsModal").classList.contains("open") && modelsTab==="installed") renderInstalledTab();
 }
 // Discover the visitor's local Ollama (localhost:11434). An HTTPS page makes
@@ -374,31 +383,122 @@ async function discoverLocalModels(){
   const mods=(j.models||[]).map(m=>({name:m.name, sizeGB:m.size?m.size/1e9:0, details:m.details||{}}));
   return {ok:true, models:mods};
 }
+function hostBadge(host){
+  const b=document.createElement("span"); b.className="model-badge host host-"+host;
+  b.textContent={nas:"NAS",mac:"Mac",local:"Local"}[host]||host;
+  return b;
+}
+function speedBadgeFor(tps){
+  if(!tps || tps<=0) return null;
+  const cls=tps>=12?"speed-fast":tps>=6?"speed-ok":"speed-slow";
+  const b=document.createElement("span"); b.className="model-badge speed "+cls;
+  b.textContent=tps.toFixed(0)+" t/s";
+  return b;
+}
+function capBadge(c){
+  if(c==="completion") return null;                 // chat is universal — skip
+  const label={vision:"vision",tools:"tools",thinking:"thinking",embedding:"embed"}[c];
+  if(!label) return null;
+  const b=document.createElement("span"); b.className="model-badge cap cap-"+c;
+  b.textContent=label; return b;
+}
+function buildModelRow(e){
+  const row=document.createElement("button");
+  row.type="button"; row.className="model-row"; row.setAttribute("role","option");
+  row.dataset.name=e.name;
+  row.setAttribute("aria-selected", String(e.name===selectedModel));
+  if(e.name===selectedModel) row.classList.add("selected");
+  if(!e.hostOnline){ row.classList.add("offline"); row.disabled=true; }
+  const name=document.createElement("span"); name.className="model-row-name"; name.textContent=e.name;
+  row.appendChild(name);
+  const badges=document.createElement("span"); badges.className="model-row-badges";
+  badges.appendChild(hostBadge(e.host));
+  const sp=speedBadgeFor(e.tokPerSec); if(sp) badges.appendChild(sp);
+  for(const c of modelCapsFor(e.name)){ const cb=capBadge(c); if(cb) badges.appendChild(cb); }
+  row.appendChild(badges);
+  if(e.hostOnline) row.addEventListener("click",()=>chooseModel(e.name));
+  return row;
+}
+// Refresh one row's badges after its capabilities finish loading (keeps the
+// popup's scroll/selection intact instead of a full re-render).
+function refreshRowBadges(name){
+  const row=modelPopup.querySelector('.model-row[data-name="'+name+'"]');
+  if(!row) return;
+  const badges=row.querySelector(".model-row-badges"); if(!badges) return;
+  const e=modelEntries.find(x=>x.name===name); if(!e) return;
+  badges.replaceChildren();
+  badges.appendChild(hostBadge(e.host));
+  const sp=speedBadgeFor(e.tokPerSec); if(sp) badges.appendChild(sp);
+  for(const c of modelCapsFor(name)){ const cb=capBadge(c); if(cb) badges.appendChild(cb); }
+}
 function renderModels(){
-  modelSel.innerHTML="";
+  // Trigger button: current model name + host badge + chevron.
+  const cur=modelEntries.find(e=>e.name===selectedModel);
+  modelBtn.replaceChildren();
+  modelBtn.disabled=!modelEntries.length;
+  const nameEl=document.createElement("span"); nameEl.className="model-btn-name";
+  nameEl.textContent = cur ? cur.name : (modelEntries.length ? "Select model" : "No models");
+  modelBtn.appendChild(nameEl);
+  if(cur) modelBtn.appendChild(hostBadge(cur.host));
+  const chev=document.createElement("span"); chev.className="model-chev"; chev.innerHTML=icon("chevron-down",14);
+  modelBtn.appendChild(chev);
+  // Popup: grouped sections (NAS / Mac / Local).
+  modelPopup.replaceChildren();
   const groups={};
   for(const e of modelEntries){ (groups[e.host]=groups[e.host]||[]).push(e); }
   const labels={nas:"NAS", mac:"Mac", local:"Local (this computer)"};
   for(const h of ["nas","mac","local"]){
     const arr=groups[h]; if(!arr||!arr.length) continue;
-    const og=document.createElement("optgroup"); og.label=labels[h]||h;
-    for(const e of arr){
-      const o=document.createElement("option"); o.value=o.textContent=e.name;
-      if(!e.hostOnline) o.disabled=true;       // grey out offline-host models
-      og.appendChild(o);
-    }
-    modelSel.appendChild(og);
+    const g=document.createElement("div"); g.className="model-group";
+    const gl=document.createElement("div"); gl.className="model-group-label"; gl.textContent=labels[h]||h;
+    g.appendChild(gl);
+    for(const e of arr) g.appendChild(buildModelRow(e));
+    modelPopup.appendChild(g);
   }
-  if(modelEntries.length) modelSel.value=selectedModel;
 }
-modelSel.addEventListener("change", ()=>{
-  selectedModel=modelSel.value;
-  localStorage.setItem("nas-llm-model", selectedModel);
-  syncVision();
+function setModelPopup(open){
+  modelPopup.classList.toggle("hidden", !open);
+  modelBtn.classList.toggle("open", open);
+  modelBtn.setAttribute("aria-expanded", String(open));
+  if(open){
+    const focusEl=modelPopup.querySelector(".model-row.selected:not(.offline)") || modelPopup.querySelector(".model-row:not(.offline)");
+    if(focusEl) focusEl.focus();
+  }
+}
+function chooseModel(name){
+  selectedModel=name; localStorage.setItem("nas-llm-model", selectedModel);
+  syncVision(); renderModels();
   // Don't overwrite messages while a background job is mid-generation for this
   // conversation — the job finalizes by appending to the stored messages, and a
   // PUT here (which lacks the in-flight assistant reply) would clobber it.
   if(activeId && !generatingIds.has(activeId)) saveConversation();
+  setModelPopup(false); modelBtn.focus();
+}
+// Background-fetch capabilities for every known model so the dropdown can badge
+// vision/tools/thinking. Cached per session via capsChecked; re-renders each
+// row's badges as its /info resolves. One at a time to be gentle on the N100.
+function prefetchCaps(){
+  const names=modelEntries.map(e=>e.name);
+  let i=0;
+  (function next(){
+    if(i>=names.length) return;
+    const n=names[i++];
+    if(capsChecked.has(n)){ next(); return; }
+    ensureCaps(n).then(()=>{ refreshRowBadges(n); if(n===selectedModel) renderComposer(); next(); });
+  })();
+}
+modelBtn.addEventListener("click", e=>{ e.stopPropagation(); setModelPopup(modelPopup.classList.contains("hidden")); });
+document.addEventListener("click", e=>{ if(modelPopup.classList.contains("hidden")) return; if(!modelPopup.contains(e.target) && !modelBtn.contains(e.target)) setModelPopup(false); });
+document.addEventListener("keydown", e=>{
+  if(modelPopup.classList.contains("hidden")) return;
+  if(e.key==="Escape"){ setModelPopup(false); modelBtn.focus(); return; }
+  const rows=[...modelPopup.querySelectorAll(".model-row:not(.offline)")];
+  if(!rows.length) return;
+  const cur=modelPopup.querySelector(".model-row:focus");
+  let idx=cur?rows.indexOf(cur):0;
+  if(e.key==="ArrowDown"){ e.preventDefault(); idx=Math.min(rows.length-1, idx+1); rows[idx].focus(); }
+  else if(e.key==="ArrowUp"){ e.preventDefault(); idx=Math.max(0, idx-1); rows[idx].focus(); }
+  else if(e.key==="Enter"||e.key===" "){ e.preventDefault(); const r=cur||rows[0]; if(r) chooseModel(r.dataset.name); }
 });
 
 // --- Sidebar / conversations ------------------------------------------------
@@ -665,7 +765,8 @@ async function resumeIfGenerating(id){
   activeJobConvId=id; renderSend();
   const hasQ = !!(job.questions && job.questions.questions && job.questions.questions.length);
   const {bubble, searchWrap, srcLinks, stepsWrap, thoughtsWrap, thoughtsDet}=addMsg("assistant", hasQ ? "" : (job.content||""), job.createdAt||Date.now(), job.searches||null, null, job.questions||null, false, job.steps||null, job.thoughts||null);
-  // A finished/reloaded agent turn collapses its thinking (it's done).
+  // A generating job with no reasoning yet collapses the empty drawer; one with
+  // reasoning stays open and tailJob sets the streaming summary/elapsed timer.
   if(thoughtsDet && (!job.thoughts || !job.thoughts.length)) thoughtsDet.open = false;
   tailJob(id, bubble, hasQ ? "" : (job.content||""), searchWrap, srcLinks, job.questions||null, stepsWrap, job.steps||null, thoughtsWrap, thoughtsDet, job.thoughts||null);
 }
@@ -767,7 +868,15 @@ function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarif
     renderer.set(initialAcc);
   }
   if(initialSteps && stepsWrap) renderAgentSteps(stepsWrap, initialSteps);
-  if(initialThoughts && thoughtsWrap) renderThoughts(thoughtsWrap, initialThoughts);
+  let thoughtStart=null;
+  if(initialThoughts && initialThoughts.length && thoughtsWrap){
+    // Reattaching to a generating job that already has reasoning: show it open
+    // with the streaming summary and start the elapsed timer from now.
+    renderThoughts(thoughtsWrap, initialThoughts);
+    thoughtStart=Date.now();
+    setThoughtsSummary(thoughtsDet, "Thinking", {streaming:true});
+    if(thoughtsDet) thoughtsDet.open=true;
+  }
   let esClosed=false;
   activeJobConvId=convId;
   const es=new EventSource("/api/conversations/"+encodeURIComponent(convId)+"/events");
@@ -778,8 +887,8 @@ function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarif
   es.addEventListener("questions", e=>{ let q=null; try{ q=JSON.parse(e.data); }catch{} renderer.suspend(); renderClarifyCard(bubble, q, false, onAnswer); });
   es.addEventListener("steps", e=>{ let arr=[]; try{ arr=JSON.parse(e.data)||[]; }catch{} renderAgentSteps(stepsWrap, arr); });
   es.addEventListener("tool", e=>{ let st=null; try{ st=JSON.parse(e.data); }catch{} appendAgentStep(stepsWrap, st); });
-  es.addEventListener("thoughts", e=>{ let arr=[]; try{ arr=JSON.parse(e.data)||[]; }catch{} renderThoughts(thoughtsWrap, arr); });
-  es.addEventListener("thought", e=>{ let t=""; try{ t=JSON.parse(e.data); }catch{} appendThought(thoughtsWrap, t); });
+  es.addEventListener("thoughts", e=>{ let arr=[]; try{ arr=JSON.parse(e.data)||[]; }catch{} renderThoughts(thoughtsWrap, arr); if(arr&&arr.length){ if(!thoughtStart) thoughtStart=Date.now(); setThoughtsSummary(thoughtsDet,"Thinking",{streaming:true}); if(thoughtsDet) thoughtsDet.open=true; } });
+  es.addEventListener("thought", e=>{ let t=""; try{ t=JSON.parse(e.data); }catch{} appendThought(thoughtsWrap, t); if(t!=null&&t!==""){ if(!thoughtStart) thoughtStart=Date.now(); setThoughtsSummary(thoughtsDet,"Thinking",{streaming:true}); if(thoughtsDet) thoughtsDet.open=true; } });
   es.addEventListener("clear", ()=>{ renderer.set(""); });
   // Local-model relay: the backend needs the visitor's Ollama to infer. Stream
   // the response into the bubble as it arrives, then POST the assembled result
@@ -812,14 +921,14 @@ function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarif
     else if(p==="answering") clearSearchPending(searchWrap);
   });
   es.addEventListener("chunk", e=>{ let d=""; try{ d=JSON.parse(e.data); }catch{} renderer.append(d); });
-  es.addEventListener("done", ()=>{ esClosed=true; if(activeLocalAbort){ activeLocalAbort.abort(); activeLocalAbort=null; } es.close(); activeES=null; if(thoughtsDet) thoughtsDet.open=false; onGenerationDone(convId); });
+  es.addEventListener("done", ()=>{ esClosed=true; if(activeLocalAbort){ activeLocalAbort.abort(); activeLocalAbort=null; } es.close(); activeES=null; if(thoughtsDet){ if(thoughtStart){ const secs=((Date.now()-thoughtStart)/1000).toFixed(1); setThoughtsSummary(thoughtsDet,"Thought for "+secs+"s",{streaming:false}); } else setThoughtsSummary(thoughtsDet,"Thinking",{streaming:false}); thoughtsDet.open=false; } onGenerationDone(convId); });
   es.addEventListener("joberror", e=>{
     esClosed=true; if(activeLocalAbort){ activeLocalAbort.abort(); activeLocalAbort=null; } es.close(); activeES=null;
     let msg=e.data; try{ msg=JSON.parse(e.data); }catch{}
     const acc = renderer.acc;
     if(acc) renderer.finalize(acc);
     else bubbleError(bubble, msg);
-    if(thoughtsDet) thoughtsDet.open=false; // collapse thinking on terminal
+    if(thoughtsDet){ setThoughtsSummary(thoughtsDet,"Thinking",{streaming:false}); thoughtsDet.open=false; } // collapse thinking on terminal
     generatingIds.delete(convId); renderSidebar();
     activeJobConvId=null; renderSend(); input.focus();
   });
@@ -905,8 +1014,14 @@ function addMsg(role, text, ts, searches, images, clarify, answered, steps, thou
   // live outside the StreamRenderer's container so streaming re-parses never
   // wipe them; srcLinks is filled from searches or during stream.
   const { wrap: thoughtsWrap, det: thoughtsDet } = buildThoughtsWrap();
-  if(thoughts && thoughts.length) renderThoughts(thoughtsWrap, thoughts);
-  else thoughtsWrap.classList.add("hidden");
+  if(thoughts && thoughts.length){
+    // Persisted/reloaded reasoning: render collapsed with a static "Thinking"
+    // label (no live timer). A live resume (resumeIfGenerating -> tailJob) flips
+    // it open with the streaming summary; fresh live turns have no thoughts yet.
+    renderThoughts(thoughtsWrap, thoughts);
+    setThoughtsSummary(thoughtsDet,"Thinking",{streaming:false});
+    if(thoughtsDet) thoughtsDet.open=false;
+  } else thoughtsWrap.classList.add("hidden");
   d.appendChild(thoughtsWrap);
   let stepsWrap=document.createElement("div"); stepsWrap.className="msg-steps";
   if(steps && steps.length) renderAgentSteps(stepsWrap, steps);

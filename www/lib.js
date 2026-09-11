@@ -312,11 +312,12 @@ export function appendAgentStep(container, st) {
   container.appendChild(buildStepRow(st));
 }
 
-// --- Agent thinking drawer (per-round reasoning, smaller + collapsible) ----------
-// renderThoughts replaces the drawer with the full set (SSE replay / reload).
-// appendThought adds one live thought as its round completes. Each is a small
-// muted block inside a <details> that is open while streaming and auto-closed
-// on done so the user is left with only the summarized answer.
+// --- Agent thinking drawer (per-round reasoning, minimal + collapsible) ----------
+// renderThoughts replaces the drawer body with the full set (SSE replay / reload);
+// appendThought adds one live thought as its round completes. The <summary> holds
+// a mutable label span (setThoughtsSummary) so callers can show "Thinking" +
+// animated dots while reasoning streams, then swap to "Thought for Xs" and
+// collapse the drawer when it completes. Each thought is a small, dim block.
 function buildThoughtRow(text) {
   const div = document.createElement('div');
   div.className = 'thought';
@@ -342,13 +343,30 @@ export function appendThought(container, text) {
   container.classList.remove('hidden');
   det.querySelector('.thoughts-body').appendChild(buildThoughtRow(text));
 }
+// Update the thinking drawer's summary label. streaming=true shows the text
+// followed by animated dots (used while reasoning streams); streaming=false
+// shows a plain one-liner (the "Thought for Xs" done state, or reloaded history
+// which has no live timer). The drawer's open/collapsed state is owned by the
+// caller (tailJob / addMsg), not by this helper.
+export function setThoughtsSummary(det, text, { streaming = false } = {}) {
+  if (!det) return;
+  const label = det.querySelector('.thoughts-label');
+  if (!label) return;
+  label.classList.toggle('streaming', !!streaming);
+  label.replaceChildren();
+  const t = document.createElement('span'); t.textContent = String(text || '');
+  label.appendChild(t);
+  if (streaming) label.appendChild(thinkingDots());
+}
 // Build the collapsible thinking wrapper (<details open>) the SSE handlers
-// fill. open by default so thinking is visible (smaller) while it streams;
-// the tailJob done handler removes `open` to collapse it.
+// fill. open by default so thinking is visible (smaller) while it streams; the
+// tailJob done handler swaps the label to "Thought for Xs" and removes `open`.
 export function buildThoughtsWrap() {
   const wrap = document.createElement('div'); wrap.className = 'msg-thoughts hidden';
   const det = document.createElement('details'); det.className = 'thoughts-det'; det.open = true;
-  const sum = document.createElement('summary'); sum.textContent = 'Thinking';
+  const sum = document.createElement('summary');
+  const label = document.createElement('span'); label.className = 'thoughts-label'; label.textContent = 'Thinking';
+  sum.appendChild(label);
   const body = document.createElement('div'); body.className = 'thoughts-body';
   det.appendChild(sum); det.appendChild(body); wrap.appendChild(det);
   return { wrap, det };
