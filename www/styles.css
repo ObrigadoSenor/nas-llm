@@ -126,6 +126,20 @@ header h1{font-size:var(--fs-l);font-weight:600;margin:0}
 .badge.web{background:var(--soft);border-color:color-mix(in srgb,var(--accent) 40%,transparent);color:var(--accent)}
 .badge.web .icon{color:var(--accent)}
 
+/* Agent tool-call trace (steps drawer) above the answer */
+.msg-steps{display:flex;flex-direction:column;gap:6px;margin-bottom:8px}
+.msg-steps.hidden{display:none!important}
+.step{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:var(--fs-m);display:flex;flex-direction:column;gap:4px}
+.step.err{border-color:color-mix(in srgb,var(--bad) 50%,transparent)}
+.step-head{display:inline-flex;align-items:center;gap:7px;color:var(--muted);flex-wrap:wrap}
+.step-num{display:inline-flex;align-items:center;justify-content:center;min-width:18px;height:18px;padding:0 4px;font-size:11px;line-height:1;border-radius:99px;background:var(--soft);color:var(--muted)}
+.step-tool{font-weight:600;color:var(--text)}
+.step-args{font-family:var(--mono);font-size:.85em;color:var(--muted);opacity:.85;word-break:break-all}
+.step-preview{color:var(--text);opacity:.85;font-size:var(--fs-m);line-height:1.45;word-wrap:break-word;overflow-wrap:anywhere}
+.step.err .step-preview{color:var(--bad)}
+.step-sources{display:inline-flex;align-items:center;gap:4px;flex-wrap:wrap}
+.step-query{font-weight:600;color:var(--text);margin-right:4px}
+
 /* --- Clarifying questions (agent loop) --- */
 .clarify-card{background:var(--panel);border:1px solid color-mix(in srgb,var(--accent) 35%,transparent);border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:10px}
 .clarify-card+.clarify-card{margin-top:8px}
@@ -298,3 +312,27 @@ header h1{font-size:var(--fs-l);font-weight:600;margin:0}
 .details-facts>div{display:flex;justify-content:space-between;gap:12px}
 .details-facts>div span:first-child{color:var(--muted)}
 @media (max-width:680px){.modal-card{width:100%;max-width:100%;border-left:none}}
+
+/* --- + menu separator + Agent settings entry --- */
+.plus-sep{height:1px;background:var(--border);margin:4px 2px}
+.plus-cfg{color:var(--muted)}
+.plus-cfg:hover{background:var(--hover);color:var(--text)}
+.plus-cfg .icon{color:var(--muted)}
+
+/* --- Agent settings panel --- */
+#closeAgent{display:inline-flex;align-items:center;justify-content:center;width:var(--h);padding:0}
+.agent-cfg-note{line-height:1.5}
+.agent-label{font-size:var(--fs-m);color:var(--muted);margin-top:4px}
+#agentSystem{width:100%;resize:vertical;min-height:90px;max-height:280px;font:inherit;font-size:var(--fs-m);line-height:1.5;padding:8px 10px;border-radius:8px;background:var(--bg);color:var(--text)}
+.agent-tools{display:flex;flex-direction:column;gap:6px}
+.agent-tool{display:flex;align-items:flex-start;gap:8px;padding:8px 10px;border:1px solid var(--border);border-radius:8px;cursor:pointer}
+.agent-tool:hover{background:var(--hover)}
+.agent-tool.on{border-color:color-mix(in srgb,var(--accent) 45%,transparent);background:var(--soft)}
+.agent-tool input{margin-top:3px}
+.agent-tool-text{display:flex;flex-direction:column;gap:2px;font-size:var(--fs-m)}
+.agent-tool-text b{font-weight:600;color:var(--text)}
+.agent-tool-text .muted{font-size:var(--fs-s)}
+.agent-cfg-actions{display:flex;align-items:center;gap:10px;margin-top:4px}
+.agent-cfg-actions button{height:32px;padding:0 16px}
+.agent-saved{font-size:var(--fs-s)}
+.agent-saved.err-note{color:var(--bad)}

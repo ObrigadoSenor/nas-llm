@@ -491,11 +491,11 @@ type catalogEntry struct {
 }
 
 type modelVerdict struct {
-	Fit          string     `json:"fit"`          // "fits" | "tight" | "no"
+	Fit          string     `json:"fit"` // "fits" | "tight" | "no"
 	RAMUsedGB    float64    `json:"ramUsedGB"`
 	AvailableGB  float64    `json:"availableGB"`
 	KVCacheGB    float64    `json:"kvCacheGB"`
-	Speed        string     `json:"speed"`        // "fast" | "usable" | "slow" | "unknown"
+	Speed        string     `json:"speed"` // "fast" | "usable" | "slow" | "unknown"
 	EstTokPerSec [2]float64 `json:"estTokPerSec,omitempty"`
 }
 
@@ -512,49 +512,49 @@ var curatedCatalog = []catalogEntry{
 	{
 		Name: "qwen3:1.7b", Family: "qwen3", Params: "1.7B", Quant: "Q4_K_M",
 		SizeGB: 1.1, ContextWindow: 32768, Capabilities: []string{"tools", "thinking", "completion"},
-		Blurb: "Very fast little model. Great for quick answers and tool/web-search calls.",
+		Blurb:        "Very fast little model. Great for quick answers and tool/web-search calls.",
 		EstTokPerSec: [2]float64{10, 16}, RecommendedFor: "Fast replies, web search",
 		Layers: 28, KVHeads: 8, HeadDim: 128,
 	},
 	{
 		Name: "llama3.2:3b", Family: "llama", Params: "3B", Quant: "Q4_K_M",
 		SizeGB: 2.0, ContextWindow: 128000, Capabilities: []string{"completion"},
-		Blurb: "The sweet spot on 8 GB. Solid general chat and page summarizing.",
+		Blurb:        "The sweet spot on 8 GB. Solid general chat and page summarizing.",
 		EstTokPerSec: [2]float64{7, 11}, RecommendedFor: "General chat, summarizing",
 		Layers: 28, KVHeads: 8, HeadDim: 128,
 	},
 	{
 		Name: "qwen2.5:3b", Family: "qwen2.5", Params: "3B", Quant: "Q4_K_M",
 		SizeGB: 1.9, ContextWindow: 32768, Capabilities: []string{"tools", "completion"},
-		Blurb: "Strong reasoning for its size and tool-capable. A good 3B alternative.",
+		Blurb:        "Strong reasoning for its size and tool-capable. A good 3B alternative.",
 		EstTokPerSec: [2]float64{6, 10}, RecommendedFor: "Reasoning, tool calls",
 		Layers: 36, KVHeads: 2, HeadDim: 128,
 	},
 	{
 		Name: "phi3:mini", Family: "phi3", Params: "3.8B", Quant: "Q4_K_M",
 		SizeGB: 2.2, ContextWindow: 128000, Capabilities: []string{"completion"},
-		Blurb: "Microsoft's small model. Decent reasoning, long context window.",
+		Blurb:        "Microsoft's small model. Decent reasoning, long context window.",
 		EstTokPerSec: [2]float64{4, 8}, RecommendedFor: "Long-context notes",
 		Layers: 32, KVHeads: 32, HeadDim: 96,
 	},
 	{
 		Name: "gemma3:4b", Family: "gemma3", Params: "4B", Quant: "Q4_K_M",
 		SizeGB: 2.5, ContextWindow: 128000, Capabilities: []string{"vision", "completion"},
-		Blurb: "Multimodal — understands images as well as text. Slower than the 3B models.",
+		Blurb:        "Multimodal — understands images as well as text. Slower than the 3B models.",
 		EstTokPerSec: [2]float64{5, 9}, RecommendedFor: "Image + text",
 		Layers: 35, KVHeads: 1, HeadDim: 256,
 	},
 	{
 		Name: "llama3.1:8b", Family: "llama3", Params: "8B", Quant: "Q4_K_M",
 		SizeGB: 4.7, ContextWindow: 128000, Capabilities: []string{"tools", "completion"},
-		Blurb: "Best quality here, but slow and RAM-heavy on 8 GB. Shorten its context.",
+		Blurb:        "Best quality here, but slow and RAM-heavy on 8 GB. Shorten its context.",
 		EstTokPerSec: [2]float64{2, 4}, RecommendedFor: "Best quality (slow)",
 		Layers: 32, KVHeads: 8, HeadDim: 128,
 	},
 	{
 		Name: "nomic-embed-text", Family: "nomic-bert", Params: "0.1B", Quant: "f16",
 		SizeGB: 0.27, ContextWindow: 8192, Capabilities: []string{"embedding"},
-		Blurb: "Embeddings for search/RAG — not a chat model. Tiny and fast.",
+		Blurb:        "Embeddings for search/RAG — not a chat model. Tiny and fast.",
 		EstTokPerSec: [2]float64{0, 0}, RecommendedFor: "Embeddings",
 	},
 }

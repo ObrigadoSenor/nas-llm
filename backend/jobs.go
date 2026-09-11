@@ -31,7 +31,7 @@ var errJobActive = errors.New("a generation is already running for this conversa
 
 // subEvent is a single event pushed to an SSE subscriber.
 type subEvent struct {
-	kind string // "chunk", "phase", "search", "questions", "done", "error"
+	kind string // "chunk", "phase", "search", "questions", "tool", "done", "error"
 	text string
 }
 
@@ -47,7 +47,11 @@ type job struct {
 	model     string
 	webSearch bool
 	clarify   bool // Clarify extra was on for this generation (drives the agent loop)
+	agent     bool // Agent mode: general ReAct loop over a tool registry
 	createdAt int64
+
+	promptTokens     int // agent-mode: cumulative prompt tokens (observability)
+	completionTokens int // agent-mode: cumulative completion tokens (observability)
 
 	mu              sync.Mutex
 	status          string // queued, generating, done, error, cancelled
@@ -56,6 +60,7 @@ type job struct {
 	phase           string        // last phase hint (searching/answering/clarifying…): replayed on (re)connect
 	searches        []searchEntry // accumulated web-search evidence: broadcast + persisted
 	clarifyMeta     *clarifyMeta  // stashed clarifying question(s) when the model called ask_user: broadcast + persisted
+	steps           []agentStep   // accumulated agent tool-call trace: broadcast + persisted
 	subs            map[chan subEvent]struct{}
 	finished        chan struct{}      // closed when the job reaches a terminal state
 	cancelFn        context.CancelFunc // set when the job starts running
@@ -70,7 +75,7 @@ func newJobID() string {
 	return hex.EncodeToString(b)
 }
 
-func newJob(convID, email, model string, webSearch, clarify bool) *job {
+func newJob(convID, email, model string, webSearch, clarify, agent bool) *job {
 	return &job{
 		id:        newJobID(),
 		convID:    convID,
@@ -78,6 +83,7 @@ func newJob(convID, email, model string, webSearch, clarify bool) *job {
 		model:     model,
 		webSearch: webSearch,
 		clarify:   clarify,
+		agent:     agent,
 		createdAt: time.Now().UnixMilli(),
 		status:    "queued",
 		subs:      map[chan subEvent]struct{}{},
@@ -196,6 +202,57 @@ func (j *job) clarifySnapshot() *clarifyMeta {
 	}
 	cp := *j.clarifyMeta
 	return &cp
+}
+
+// emitTool records one agent tool-call step and broadcasts it to every live
+// subscriber so the UI can paint the trace. Also accumulated for persistence
+// (attached to the saved assistant message) and SSE replay.
+func (j *job) emitTool(st agentStep) {
+	j.mu.Lock()
+	j.steps = append(j.steps, st)
+	subs := make([]chan subEvent, 0, len(j.subs))
+	for ch := range j.subs {
+		subs = append(subs, ch)
+	}
+	j.mu.Unlock()
+	b, _ := json.Marshal(st)
+	ev := subEvent{kind: "tool", text: string(b)}
+	for _, ch := range subs {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
+}
+
+// stepSnapshot returns a copy of the accumulated agent tool-call trace for
+// persistence (attached to the saved assistant message) and SSE replay.
+func (j *job) stepSnapshot() []agentStep {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if len(j.steps) == 0 {
+		return nil
+	}
+	out := make([]agentStep, len(j.steps))
+	copy(out, j.steps)
+	return out
+}
+
+// addUsage accumulates token counts reported by the agent loop (one call per
+// model round). Thread-safe; the worker reads the totals via usageSnapshot()
+// after the run to persist them for observability.
+func (j *job) addUsage(prompt, completion int) {
+	j.mu.Lock()
+	j.promptTokens += prompt
+	j.completionTokens += completion
+	j.mu.Unlock()
+}
+
+// usageSnapshot returns the cumulative (prompt, completion) token counts.
+func (j *job) usageSnapshot() (int, int) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.promptTokens, j.completionTokens
 }
 
 func (j *job) contentString() string {
@@ -425,11 +482,24 @@ func (jm *jobManager) worker() {
 		// question card on the job. Persist the question text as the assistant
 		// content (so the model has context for the user's follow-up answer) and
 		// attach the card for the UI. Preamble the model streamed before calling
-		// ask_user is dropped in favor of the explicit question text.
+		// ask_user is dropped in favor of the explicit question text. This covers
+		// both the one-shot clarify loop and the agent loop (whose ask_user tool
+		// also calls emitQuestions when it goes terminal).
 		var cmeta *clarifyMeta
 		if cm := j.clarifySnapshot(); cm != nil {
 			cmeta = cm
 			content = clarifyAsContent(cm)
+		}
+		// Agent-mode turns carry their tool-call trace on the message so a reload
+		// re-paints the steps drawer.
+		steps := j.stepSnapshot()
+		// Observability: persist the per-step trace (agent_steps) and the cumulative
+		// token totals (jobs.prompt_tokens / completion_tokens) for analytics.
+		// Best-effort: a failure here never undoes a successful generation.
+		if j.agent {
+			p, c := j.usageSnapshot()
+			_ = jm.store.setJobTokens(j.id, p, c)
+			_ = jm.store.persistAgentSteps(j.id, steps)
 		}
 
 		j.mu.Lock()
@@ -443,7 +513,7 @@ func (jm *jobManager) worker() {
 			ts := time.Now().UnixMilli()
 			if strings.TrimSpace(content) != "" {
 				_ = jm.store.setJobContent(j.id, content)
-				_ = jm.store.appendAssistantMessage(j.email, j.convID, Message{Role: "assistant", Content: content, Ts: ts, Search: smeta, Clarify: cmeta})
+				_ = jm.store.appendAssistantMessage(j.email, j.convID, Message{Role: "assistant", Content: content, Ts: ts, Search: smeta, Clarify: cmeta, Steps: steps})
 			}
 			_ = jm.store.finalizeJob(j.id, "cancelled", "", ts)
 			j.notifyCancelled()
@@ -453,7 +523,7 @@ func (jm *jobManager) worker() {
 		default:
 			_ = jm.store.setJobContent(j.id, content)
 			ts := time.Now().UnixMilli()
-			_ = jm.store.appendAssistantMessage(j.email, j.convID, Message{Role: "assistant", Content: content, Ts: ts, Search: smeta, Clarify: cmeta})
+			_ = jm.store.appendAssistantMessage(j.email, j.convID, Message{Role: "assistant", Content: content, Ts: ts, Search: smeta, Clarify: cmeta, Steps: steps})
 			_ = jm.store.finalizeJob(j.id, "done", "", ts)
 			j.notifyDone()
 		}
@@ -522,6 +592,10 @@ func (s *server) runGeneration(j *job) error {
 		}
 	}
 
+	if j.agent {
+		allow, sys := s.agentConfig(j)
+		return s.runAgentLoop(ctx, j.model, j.email, msgs, allow, sys, j.emitChunk, j.emitPhase, j.emitTool, j.emitQuestions, j.addUsage)
+	}
 	if j.clarify {
 		// Cap back-to-back clarifying questions at MAX_CLARIFY_ROUNDS: once the
 		// model has asked that many in the current clarify session, drop the

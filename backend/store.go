@@ -27,6 +27,12 @@ type Message struct {
 	// context for the user's follow-up answer on the next round. Rides in the
 	// messages JSON blob; omitempty keeps existing rows byte-identical.
 	Clarify *clarifyMeta `json:"clarify,omitempty"`
+	// Steps, when set on an assistant turn, is the agent's tool-call trace
+	// (one entry per tool call): tool name, args, a short result preview, and
+	// specialized payloads (search evidence, clarify card). Rides in the
+	// messages JSON blob so a reload re-paints the trace; omitempty keeps
+	// existing rows byte-identical. Populated only for agent-mode turns.
+	Steps []agentStep `json:"steps,omitempty"`
 }
 
 type Conversation struct {
@@ -83,6 +89,8 @@ CREATE TABLE IF NOT EXISTS conversations (
 	model TEXT NOT NULL,
 	folder_id TEXT,
 	title_custom INTEGER NOT NULL DEFAULT 0,
+	agent_system TEXT,
+	agent_tools TEXT,
 	created_at INTEGER NOT NULL,
 	updated_at INTEGER NOT NULL,
 	messages TEXT NOT NULL
@@ -105,11 +113,35 @@ CREATE TABLE IF NOT EXISTS jobs (
 	web_search INTEGER NOT NULL DEFAULT 0,
 	content TEXT NOT NULL DEFAULT '',
 	error TEXT NOT NULL DEFAULT '',
+	prompt_tokens INTEGER NOT NULL DEFAULT 0,
+	completion_tokens INTEGER NOT NULL DEFAULT 0,
 	created_at INTEGER NOT NULL,
 	started_at INTEGER,
 	finished_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_conv ON jobs(conversation_id);
+CREATE TABLE IF NOT EXISTS agent_steps (
+	job_id TEXT NOT NULL,
+	step INTEGER NOT NULL,
+	tool TEXT NOT NULL,
+	args TEXT NOT NULL DEFAULT '',
+	result_preview TEXT NOT NULL DEFAULT '',
+	duration_ms INTEGER NOT NULL DEFAULT 0,
+	created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_steps_job ON agent_steps(job_id, step);
+CREATE TABLE IF NOT EXISTS notes (
+	id TEXT PRIMARY KEY,
+	email TEXT NOT NULL,
+	key TEXT NOT NULL,
+	value TEXT NOT NULL,
+	updated_at INTEGER NOT NULL,
+	UNIQUE(email, key)
+);
+CREATE TABLE IF NOT EXISTS settings (
+	key TEXT PRIMARY KEY,
+	value TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS model_benchmarks (
 	model TEXT PRIMARY KEY,
 	tok_per_sec REAL NOT NULL DEFAULT 0,
@@ -158,8 +190,8 @@ func (s *store) getBenchmark(model string) *benchmark {
 	return &b
 }
 
-// migrate adds columns to pre-existing conversations tables (a no-op for fresh
-// installs, which already include them via the schema above).
+// migrate adds columns to pre-existing tables (a no-op for fresh installs,
+// which already include them via the schema above).
 func migrate(db *sql.DB) error {
 	cols, err := tableColumns(db, "conversations")
 	if err != nil {
@@ -172,6 +204,30 @@ func migrate(db *sql.DB) error {
 	}
 	if !cols["title_custom"] {
 		if _, err := db.Exec(`ALTER TABLE conversations ADD COLUMN title_custom INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	if !cols["agent_system"] {
+		if _, err := db.Exec(`ALTER TABLE conversations ADD COLUMN agent_system TEXT`); err != nil {
+			return err
+		}
+	}
+	if !cols["agent_tools"] {
+		if _, err := db.Exec(`ALTER TABLE conversations ADD COLUMN agent_tools TEXT`); err != nil {
+			return err
+		}
+	}
+	jcols, err := tableColumns(db, "jobs")
+	if err != nil {
+		return err
+	}
+	if !jcols["prompt_tokens"] {
+		if _, err := db.Exec(`ALTER TABLE jobs ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	if !jcols["completion_tokens"] {
+		if _, err := db.Exec(`ALTER TABLE jobs ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return err
 		}
 	}
@@ -425,7 +481,7 @@ func (s *store) deleteFolder(email, id string) (bool, error) {
 // An empty folderID clears the folder (sets it to NULL). A non-empty title marks
 // the conversation as having a custom title (title_custom = 1) so later saves
 // won't overwrite it with the auto-derived first-message title.
-func (s *store) patchConversation(email, id string, title, folderID, model *string) (*Conversation, error) {
+func (s *store) patchConversation(email, id string, title, folderID, model, agentSystem, agentTools *string) (*Conversation, error) {
 	now := time.Now().UnixMilli()
 	sets := []string{"updated_at = ?"}
 	args := []any{now}
@@ -444,6 +500,14 @@ func (s *store) patchConversation(email, id string, title, folderID, model *stri
 	if model != nil {
 		sets = append(sets, "model = ?")
 		args = append(args, *model)
+	}
+	if agentSystem != nil {
+		sets = append(sets, "agent_system = ?")
+		args = append(args, *agentSystem)
+	}
+	if agentTools != nil {
+		sets = append(sets, "agent_tools = ?")
+		args = append(args, *agentTools)
 	}
 	args = append(args, id, email)
 	res, err := s.db.Exec(`UPDATE conversations SET `+strings.Join(sets, ", ")+` WHERE id = ? AND email = ?`, args...)
@@ -535,4 +599,115 @@ func reconcileJobs(db *sql.DB) error {
 	_, err := db.Exec(`UPDATE jobs SET status = 'error', error = 'backend restarted', finished_at = ?
 		WHERE status IN ('queued', 'generating')`, time.Now().UnixMilli())
 	return err
+}
+
+// setJobTokens records the cumulative prompt/completion token counts for a job
+// (agent-mode observability). Ollama reports usage per round; the agent loop
+// accumulates it and the worker persists the totals here.
+func (s *store) setJobTokens(id string, prompt, completion int) error {
+	_, err := s.db.Exec(`UPDATE jobs SET prompt_tokens = ?, completion_tokens = ? WHERE id = ?`, prompt, completion, id)
+	return err
+}
+
+// --- Agent observability (agent_steps) --------------------------------------
+
+// addAgentStep persists one row of an agent run's tool-call trace. The
+// user-facing trace also rides on the assistant message (Message.Steps); this
+// table is the normalized, queryable store for per-run analytics.
+func (s *store) addAgentStep(jobID string, st agentStep) error {
+	preview := st.Preview
+	if len(preview) > 500 {
+		preview = preview[:500]
+	}
+	_, err := s.db.Exec(`INSERT INTO agent_steps(job_id, step, tool, args, result_preview, duration_ms, created_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?)`,
+		jobID, st.Step, st.Tool, st.Args, preview, st.DurationMs, time.Now().UnixMilli())
+	return err
+}
+
+// PersistAgentSteps writes all of a job's trace rows in one call (worker uses
+// this after a run finalizes).
+func (s *store) persistAgentSteps(jobID string, steps []agentStep) error {
+	for _, st := range steps {
+		if err := s.addAgentStep(jobID, st); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// --- Memory (notes) --------------------------------------------------------
+
+// getNote returns the value for a (email,key) note, or "" with ok=false if none.
+func (s *store) getNote(email, key string) (string, bool, error) {
+	var v string
+	err := s.db.QueryRow(`SELECT value FROM notes WHERE email = ? AND key = ?`, email, key).Scan(&v)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return v, true, nil
+}
+
+// setNote upserts a (email,key) note.
+func (s *store) setNote(email, key, value string) error {
+	id := s.newFolderID()
+	_, err := s.db.Exec(`INSERT INTO notes(id, email, key, value, updated_at) VALUES(?, ?, ?, ?, ?)
+		ON CONFLICT(email, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+		id, email, key, value, time.Now().UnixMilli())
+	return err
+}
+
+// listNoteKeys returns the distinct keys for a user, for the memory index
+// injected into the agent system prompt.
+func (s *store) listNoteKeys(email string) ([]string, error) {
+	rows, err := s.db.Query(`SELECT key FROM notes WHERE email = ? ORDER BY key ASC`, email)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+// --- Settings (global agent config) ----------------------------------------
+
+func (s *store) getSetting(key string) string {
+	var v string
+	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&v); err != nil {
+		return ""
+	}
+	return v
+}
+
+func (s *store) setSetting(key, value string) error {
+	_, err := s.db.Exec(`INSERT INTO settings(key, value) VALUES(?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value)
+	return err
+}
+
+// --- Per-conversation agent config -----------------------------------------
+
+// getConvAgentConfig returns the (system prompt, tool allowlist) override for a
+// conversation. Empty strings mean "no override"; the caller falls back to
+// global settings then built-in defaults.
+func (s *store) getConvAgentConfig(email, id string) (system, tools string, err error) {
+	var sys, t sql.NullString
+	err = s.db.QueryRow(`SELECT agent_system, agent_tools FROM conversations WHERE id = ? AND email = ?`, id, email).Scan(&sys, &t)
+	if err == sql.ErrNoRows {
+		return "", "", nil
+	}
+	if err != nil {
+		return "", "", err
+	}
+	return sys.String, t.String, nil
 }

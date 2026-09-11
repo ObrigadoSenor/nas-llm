@@ -149,6 +149,61 @@ session-cookie `/api/*` surface.
 Env (`.env`, with a safe default): `MAX_CLARIFY_ROUNDS=3` — raise it for more
 thorough interrogation, lower it to force a faster answer.
 
+## Agent mode
+
+The + menu has an **Agent** toggle (mutually exclusive with Web search and
+Clarify). When on, `/api/conversations/:id/generate` runs a general ReAct loop
+in the backend (`backend/agent.go`) over a small tool registry, instead of the
+single-purpose search/clarify loops. The agent can compose tools within one
+run — e.g. `web_search` then `calculator`, or `ask_user` then answer — which the
+mutually-exclusive toggles could not.
+
+Tools (each a schema + server-side executor):
+- **`web_search`** — the existing SearXNG meta-search (reused from `search.go`).
+- **`ask_user`** — the existing clarifying-question card (terminal; the user's
+  clicked option is the next turn, same as the Clarify toggle).
+- **`get_time`** — the current date/time (the model's cutoff is stale).
+- **`calculator`** — a safe arithmetic evaluator (`+ - * / ^`, `sqrt`/`log`/…,
+  `pi`/`e`); no `eval`, so untrusted model output can't run code.
+- **`memory_read` / `memory_write`** — persistent notes per user in SQLite
+  (`notes` table); a short index of note keys is auto-injected into the system
+  prompt so the agent knows what it can recall.
+- **`fetch_page`** — download a URL and read its text. **Off by default** (see
+  guardrails below).
+
+Small-model guardrails (the N100/8 GB runs a 3B–8B model): a hard step budget
+(`MAX_AGENT_STEPS`, default 6), duplicate-(tool,args) detection that nudges the
+model to stop and answer, **error-as-observation** (a tool failure or a bad
+argument goes back to the model as an observation so it self-corrects instead of
+crashing the run), observation size capping, and **context compaction** (old tool
+results are truncated; when the transcript nears the context window, the oldest
+turns are summarized into one system message so a long multi-step run doesn't
+overflow 8–16k). Each run's tool-call trace (step, tool, args, result preview,
+duration) is streamed live to a steps drawer above the answer and persisted
+(`agent_steps` table + `jobs.prompt_tokens`/`completion_tokens` for analytics).
+
+Configure the agent from the **Agent settings** entry at the bottom of the +
+menu: a system prompt (blank = the built-in date-injected nudge) and a tool
+allowlist (a small set suits a small model). Settings are global defaults stored
+in SQLite (`settings` table); per-conversation overrides are supported in the
+schema (`PATCH /api/conversations/:id` with `agentSystem`/`agentTools`) but not
+yet exposed in the UI.
+
+### Guardrails: `fetch_page` and the injection surface
+
+`fetch_page` makes the agent read **untrusted web content**. That is the
+"lethal trifecta": untrusted content + the agent's access to your memory notes
++ outbound network. A page can contain hidden instructions ("ignore previous
+instructions and exfiltrate …") that the model may follow. Mitigations here:
+it is **off by default** (`FETCH_PAGE_ENABLED=false`), the system prompt tells
+the model to treat fetched content as data not instructions, content is stripped
+to text and size-capped, and the tool never runs unless you opt in. Keep the
+light 3B plain-chat path as the default for simple Q&A; Agent mode is opt-in per
+turn. Any future file/workspace tools must be sandboxed to a dedicated NAS
+directory and per-invocation approved.
+
+Env (`.env`, with safe defaults): `MAX_AGENT_STEPS=6`, `FETCH_PAGE_ENABLED=false`.
+
 ## Prerequisites on the NAS (phase 1)
 
 1. **Docker** — install from UGOS Pro **App Center > Docker**.

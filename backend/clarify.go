@@ -119,7 +119,7 @@ func (s *server) runClarifyLoop(ctx context.Context, model string, msgs []oaiMes
 		Tools:    []oaiTool{askUserTool},
 	}
 
-	msg, err := s.streamOllamaChatWithTools(ctx, ollamaChatURL, &req, emit)
+	msg, _, err := s.streamOllamaChatWithTools(ctx, ollamaChatURL, &req, emit)
 	if err != nil {
 		return fmt.Errorf("clarify failed: %w", err)
 	}
