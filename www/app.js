@@ -1,6 +1,6 @@
 // nas-llm chat UI — app logic, split out of the old single-file index.html.
 // Imports UI helpers (icons, markdown rendering) from lib.js. No build step.
-import { icon, setIcon, renderMessage, escapeHtml, StreamRenderer, thinkingDots, renderSearchBlock, appendSearchEntry, showSearchPending, clearSearchPending, renderSourceLinks, appendSourceLinks, renderClarifyCard, renderAgentSteps, appendAgentStep } from './lib.js?v=24';
+import { icon, setIcon, renderMessage, escapeHtml, StreamRenderer, thinkingDots, renderSearchBlock, appendSearchEntry, showSearchPending, clearSearchPending, renderSourceLinks, appendSourceLinks, renderClarifyCard, renderAgentSteps, appendAgentStep, buildThoughtsWrap, renderThoughts, appendThought } from './lib.js?v=26';
 
 const $ = id => document.getElementById(id);
 const app=$("app"), loginView=$("login");
@@ -65,6 +65,43 @@ let draft = "";                        // in-progress text saved on first ArrowU
 let pendingImages = [];                // staged data URLs for the next send
 const visionModels = new Set();        // model names confirmed vision-capable
 const visionChecked = new Set();       // model names already queried via /info
+// Visitor's local Ollama models (localhost:11434), discovered from the
+// browser. NAMES persist to localStorage so a reload reattaches them in the
+// selector even before the re-probe finishes; rich info (size/details) is
+// kept in memory only. modelEntries merges server + local for the selector.
+let localModelNames = loadLocalModelNames();
+let localModels = [];                  // [{name,sizeGB,details}] from the last successful probe
+let modelEntries = [];                 // merged server+local entries driving the selector
+let lastServerModels = [];             // raw /api/models data, cached for re-merges after a probe
+let activeLocalAbort = null;           // AbortController for the in-flight localhost inference
+let localDiscoverMsg = null;           // last discovery error string (shown in the Local section)
+function loadLocalModelNames(){ try{ return JSON.parse(localStorage.getItem("nas-llm-local-models")||"[]")||[]; }catch{ return []; } }
+function saveLocalModelNames(){ localStorage.setItem("nas-llm-local-models", JSON.stringify(localModelNames)); }
+function isLocalModel(name){ return localModelNames.includes(name); }
+function hostLabel(h){ return {nas:"NAS",mac:"Mac"}[h]||h; }
+// Merge server models (from /api/models, carrying host/hostOnline) with the
+// local set. Dedupe by name: if a name is both local and on a server host,
+// keep the Local entry and drop the server duplicate. Ordered NAS, Mac, Local.
+function buildModelEntries(serverData, localNames){
+  const localSet=new Set(localNames);
+  const entries=[]; const seen=new Set();
+  for(const m of serverData){
+    const name=m.name||m.id; if(!name) continue;
+    if(localSet.has(name)) continue;        // local wins -> drop server duplicate
+    if(seen.has(name)) continue; seen.add(name);
+    entries.push({name, host:m.host||"nas", hostOnline:m.hostOnline!==false, local:false});
+  }
+  for(const n of localNames){ if(seen.has(n)) continue; seen.add(n); entries.push({name:n, host:"local", hostOnline:true, local:true}); }
+  const order={nas:0,mac:1,local:2};
+  entries.sort((a,b)=>(order[a.host]??9)-(order[b.host]??9)||a.name.localeCompare(b.name));
+  return entries;
+}
+function syncSelectedFromEntries(){
+  if(modelEntries.length && !models.includes(selectedModel)){
+    const onl=modelEntries.find(e=>e.hostOnline);
+    selectedModel = onl?onl.name:modelEntries[0].name;
+  }
+}
 
 function renderPills(){
   pills.innerHTML="";
@@ -200,6 +237,10 @@ function renderSend(){
 async function stopActive(){
   if(activeJobConvId !== activeId) return;
   send.disabled=true;
+  // For a local-model job, abort the in-flight localhost inference immediately
+  // so Stop is responsive — don't wait for the SSE "done" round-trip. The
+  // backend /cancel still finalizes the connection-bound job.
+  if(activeLocalAbort){ activeLocalAbort.abort(); activeLocalAbort=null; }
   try{ await fetch("/api/conversations/"+encodeURIComponent(activeId)+"/cancel",{method:"POST"}); }catch{}
   // The SSE "done" event from the cancelled job finalizes the UI; if it never
   // arrives (e.g. the job already finished), fall back after a short delay.
@@ -259,6 +300,7 @@ async function showApp(){
   loginView.classList.add("hidden"); app.classList.remove("hidden");
   whoEmail.textContent=me.email;
   await loadModels();
+  reattachLocalModels();          // re-probe localhost so a reload reattaches
   await loadConversations();
   await loadActiveJobs();
   if(conversations.length) await openConversation(conversations[0].id);
@@ -297,16 +339,57 @@ async function loadModels(){
   try{
     const r=await fetchRetry("/api/models",{},{label:"Load models"});
     const j=await r.json();
-    models=(j.data||[]).map(m=>m.id);
-    if(models.length && !models.includes(selectedModel)) selectedModel=models[0];
+    lastServerModels=j.data||[];
+    modelEntries=buildModelEntries(lastServerModels, localModelNames);
+    models=modelEntries.map(e=>e.name);
+    syncSelectedFromEntries();
     renderModels();
     syncVision();
   }catch(e){ renderModels(); modelSel.title=String(e.message||e); }
 }
+// Re-probe localhost on boot/showApp so a reload reattaches the visitor's
+// local Ollama models without making them click Connect again. Silent on
+// failure: the persisted name list still seeds the selector, and no error is
+// surfaced (the user didn't ask to connect this session).
+async function reattachLocalModels(){
+  const res=await discoverLocalModels();
+  if(res.ok){ localModels=res.models; localModelNames=res.models.map(m=>m.name); saveLocalModelNames(); }
+  modelEntries=buildModelEntries(lastServerModels, localModelNames);
+  models=modelEntries.map(e=>e.name);
+  syncSelectedFromEntries();
+  renderModels();
+  if($("modelsModal").classList.contains("open") && modelsTab==="installed") renderInstalledTab();
+}
+// Discover the visitor's local Ollama (localhost:11434). An HTTPS page makes
+// the fetch trigger Chrome's Local Network Access prompt (the "accept" UX).
+// 403 = Ollama is running but rejected the cross-origin request (needs
+// OLLAMA_ORIGINS); a throw = nothing is listening on 11434.
+async function discoverLocalModels(){
+  let r;
+  try{ r=await fetch("http://localhost:11434/api/tags"); }
+  catch{ return {ok:false, kind:"refused"}; }
+  if(r.status===403) return {ok:false, kind:"origins"};
+  if(!r.ok) return {ok:false, kind:"http", status:r.status};
+  let j; try{ j=await r.json(); }catch{ return {ok:false, kind:"http", status:r.status}; }
+  const mods=(j.models||[]).map(m=>({name:m.name, sizeGB:m.size?m.size/1e9:0, details:m.details||{}}));
+  return {ok:true, models:mods};
+}
 function renderModels(){
   modelSel.innerHTML="";
-  models.forEach(m=>{ const o=document.createElement("option"); o.value=o.textContent=m; modelSel.appendChild(o); });
-  if(models.length) modelSel.value=selectedModel;
+  const groups={};
+  for(const e of modelEntries){ (groups[e.host]=groups[e.host]||[]).push(e); }
+  const labels={nas:"NAS", mac:"Mac", local:"Local (this computer)"};
+  for(const h of ["nas","mac","local"]){
+    const arr=groups[h]; if(!arr||!arr.length) continue;
+    const og=document.createElement("optgroup"); og.label=labels[h]||h;
+    for(const e of arr){
+      const o=document.createElement("option"); o.value=o.textContent=e.name;
+      if(!e.hostOnline) o.disabled=true;       // grey out offline-host models
+      og.appendChild(o);
+    }
+    modelSel.appendChild(og);
+  }
+  if(modelEntries.length) modelSel.value=selectedModel;
 }
 modelSel.addEventListener("change", ()=>{
   selectedModel=modelSel.value;
@@ -560,7 +643,7 @@ async function syncGenerating(){
   if(!same) renderSidebar();
 }
 
-function closeTail(){ if(activeES){ activeES.close(); activeES=null; } }
+function closeTail(){ if(activeLocalAbort){ activeLocalAbort.abort(); activeLocalAbort=null; } if(activeES){ activeES.close(); activeES=null; } }
 
 // If the conversation has an active background job, render its partial content
 // and reopen the SSE tail so switching back resumes live.
@@ -581,8 +664,87 @@ async function resumeIfGenerating(id){
   generatingIds.add(id); renderSidebar();
   activeJobConvId=id; renderSend();
   const hasQ = !!(job.questions && job.questions.questions && job.questions.questions.length);
-  const {bubble, searchWrap, srcLinks, stepsWrap}=addMsg("assistant", hasQ ? "" : (job.content||""), job.createdAt||Date.now(), job.searches||null, null, job.questions||null, false, job.steps||null);
-  tailJob(id, bubble, hasQ ? "" : (job.content||""), searchWrap, srcLinks, job.questions||null, stepsWrap, job.steps||null);
+  const {bubble, searchWrap, srcLinks, stepsWrap, thoughtsWrap, thoughtsDet}=addMsg("assistant", hasQ ? "" : (job.content||""), job.createdAt||Date.now(), job.searches||null, null, job.questions||null, false, job.steps||null, job.thoughts||null);
+  // A finished/reloaded agent turn collapses its thinking (it's done).
+  if(thoughtsDet && (!job.thoughts || !job.thoughts.length)) thoughtsDet.open = false;
+  tailJob(id, bubble, hasQ ? "" : (job.content||""), searchWrap, srcLinks, job.questions||null, stepsWrap, job.steps||null, thoughtsWrap, thoughtsDet, job.thoughts||null);
+}
+
+// --- Local-model relay (browser -> visitor's Ollama, results back to NAS) ---
+// On a `modelCall` SSE event the backend hands the browser the OpenAI
+// chat-completions payload it would have sent to a server Ollama. The browser
+// streams it to the visitor's localhost Ollama, paints content into the answer
+// bubble via the same StreamRenderer as server-model chunks, then POSTs the
+// assembled {content, tool_calls} back so the backend can continue the tool
+// loop (web_search/clarify/agent) or finalize. `tools` is null for plain chat.
+function localFetchErrMsg(){
+  return "No Ollama found on this computer — install/start Ollama.";
+}
+function localStatusErrMsg(status){
+  if(status===403) return "Your local Ollama rejected the request — start it with OLLAMA_ORIGINS=https://chat.selected.systems ollama serve (or OLLAMA_ORIGINS=*).";
+  return "Local Ollama returned HTTP "+status+".";
+}
+async function postModelResponse(convId, jobId, content, toolCalls, error){
+  try{
+    const payload = error ? { jobId, error } : { jobId, content, tool_calls: toolCalls||null };
+    await fetch("/api/conversations/"+encodeURIComponent(convId)+"/model-response",{
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(payload)
+    });
+  }catch{}
+}
+// Drive one local-model inference round. Streams content into the renderer as
+// it arrives (the bubble updates live), assembles fragmented tool_calls by
+// index, and returns {content, toolCalls}. On a fetch/HTTP failure it shows
+// the contract error message in the bubble via bubbleError and POSTs
+// {jobId, error} so the backend finalizes the connection-bound job as an
+// error (the message survives the done/reload) instead of an empty success;
+// returns null.
+async function relayLocalModelCall(convId, call, renderer, bubble, signal){
+  const body={ model:call.model, messages:call.messages, stream:true };
+  if(call.tools && call.tools.length) body.tools=call.tools;
+  let resp;
+  try{ resp=await fetch("http://localhost:11434/v1/chat/completions",{ method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body), signal }); }
+  catch(e){ if(signal.aborted) return null; const msg=localFetchErrMsg(); bubbleError(bubble, msg); postModelResponse(convId, call.jobId, null, null, msg); return null; }
+  if(!resp.ok){ const msg=localStatusErrMsg(resp.status); bubbleError(bubble, msg); postModelResponse(convId, call.jobId, null, null, msg); return null; }
+  let content=""; const toolsByIndex=new Map();
+  const reader=resp.body.getReader(); const dec=new TextDecoder(); let buf=""; let finished=false;
+  try{
+    while(!finished){
+      const {done, value}=await reader.read();
+      if(done) break;
+      buf+=dec.decode(value,{stream:true});
+      let idx;
+      while((idx=buf.indexOf("\n"))>=0){
+        const line=buf.slice(0,idx).trim(); buf=buf.slice(idx+1);
+        if(!line.startsWith("data:")) continue;
+        const data=line.slice(5).trim();
+        if(data==="[DONE]"){ finished=true; break; }
+        let j; try{ j=JSON.parse(data); }catch{ continue; }
+        const delta=j.choices && j.choices[0] && j.choices[0].delta;
+        if(!delta) continue;
+        if(delta.content){ content+=delta.content; renderer.append(delta.content); }
+        if(delta.tool_calls){
+          for(const tc of delta.tool_calls){
+            const i=tc.index??0;
+            let cur=toolsByIndex.get(i);
+            if(!cur){ cur={id:tc.id||null, type:tc.type||"function", function:{name:"", arguments:""}}; toolsByIndex.set(i,cur); }
+            if(tc.id) cur.id=tc.id;
+            if(tc.type) cur.type=tc.type;
+            if(tc.function){ if(tc.function.name) cur.function.name+=tc.function.name; if(tc.function.arguments) cur.function.arguments+=tc.function.arguments; }
+          }
+        }
+      }
+    }
+  }catch(e){
+    // Intentional abort (Stop / done / closeTail): bail without posting — the
+    // backend's connection-bound job is finalized by the SSE done/cancel path.
+    if(signal.aborted) return null;
+    // Mid-stream network drop: fall through and return whatever streamed so
+    // far so the backend gets partial content instead of hanging.
+  }
+  const toolCalls=toolsByIndex.size?[...toolsByIndex.entries()].sort((a,b)=>a[0]-b[0]).map(([,v])=>v):null;
+  return { content, toolCalls };
 }
 
 // tailJob opens an EventSource to /events and renders into bubble via a
@@ -592,7 +754,7 @@ async function resumeIfGenerating(id){
 // bubble to a clickable option card and suspends the renderer so a queued
 // flush can't wipe it. "done" reloads the conversation from the server
 // (source of truth — the assistant reply is persisted there).
-function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarify, stepsWrap, initialSteps){
+function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarify, stepsWrap, initialSteps, thoughtsWrap, thoughtsDet, initialThoughts){
   closeTail();
   const renderer = new StreamRenderer(bubble);
   const onAnswer=(value)=>sendClarifyAnswer(value, bubble);
@@ -605,6 +767,7 @@ function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarif
     renderer.set(initialAcc);
   }
   if(initialSteps && stepsWrap) renderAgentSteps(stepsWrap, initialSteps);
+  if(initialThoughts && thoughtsWrap) renderThoughts(thoughtsWrap, initialThoughts);
   let esClosed=false;
   activeJobConvId=convId;
   const es=new EventSource("/api/conversations/"+encodeURIComponent(convId)+"/events");
@@ -615,6 +778,32 @@ function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarif
   es.addEventListener("questions", e=>{ let q=null; try{ q=JSON.parse(e.data); }catch{} renderer.suspend(); renderClarifyCard(bubble, q, false, onAnswer); });
   es.addEventListener("steps", e=>{ let arr=[]; try{ arr=JSON.parse(e.data)||[]; }catch{} renderAgentSteps(stepsWrap, arr); });
   es.addEventListener("tool", e=>{ let st=null; try{ st=JSON.parse(e.data); }catch{} appendAgentStep(stepsWrap, st); });
+  es.addEventListener("thoughts", e=>{ let arr=[]; try{ arr=JSON.parse(e.data)||[]; }catch{} renderThoughts(thoughtsWrap, arr); });
+  es.addEventListener("thought", e=>{ let t=""; try{ t=JSON.parse(e.data); }catch{} appendThought(thoughtsWrap, t); });
+  es.addEventListener("clear", ()=>{ renderer.set(""); });
+  // Local-model relay: the backend needs the visitor's Ollama to infer. Stream
+  // the response into the bubble as it arrives, then POST the assembled result
+  // back. The existing thoughts/clear handlers tolerate this ordering (a
+  // thinking round's content streams first, then thoughts + clear arrive and
+  // move the text to the thinking drawer / wipe the bubble).
+  es.addEventListener("modelCall", async e=>{
+    let d={}; try{ d=JSON.parse(e.data); }catch{ return; }
+    if(!d.jobId || !d.model) return;
+    const ctrl=new AbortController(); activeLocalAbort=ctrl;
+    try{
+      const res=await relayLocalModelCall(convId, d, renderer, bubble, ctrl.signal);
+      if(res===null) return;                  // fetch failed or aborted: error shown / nothing to post
+      await postModelResponse(convId, d.jobId, res.content, res.toolCalls);
+    }catch(err){
+      // Unexpected throw relayLocalModelCall didn't handle: finalize as an
+      // error so the backend's connection-bound job doesn't hang.
+      if(ctrl.signal.aborted) return;
+      bubbleError(bubble, localFetchErrMsg());
+      postModelResponse(convId, d.jobId, null, null, localFetchErrMsg());
+    }finally{
+      if(activeLocalAbort===ctrl) activeLocalAbort=null;
+    }
+  });
   es.addEventListener("phase", e=>{
     const p=e.data;
     renderer.setPhase(p);
@@ -623,13 +812,14 @@ function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarif
     else if(p==="answering") clearSearchPending(searchWrap);
   });
   es.addEventListener("chunk", e=>{ let d=""; try{ d=JSON.parse(e.data); }catch{} renderer.append(d); });
-  es.addEventListener("done", ()=>{ esClosed=true; es.close(); activeES=null; onGenerationDone(convId); });
+  es.addEventListener("done", ()=>{ esClosed=true; if(activeLocalAbort){ activeLocalAbort.abort(); activeLocalAbort=null; } es.close(); activeES=null; if(thoughtsDet) thoughtsDet.open=false; onGenerationDone(convId); });
   es.addEventListener("joberror", e=>{
-    esClosed=true; es.close(); activeES=null;
+    esClosed=true; if(activeLocalAbort){ activeLocalAbort.abort(); activeLocalAbort=null; } es.close(); activeES=null;
     let msg=e.data; try{ msg=JSON.parse(e.data); }catch{}
     const acc = renderer.acc;
     if(acc) renderer.finalize(acc);
     else bubbleError(bubble, msg);
+    if(thoughtsDet) thoughtsDet.open=false; // collapse thinking on terminal
     generatingIds.delete(convId); renderSidebar();
     activeJobConvId=null; renderSend(); input.focus();
   });
@@ -692,7 +882,7 @@ function bubbleError(bubble, msg){
   bubble.appendChild(s);
 }
 
-function addMsg(role, text, ts, searches, images, clarify, answered, steps){
+function addMsg(role, text, ts, searches, images, clarify, answered, steps, thoughts){
   const d=document.createElement("div"); d.className="msg "+role;
   if(role==="user"){
     // Questions: text + any attached images — no header, right-aligned.
@@ -706,13 +896,18 @@ function addMsg(role, text, ts, searches, images, clarify, answered, steps){
     d.appendChild(b);
     chat.appendChild(d);
     chat.scrollTop=chat.scrollHeight;
-    return {bubble:b, searchWrap:null, srcLinks:null, stepsWrap:null};
+    return {bubble:b, searchWrap:null, srcLinks:null, stepsWrap:null, thoughtsWrap:null, thoughtsDet:null};
   }
-  // Answers: agent tool-call trace (steps drawer) and search evidence (readable
-  // snippets) above the answer, then a meta row (date/time + source-link chips +
-  // copy icon) below. Left-aligned. The steps + search wraps live outside the
-  // StreamRenderer's container so streaming re-parses never wipe them; srcLinks
-  // is filled from searches or during stream.
+  // Answers: agent thinking (per-round reasoning, collapsible) and tool-call
+  // trace (steps drawer) above the answer, then search evidence (readable
+  // snippets), then the answer bubble, then a meta row (date/time + source-link
+  // chips + copy icon) below. Left-aligned. The thinking/steps/search wraps
+  // live outside the StreamRenderer's container so streaming re-parses never
+  // wipe them; srcLinks is filled from searches or during stream.
+  const { wrap: thoughtsWrap, det: thoughtsDet } = buildThoughtsWrap();
+  if(thoughts && thoughts.length) renderThoughts(thoughtsWrap, thoughts);
+  else thoughtsWrap.classList.add("hidden");
+  d.appendChild(thoughtsWrap);
   let stepsWrap=document.createElement("div"); stepsWrap.className="msg-steps";
   if(steps && steps.length) renderAgentSteps(stepsWrap, steps);
   else stepsWrap.classList.add("hidden");
@@ -742,7 +937,7 @@ function addMsg(role, text, ts, searches, images, clarify, answered, steps){
   d.appendChild(meta);
   chat.appendChild(d);
   chat.scrollTop=chat.scrollHeight;
-  return {bubble:b, searchWrap, srcLinks, stepsWrap};
+  return {bubble:b, searchWrap, srcLinks, stepsWrap, thoughtsWrap, thoughtsDet};
 }
 function addCopyMsg(roleRow, text){
   const btn=document.createElement("button"); btn.type="button";
@@ -763,7 +958,7 @@ function rerenderChat(){
     // A clarifying question is "answered" once a user turn follows it, so on a
     // reload we render its option buttons disabled.
     const answered = m.role==="assistant" && !!m.clarify && i<messages.length-1 && messages[i+1] && messages[i+1].role==="user";
-    addMsg(m.role, m.content, m.ts, m.search ? m.search.searches : null, m.images||null, m.clarify||null, answered, m.steps||null);
+    addMsg(m.role, m.content, m.ts, m.search ? m.search.searches : null, m.images||null, m.clarify||null, answered, m.steps||null, m.thoughts||null);
   });
 }
 function updateHeader(){
@@ -805,7 +1000,7 @@ async function stream(){
   if(!activeId) return;
 
   const aTs=Date.now();
-  const {bubble, searchWrap, srcLinks, stepsWrap}=addMsg("assistant","",aTs);
+  const {bubble, searchWrap, srcLinks, stepsWrap, thoughtsWrap, thoughtsDet}=addMsg("assistant","",aTs);
   send.disabled=true;
   generatingIds.add(activeId); renderSidebar();
   activeJobConvId=activeId;
@@ -820,7 +1015,7 @@ async function stream(){
       const r=await fetch("/api/conversations/"+encodeURIComponent(activeId)+"/generate",{
         method:"POST",
         headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({model:selectedModel, messages, web_search:webSearchOn(), clarify:clarifyOn(), agent:agentOn()})
+        body:JSON.stringify({model:selectedModel, messages, web_search:webSearchOn(), clarify:clarifyOn(), agent:agentOn(), local:isLocalModel(selectedModel)})
       });
       if(r.ok || r.status===409){ job=await r.json(); break; }
       genErr=new Error("HTTP "+r.status);
@@ -843,7 +1038,7 @@ async function stream(){
 
   // Tail the job. Generation keeps running on the NAS even if the user switches
   // chats; "done" reloads this conversation from the server (source of truth).
-  tailJob(activeId, bubble, job.content||"", searchWrap, srcLinks, null, stepsWrap, null);
+  tailJob(activeId, bubble, job.content||"", searchWrap, srcLinks, null, stepsWrap, null, thoughtsWrap, thoughtsDet, null);
   renderSend();
 }
 
@@ -960,14 +1155,80 @@ async function renderInstalledTab(){
   try{ const r=await fetchRetry("/api/models",{},{label:"Load models"}); data=await r.json(); }
   catch(e){ body.appendChild(mutedNote("Could not load models: "+errText(e))); await resumePullIfActive(); return; }
   const list=data.data||[];
-  models=list.map(m=>m.id); renderModels();           // keep the header selector in sync
-  if(!list.length){ body.appendChild(mutedNote("No models installed yet. Go to Browse to download one.")); }
-  else list.forEach(m=>body.appendChild(renderInstalledCard(m)));
+  lastServerModels=list;
+  // Local (this computer) section sits above the server card list. It shows
+  // the visitor's own Ollama models, distinct from NAS/Mac server models.
+  body.appendChild(renderLocalSection());
+  modelEntries=buildModelEntries(list, localModelNames);
+  models=modelEntries.map(e=>e.name);
+  syncSelectedFromEntries();
+  renderModels();                                   // keep the header selector in sync
+  if(!list.length){
+    if(!localModelNames.length) body.appendChild(mutedNote("No models installed yet. Go to Browse to download one."));
+  } else list.forEach(m=>body.appendChild(renderInstalledCard(m)));
   await resumePullIfActive();
+}
+// The Local section: a heading + "Connect local models" button, then either
+// the discovered model cards, a hint (nothing connected yet), or the last
+// discovery error (403/refused) rendered verbatim per the relay contract.
+function renderLocalSection(){
+  const sec=document.createElement("div"); sec.className="local-section";
+  const head=document.createElement("div"); head.className="local-head";
+  const label=document.createElement("div"); label.className="local-label"; label.textContent="Local (this computer)";
+  const connect=document.createElement("button"); connect.type="button"; connect.className="local-connect";
+  connect.innerHTML=icon("boxes",15)+'<span>Connect local models</span>';
+  connect.addEventListener("click", onConnectLocal);
+  head.appendChild(label); head.appendChild(connect); sec.appendChild(head);
+  if(localDiscoverMsg){
+    const err=document.createElement("div"); err.className="err-note local-err"; err.textContent=localDiscoverMsg;
+    sec.appendChild(err);
+  }
+  const known=localModels.length?localModels:localModelNames.map(n=>({name:n}));
+  if(known.length){
+    known.forEach(m=>sec.appendChild(renderLocalCard(m)));
+  } else if(!localDiscoverMsg){
+    const hint=document.createElement("div"); hint.className="muted local-hint";
+    hint.textContent="Connect to Ollama on this computer (localhost:11434) to use your own models here — full feature parity with server models.";
+    sec.appendChild(hint);
+  }
+  return sec;
+}
+// A local model card: name + size/details (if known) + a Use button. We can't
+// remove or benchmark the visitor's models, so no Remove/Benchmark actions.
+function renderLocalCard(m){
+  const card=document.createElement("div"); card.className="mcard local-card";
+  const head=document.createElement("div"); head.className="mcard-head";
+  const title=document.createElement("div"); title.className="mcard-title"; title.textContent=m.name;
+  const sub=document.createElement("div"); sub.className="mcard-sub";
+  const d=m.details||{}; const bits=[d.parameter_size, d.quantization_level, d.family].filter(Boolean);
+  if(m.sizeGB) bits.push(m.sizeGB.toFixed(1)+" GB");
+  sub.textContent=bits.join(" · ");
+  head.appendChild(title); head.appendChild(sub); card.appendChild(head);
+  const actions=document.createElement("div"); actions.className="mcard-actions";
+  const use=document.createElement("button"); use.textContent="Use"; use.addEventListener("click",()=>useModel(m.name));
+  actions.appendChild(use); card.appendChild(actions);
+  return card;
+}
+async function onConnectLocal(){
+  localDiscoverMsg=null;
+  const res=await discoverLocalModels();
+  if(res.ok){ localModels=res.models; localModelNames=res.models.map(m=>m.name); saveLocalModelNames(); }
+  else {
+    localModels=[];
+    if(res.kind==="origins") localDiscoverMsg="Your local Ollama rejected the request — start it with OLLAMA_ORIGINS=https://chat.selected.systems ollama serve (or OLLAMA_ORIGINS=*).";
+    else if(res.kind==="refused") localDiscoverMsg="No Ollama found on this computer — install/start Ollama.";
+    else localDiscoverMsg="Local Ollama returned HTTP "+(res.status||"?")+".";
+  }
+  modelEntries=buildModelEntries(lastServerModels, localModelNames);
+  models=modelEntries.map(e=>e.name);
+  syncSelectedFromEntries();
+  renderModels();
+  await renderInstalledTab();
 }
 
 function renderInstalledCard(m){
   const card=document.createElement("div"); card.className="mcard";
+  if(m.hostOnline===false) card.classList.add("offline");
   const d=m.details||{};
   const head=document.createElement("div"); head.className="mcard-head";
   const title=document.createElement("div"); title.className="mcard-title"; title.textContent=m.name;
@@ -978,6 +1239,8 @@ function renderInstalledCard(m){
   head.appendChild(title); head.appendChild(sub); card.appendChild(head);
 
   const meta=document.createElement("div"); meta.className="mcard-meta";
+  if(m.host) meta.appendChild(badge(hostLabel(m.host), "host"));
+  if(m.hostOnline===false) meta.appendChild(badge("offline", "fit-bad"));
   if(m.benchmark && m.benchmark.tokPerSec>0){
     meta.appendChild(badge(`${m.benchmark.tokPerSec.toFixed(1)} tok/s (measured)`, "speed-fast"));
     const s=document.createElement("span"); s.className="muted bench-sub";
@@ -995,6 +1258,7 @@ function renderInstalledCard(m){
   const rm=document.createElement("button"); rm.textContent="Remove"; rm.className="danger";
   rm.addEventListener("click",()=>confirmRemoveModel(m.name, card));
   if(activeId && generatingIds.has(activeId) && selectedModel===m.name) rm.disabled=true;
+  if(m.hostOnline===false){ use.disabled=true; bench.disabled=true; }  // can't run on an offline host
   actions.appendChild(use); actions.appendChild(bench); actions.appendChild(det); actions.appendChild(rm);
   card.appendChild(actions);
   return card;

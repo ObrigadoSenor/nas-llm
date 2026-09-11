@@ -105,21 +105,18 @@ func clarifyNudge() oaiMessage {
 			"Do not call ask_user if the request is already clear enough to answer.")}
 }
 
-// runClarifyLoop streams one tool-calling pass with the ask_user tool. If the
+// runClarifyLoop runs one tool-calling pass with the ask_user tool. If the
 // model calls ask_user, it stashes the parsed questions on the job (via
 // emitQuestions) and returns nil — the worker then persists a clarifying turn.
 // If the model answers directly (no tool call), the streamed content is the
-// answer and the worker persists a normal assistant message.
-func (s *server) runClarifyLoop(ctx context.Context, target, model string, msgs []oaiMessage, emit func(string), emitPhase func(string), emitQuestions func(clarifyMeta)) error {
+// answer and the worker persists a normal assistant message. The modelBackend
+// performs the inference round (a direct server dial, or a browser relay for a
+// local model).
+func (s *server) runClarifyLoop(ctx context.Context, mb modelBackend, model string, msgs []oaiMessage, emit func(string), emitPhase func(string), emitQuestions func(clarifyMeta)) error {
 	emitPhase("clarifying")
-	ollamaChatURL := target
-	req := chatRequest{
-		Model:    model,
-		Messages: append([]oaiMessage{clarifyNudge()}, msgs...),
-		Tools:    []oaiTool{askUserTool},
-	}
+	messages := append([]oaiMessage{clarifyNudge()}, msgs...)
 
-	msg, _, err := s.streamOllamaChatWithTools(ctx, ollamaChatURL, &req, emit)
+	msg, _, err := mb.Call(ctx, model, messages, []oaiTool{askUserTool})
 	if err != nil {
 		return fmt.Errorf("clarify failed: %w", err)
 	}

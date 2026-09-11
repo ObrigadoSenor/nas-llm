@@ -248,8 +248,10 @@ func TestRunStreamPass_RoutesToTargetHost(t *testing.T) {
 	var got strings.Builder
 	emit := func(s string) { got.WriteString(s) }
 
-	// NAS model → NAS chat endpoint.
-	if err := srv.runStreamPass(context.Background(), hosts[0].chatURL(), "llama3.2:3b",
+	// NAS model → NAS chat endpoint. The backend dials the resolved host's chat
+	// URL and streams content live through emit.
+	mb := &directOllama{chatURL: hosts[0].chatURL(), emit: emit}
+	if err := srv.runStreamPass(context.Background(), mb, "llama3.2:3b",
 		[]oaiMessage{{Role: "user", Content: jsonString("hi")}}, emit); err != nil {
 		t.Fatalf("runStreamPass nas: %v", err)
 	}
@@ -265,7 +267,8 @@ func TestRunStreamPass_RoutesToTargetHost(t *testing.T) {
 
 	// Mac model → Mac chat endpoint.
 	got.Reset()
-	if err := srv.runStreamPass(context.Background(), hosts[1].chatURL(), "mistral:7b",
+	mb = &directOllama{chatURL: hosts[1].chatURL(), emit: emit}
+	if err := srv.runStreamPass(context.Background(), mb, "mistral:7b",
 		[]oaiMessage{{Role: "user", Content: jsonString("hi")}}, emit); err != nil {
 		t.Fatalf("runStreamPass mac: %v", err)
 	}

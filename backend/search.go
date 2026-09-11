@@ -133,27 +133,26 @@ func jsonString(s string) json.RawMessage {
 
 // runSearchLoop runs the web_search tool-calling loop and emits the final
 // answer through emit. It is detached from any HTTP response: the caller
-// (job worker or handleChatWithSearch) wires emit to its output sink.
+// (job worker or handleChatWithSearch) wires emit to its output sink and
+// supplies the modelBackend that performs each inference round (a direct dial
+// to a server Ollama, or a browser relay for a local model).
 // emitPhase("searching"/"answering") is a hint the UI can use; emitSearch fires
 // once per real search (query + source URLs) so the UI can prove a lookup ran,
 // or a Skipped entry when the model answers without ever calling the tool.
 // Returns nil on success, an error otherwise.
-func (s *server) runSearchLoop(ctx context.Context, target, model string, msgs []oaiMessage, emit func(string), emitPhase func(string), emitSearch func(searchEntry)) error {
+func (s *server) runSearchLoop(ctx context.Context, mb modelBackend, model string, msgs []oaiMessage, emit func(string), emitPhase func(string), emitSearch func(searchEntry)) error {
 	emitPhase("searching")
-	ollamaChatURL := target
-	req := chatRequest{
-		Model:    model,
-		Messages: append([]oaiMessage{systemNudge()}, msgs...),
-		Tools:    []oaiTool{webSearchTool},
-	}
+	messages := append([]oaiMessage{systemNudge()}, msgs...)
+	tools := []oaiTool{webSearchTool}
 
 	searched := false
 	for round := 0; round < s.cfg.maxSearchRounds; round++ {
-		// Stream the tool-calling pass so any content the model produces before
-		// deciding to search (or instead of searching) reaches the UI live,
-		// rather than after a blocking non-streaming round-trip. tool_call
-		// deltas are accumulated into one assistant message for the next round.
-		msg, _, err := s.streamOllamaChatWithTools(ctx, ollamaChatURL, &req, emit)
+		// One tool-calling round. For a server backend, any preamble the model
+		// produces before deciding to search (or instead of searching) streams
+		// live to the UI; tool_calls are accumulated into the returned assistant
+		// message for the next round. For a browser relay, the browser streams
+		// the preamble directly and Call returns the assembled text + tool_calls.
+		msg, _, err := mb.Call(ctx, model, messages, tools)
 		if err != nil {
 			return fmt.Errorf("search failed: %w", err)
 		}
@@ -163,7 +162,7 @@ func (s *server) runSearchLoop(ctx context.Context, target, model string, msgs [
 			// any live "searching" indicator and a reconnect replays the right
 			// phase (not a stale "searching:…").
 			emitPhase("answering")
-			if len(msg.Content) == 0 {
+			if contentText(msg.Content) == "" {
 				emit("(no response)")
 			}
 			if !searched {
@@ -176,7 +175,7 @@ func (s *server) runSearchLoop(ctx context.Context, target, model string, msgs [
 		// Echo the assistant tool_calls, then append tool results. Searches in a
 		// single round run concurrently (ordered results preserve the API's
 		// tool_call_id alignment); the query is echoed to the UI as it fires.
-		req.Messages = append(req.Messages, msg)
+		messages = append(messages, msg)
 		type searchOut struct {
 			snippet string
 			hits    []searchSource
@@ -215,7 +214,7 @@ func (s *server) runSearchLoop(ctx context.Context, target, model string, msgs [
 			if tc.Function.Name == "web_search" && queries[i] != "" {
 				emitSearch(searchEntry{Query: queries[i], Sources: results[i].hits})
 			}
-			req.Messages = append(req.Messages, oaiMessage{
+			messages = append(messages, oaiMessage{
 				Role:       "tool",
 				ToolCallID: tc.ID,
 				Name:       tc.Function.Name,
@@ -225,10 +224,12 @@ func (s *server) runSearchLoop(ctx context.Context, target, model string, msgs [
 	}
 
 	// Round limit exhausted (the model kept wanting to search): force one final
-	// streamed answer with the tools removed so it must synthesize.
-	req.Tools = nil
+	// answer with the tools removed so it must synthesize. Routed through the
+	// backend so a server backend streams it live and a browser relay has the
+	// browser stream it from localhost.
 	emitPhase("answering")
-	return s.streamFromOllama(ctx, ollamaChatURL, &req, emit)
+	_, _, err := mb.Call(ctx, model, messages, nil)
+	return err
 }
 
 // streamOllamaChatWithTools POSTs a streaming chat completion, pipes content
@@ -246,7 +247,7 @@ func (s *server) runSearchLoop(ctx context.Context, target, model string, msgs [
 // a new id starts a new call, a delta with no id is a continuation fragment of
 // the previous call. Keying on id presence (rather than index) stays correct
 // even when Ollama emits index:0 for every call in a multi-call response.
-func (s *server) streamOllamaChatWithTools(ctx context.Context, target string, req *chatRequest, emit func(string)) (oaiMessage, agentUsage, error) {
+func streamOllamaChatWithTools(ctx context.Context, target string, req *chatRequest, emit func(string)) (oaiMessage, agentUsage, error) {
 	req.Stream = true
 	payload, err := json.Marshal(req)
 	if err != nil {
@@ -513,7 +514,10 @@ func (s *server) handleChatWithSearch(w http.ResponseWriter, r *http.Request, bo
 	ctx, cancel := context.WithTimeout(r.Context(), searchCallTimeout)
 	defer cancel()
 
-	err := s.runSearchLoop(ctx, chatURL, req.Model, req.Messages, emit, emitPhase, func(searchEntry) {})
+	// The legacy /api/chat/completions web_search path is always server-side
+	// (local models go through /generate), so drive the resolved host directly.
+	mb := &directOllama{chatURL: chatURL, emit: emit}
+	err := s.runSearchLoop(ctx, mb, req.Model, req.Messages, emit, emitPhase, func(searchEntry) {})
 	close(stop)
 	wg.Wait()
 

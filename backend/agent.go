@@ -285,15 +285,17 @@ func agentSystemNudge() string {
 }
 
 // runAgentLoop drives a bounded ReAct loop over the given tool allowlist. The
-// model's text is streamed via emit; each tool call is executed and emitted as
+// model's text is streamed via emit (for a server backend) or by the browser
+// directly (for a relay); each tool call is executed server-side and emitted as
 // a trace step (emitTool), with its observation fed back as a tool message
 // (error-as-observation: a tool failure becomes the observation text so the
 // model can self-correct). ask_user is terminal. The loop stops on: the model
 // answering with no tool call, a terminal tool, the step budget, or repeated
-// identical calls. On step-budget exhaustion it forces one final streamed
-// answer with the tools removed so the model must synthesize.
-func (s *server) runAgentLoop(ctx context.Context, target, model, email string, msgs []oaiMessage, allow []string, systemPrompt string,
-	emit func(string), emitPhase func(string), emitTool func(agentStep), emitQuestions func(clarifyMeta), addUsage func(int, int)) error {
+// identical calls. On step-budget exhaustion it forces one final answer with
+// the tools removed so the model must synthesize.
+func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email string, msgs []oaiMessage, allow []string, systemPrompt string,
+	emit func(string), emitPhase func(string), emitTool func(agentStep), emitQuestions func(clarifyMeta),
+	emitThought func(string), emitClear func(), addUsage func(int, int)) error {
 	emitPhase("agent")
 	reg := s.toolRegistry(email)
 	tools := make([]oaiTool, 0, len(allow))
@@ -305,49 +307,62 @@ func (s *server) runAgentLoop(ctx context.Context, target, model, email string, 
 	if len(tools) == 0 {
 		// No tools enabled: degenerate to a plain streamed pass.
 		emitPhase("answering")
-		return s.runStreamPass(ctx, target, model, msgs, emit)
+		return s.runStreamPass(ctx, mb, model, msgs, emit)
 	}
-	ollamaChatURL := target
 	sys := systemPrompt
 	if strings.TrimSpace(sys) == "" {
 		sys = agentSystemNudge()
 	}
-	req := chatRequest{
-		Model:    model,
-		Messages: append([]oaiMessage{{Role: "system", Content: jsonString(sys)}}, msgs...),
-		Tools:    tools,
-		// Ask Ollama to emit token usage in the final chunk of each round so the
-		// agent loop can account for cost (observability). Harmless if unsupported.
-		StreamOptions: map[string]any{"include_usage": true},
-	}
+	messages := append([]oaiMessage{{Role: "system", Content: jsonString(sys)}}, msgs...)
 	seen := map[string]int{}
 	for step := 0; step < s.cfg.maxAgentSteps; step++ {
 		// Bound the running transcript before each model call so a long multi-step
-		// run can't overflow the 8-16k context window (Tier 3 compaction).
-		req.Messages = s.maybeCompact(ctx, target, model, req.Messages)
-		msg, usage, err := s.streamOllamaChatWithTools(ctx, ollamaChatURL, &req, emit)
+		// run can't overflow the context window (Tier 3 compaction). Only a
+		// server-side backend's context window is bounded by the server's config;
+		// a browser-relay (local-model) backend runs on the visitor's Ollama with
+		// its own context window, so compaction is skipped for it (and doing the
+		// summary over the relay would stream an internal summary into the bubble).
+		if d, ok := mb.(*directOllama); ok {
+			messages = s.maybeCompact(ctx, d.chatURL, model, messages)
+		}
+		// One inference round. For a server backend, content streams live to the
+		// answer bubble as it arrives; for a browser relay, the browser streams it
+		// directly from localhost (the backend does not re-emit chunks). The
+		// returned content drives thinking-round handling below.
+		msg, usage, err := mb.Call(ctx, model, messages, tools)
 		if err != nil {
 			return fmt.Errorf("agent step %d: %w", step+1, err)
 		}
 		if addUsage != nil {
 			addUsage(usage.PromptTokens, usage.CompletionTokens)
 		}
+		roundText := contentText(msg.Content)
 		if len(msg.ToolCalls) == 0 {
-			// Final answer — its content was already streamed above.
+			// Final answer — its content was already streamed (server backend) or
+			// rendered by the browser (relay), and stays in the bubble + j.content
+			// (the answer, not thinking).
 			emitPhase("answering")
-			if len(msg.Content) == 0 {
+			if roundText == "" {
 				emit("(no response)")
 			}
 			return nil
 		}
+		// Thinking round (had tool calls): move this round's text to the thinking
+		// drawer and clear the answer bubble so it ends up holding only the final
+		// synthesized answer. This separates the model's reasoning (thinking) from
+		// its synthesized answer.
+		if roundText != "" {
+			emitThought(roundText)
+		}
+		emitClear()
 		// Append the assistant turn (thought + tool_calls) for the next round.
-		req.Messages = append(req.Messages, msg)
+		messages = append(messages, msg)
 		for _, tc := range msg.ToolCalls {
 			tool, ok := reg[tc.Function.Name]
 			if !ok {
 				obs := "Unknown tool: " + tc.Function.Name + ". Available tools: " + strings.Join(allow, ", ")
 				emitTool(agentStep{Step: step + 1, Tool: tc.Function.Name, Args: tc.Function.Arguments, Preview: "unknown tool", IsError: true})
-				req.Messages = append(req.Messages, toolResultMsg(tc, obs, true))
+				messages = append(messages, toolResultMsg(tc, obs, true))
 				continue
 			}
 			emitPhase("tool:" + tc.Function.Name)
@@ -358,7 +373,7 @@ func (s *server) runAgentLoop(ctx context.Context, target, model, email string, 
 			if seen[key] >= agentDupLimit {
 				obs := fmt.Sprintf("You have called %s with these arguments %d times. Do not call it again with the same arguments; synthesize your final answer from what you already know.", tc.Function.Name, seen[key])
 				emitTool(agentStep{Step: step + 1, Tool: tc.Function.Name, Args: tc.Function.Arguments, Preview: "repeated call — nudge to answer", IsError: true})
-				req.Messages = append(req.Messages, toolResultMsg(tc, obs, true))
+				messages = append(messages, toolResultMsg(tc, obs, true))
 				continue
 			}
 			// Validate arguments against the tool schema before executing. Small models
@@ -366,7 +381,7 @@ func (s *server) runAgentLoop(ctx context.Context, target, model, email string, 
 			// self-correct instead of crashing the run (Tier 3 hardening).
 			if verr := validateToolArgs(tool, tc.Function.Arguments); verr != nil {
 				emitTool(agentStep{Step: step + 1, Tool: tc.Function.Name, Args: tc.Function.Arguments, Preview: "bad args: " + trimPreview(verr.Error()), IsError: true})
-				req.Messages = append(req.Messages, toolResultMsg(tc, "Your call to "+tc.Function.Name+" failed validation: "+verr.Error()+". Fix the arguments and call it again, or proceed without it.", true))
+				messages = append(messages, toolResultMsg(tc, "Your call to "+tc.Function.Name+" failed validation: "+verr.Error()+". Fix the arguments and call it again, or proceed without it.", true))
 				continue
 			}
 			start := time.Now()
@@ -383,20 +398,28 @@ func (s *server) runAgentLoop(ctx context.Context, target, model, email string, 
 			if out.terminal {
 				// ask_user: stash the question card on the job (emitQuestions) so the
 				// worker persists it as a clarifying turn, and the step's Clarify
-				// payload lets the UI paint the card from the trace too.
+				// payload lets the UI paint the card from the trace too. The preamble
+				// streamed this round is thinking, not the answer — clear the bubble so
+				// the question card (rendered by the questions event) owns it cleanly.
+				if roundText != "" {
+					emitThought(roundText)
+				}
+				emitClear()
 				if out.clarify != nil {
 					emitQuestions(*out.clarify)
 				}
 				emitPhase("clarifying")
 				return nil
 			}
-			req.Messages = append(req.Messages, toolResultMsg(tc, capObservation(out.observation, agentObsMaxChars), out.isError))
+			messages = append(messages, toolResultMsg(tc, capObservation(out.observation, agentObsMaxChars), out.isError))
 		}
 	}
-	// Step budget exhausted: force one final streamed answer with tools removed.
-	req.Tools = nil
+	// Step budget exhausted: force one final answer with tools removed so the
+	// model must synthesize. Routed through the backend so a server backend
+	// streams it live and a browser relay has the browser stream it from localhost.
 	emitPhase("answering")
-	return s.streamFromOllama(ctx, ollamaChatURL, &req, emit)
+	_, _, err := mb.Call(ctx, model, messages, nil)
+	return err
 }
 
 // toolResultMsg builds an OpenAI tool-result message. Ollama's OpenAI shim does

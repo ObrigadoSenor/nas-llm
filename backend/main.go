@@ -211,6 +211,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("PATCH /api/conversations/{id}", s.requireAuth(s.handlePatchConversation))
 	mux.HandleFunc("DELETE /api/conversations/{id}", s.requireAuth(s.handleDeleteConversation))
 	mux.HandleFunc("POST /api/conversations/{id}/generate", s.requireAuth(s.handleGenerate))
+	mux.HandleFunc("POST /api/conversations/{id}/model-response", s.requireAuth(s.handleModelResponse))
 	mux.HandleFunc("POST /api/conversations/{id}/cancel", s.requireAuth(s.handleCancel))
 	mux.HandleFunc("GET /api/conversations/{id}/events", s.requireAuth(s.handleEvents))
 	mux.HandleFunc("GET /api/conversations/{id}/job", s.requireAuth(s.handleJob))

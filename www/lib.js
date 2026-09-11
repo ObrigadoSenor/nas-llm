@@ -269,7 +269,10 @@ function buildStepRow(st) {
   const ic = document.createElement('span'); ic.className = 'status-ic'; ic.innerHTML = icon(stepIcon(st.tool), 14);
   const name = document.createElement('span'); name.className = 'step-tool'; name.textContent = st.tool || '';
   head.appendChild(num); head.appendChild(ic); head.appendChild(name);
-  if (st.args) {
+  // Hide raw args when the step renders a readable query/question payload
+  // (search sources / clarify card) — the args JSON just duplicates it.
+  const hasNicePayload = !!(st.search || st.clarify);
+  if (st.args && !hasNicePayload) {
     const a = document.createElement('span'); a.className = 'step-args'; a.textContent = truncateArgs(st.args);
     head.appendChild(a);
   }
@@ -307,6 +310,48 @@ export function appendAgentStep(container, st) {
   if (!container || !st) return;
   container.classList.remove('hidden');
   container.appendChild(buildStepRow(st));
+}
+
+// --- Agent thinking drawer (per-round reasoning, smaller + collapsible) ----------
+// renderThoughts replaces the drawer with the full set (SSE replay / reload).
+// appendThought adds one live thought as its round completes. Each is a small
+// muted block inside a <details> that is open while streaming and auto-closed
+// on done so the user is left with only the summarized answer.
+function buildThoughtRow(text) {
+  const div = document.createElement('div');
+  div.className = 'thought';
+  const t = document.createElement('span'); t.className = 'thought-text';
+  t.textContent = String(text || '');
+  div.appendChild(t);
+  return div;
+}
+export function renderThoughts(container, thoughts) {
+  if (!container) return;
+  const det = container.querySelector('details.thoughts-det');
+  if (!det) return;
+  const body = det.querySelector('.thoughts-body');
+  body.replaceChildren();
+  if (!thoughts || !thoughts.length) { container.classList.add('hidden'); return; }
+  container.classList.remove('hidden');
+  thoughts.forEach(t => body.appendChild(buildThoughtRow(t)));
+}
+export function appendThought(container, text) {
+  if (!container || text == null) return;
+  const det = container.querySelector('details.thoughts-det');
+  if (!det) return;
+  container.classList.remove('hidden');
+  det.querySelector('.thoughts-body').appendChild(buildThoughtRow(text));
+}
+// Build the collapsible thinking wrapper (<details open>) the SSE handlers
+// fill. open by default so thinking is visible (smaller) while it streams;
+// the tailJob done handler removes `open` to collapse it.
+export function buildThoughtsWrap() {
+  const wrap = document.createElement('div'); wrap.className = 'msg-thoughts hidden';
+  const det = document.createElement('details'); det.className = 'thoughts-det'; det.open = true;
+  const sum = document.createElement('summary'); sum.textContent = 'Thinking';
+  const body = document.createElement('div'); body.className = 'thoughts-body';
+  det.appendChild(sum); det.appendChild(body); wrap.appendChild(det);
+  return { wrap, det };
 }
 
 // --- Clarifying questions (agent loop) --------------------------------------
