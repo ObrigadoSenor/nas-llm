@@ -39,9 +39,9 @@ let dragConv = null;           // conversation being dragged onto a folder
 // Extras: add-ons the user toggles via the + menu. Active ones ride along on
 // the next generate request and show as removable pills above the input.
 const EXTRA_DEFS = [
-  { id:"web", label:"Web search", icon:"globe", exclusive:["clarify","agent"] },
-  { id:"clarify", label:"Clarify", icon:"help", exclusive:["web","agent"] },
-  { id:"agent", label:"Agent", icon:"sparkles", exclusive:["web","clarify"] },
+  { id:"web", label:"Web search", icon:"globe", exclusive:["clarify","agent"], needsTools:true },
+  { id:"clarify", label:"Clarify", icon:"help", exclusive:["web","agent"], needsTools:true },
+  { id:"agent", label:"Agent", icon:"sparkles", exclusive:["web","clarify"], needsTools:true },
 ];
 let activeExtras = loadExtras();
 function loadExtras(){
@@ -82,18 +82,20 @@ function hostLabel(h){ return {nas:"NAS",mac:"Mac"}[h]||h; }
 // Merge server models (from /api/models, carrying host/hostOnline) with the
 // local set. Dedupe by name: if a name is both local and on a server host,
 // keep the Local entry and drop the server duplicate. Ordered NAS, Mac, Local.
-function buildModelEntries(serverData, localNames){
-  const localSet=new Set(localNames);
+function buildModelEntries(serverData, localEntries){
+  // localEntries may be rich objects ({name,capabilities,…}) or persisted
+  // name strings (pre-probe); normalize so a reload still seeds the selector
+  // before the localhost re-probe finishes.
+  const locs=(localEntries||[]).map(x=> typeof x==="string" ? {name:x, capabilities:[]} : x);
+  const localByName=new Map(locs.map(m=>[m.name, m]));
   const entries=[]; const seen=new Set();
   for(const m of serverData){
     const name=m.name||m.id; if(!name) continue;
-    if(localSet.has(name)) continue;        // local wins -> drop server duplicate
+    if(localByName.has(name)) continue;        // local wins -> drop server duplicate
     if(seen.has(name)) continue; seen.add(name);
-    const b=m.benchmark;                     // measured tok/s from the last benchmark run
-    const tps = b && typeof b.tokPerSec==="number" ? b.tokPerSec : null;
-    entries.push({name, host:m.host||"nas", hostOnline:m.hostOnline!==false, local:false, tokPerSec:tps});
+    entries.push({name, host:m.host||"nas", hostOnline:m.hostOnline!==false, local:false, capabilities:m.capabilities||[]});
   }
-  for(const n of localNames){ if(seen.has(n)) continue; seen.add(n); entries.push({name:n, host:"local", hostOnline:true, local:true, tokPerSec:null}); }
+  for(const m of locs){ if(seen.has(m.name)) continue; seen.add(m.name); entries.push({name:m.name, host:"local", hostOnline:true, local:true, capabilities:m.capabilities||[]}); }
   const order={nas:0,mac:1,local:2};
   entries.sort((a,b)=>(order[a.host]??9)-(order[b.host]??9)||a.name.localeCompare(b.name));
   return entries;
@@ -103,6 +105,40 @@ function syncSelectedFromEntries(){
     const onl=modelEntries.find(e=>e.hostOnline);
     selectedModel = onl?onl.name:modelEntries[0].name;
   }
+}
+// Rich local entries for the selector: use discovered models (with caps) when
+// available, else the persisted name list so a reload reattaches immediately.
+function localEntries(){ return localModels.length ? localModels : localModelNames; }
+// Capabilities for a selected model name, from the merged selector entries.
+// Returns [] when unknown (e.g. older Ollama that doesn't report capabilities).
+function modelCapabilities(name){
+  // Prefer the authoritative caps from /api/models/:name/info (modelCaps) when
+  // available; fall back to the merged selector entry caps (from /api/models
+  // for server models, /api/tags for local models) so gating works before the
+  // lazy /info probe finishes and for local models (whose /info can't run).
+  const cached=modelCaps.get(name);
+  if(cached && cached.length) return cached;
+  const e=modelEntries.find(e=>e.name===name);
+  return e ? (e.capabilities||[]) : [];
+}
+// modelSupportsTools returns true/false when the model's capabilities are known,
+// or null when unknown — callers must NOT gate on null (don't false-block).
+function modelSupportsTools(name){
+  const caps=modelCapabilities(name);
+  if(!caps.length) return null;
+  return caps.includes("tools");
+}
+// Drop any active tool-requiring extra (web/clarify/agent) when the selected
+// model is known to lack tool support, so a non-tool model can't sit in a mode
+// that will silently just answer. Called after model lists refresh and on model
+// change. No-op when capabilities are unknown.
+function enforceToolGating(){
+  if(modelSupportsTools(selectedModel)===false){
+    let changed=false;
+    EXTRA_DEFS.forEach(d=>{ if(d.needsTools && activeExtras.has(d.id)){ activeExtras.delete(d.id); changed=true; } });
+    if(changed) saveExtras();
+  }
+  renderExtras();
 }
 
 function renderPills(){
@@ -120,12 +156,16 @@ function renderPills(){
 }
 function renderPlusPopup(){
   plusPopup.innerHTML="";
+  const toolsOk=modelSupportsTools(selectedModel); // null=unknown, true, false
   EXTRA_DEFS.forEach(def=>{
     const on=activeExtras.has(def.id);
-    const b=document.createElement("button"); b.type="button"; b.className="plus-item"+(on?" on":"");
+    const blocked=!!def.needsTools && toolsOk===false;
+    const b=document.createElement("button"); b.type="button"; b.className="plus-item"+(on?" on":"")+(blocked?" disabled":"");
     b.setAttribute("role","menuitemcheckbox"); b.setAttribute("aria-checked",String(on));
+    if(blocked) b.title=selectedModel+" has no tool support — use a tool-capable model (e.g. llama3.1:8b, qwen3:1.7b) for "+def.label+".";
+    b.disabled=blocked;
     b.innerHTML=icon(def.icon,16)+'<span>'+escapeHtml(def.label)+'</span>'+(on?icon("check",14):'');
-    b.addEventListener("click",e=>{ e.stopPropagation(); if(activeExtras.has(def.id)){ activeExtras.delete(def.id); } else { activeExtras.add(def.id); (def.exclusive||[]).forEach(x=>activeExtras.delete(x)); } saveExtras(); renderExtras(); });
+    b.addEventListener("click",e=>{ e.stopPropagation(); if(blocked) return; if(activeExtras.has(def.id)){ activeExtras.delete(def.id); } else { activeExtras.add(def.id); (def.exclusive||[]).forEach(x=>activeExtras.delete(x)); } saveExtras(); renderExtras(); });
     plusPopup.appendChild(b);
   });
   const sep=document.createElement("div"); sep.className="plus-sep";
@@ -161,6 +201,7 @@ async function ensureCaps(name){
     if(!r.ok) return;
     const j=await r.json();
     modelCaps.set(name, j.capabilities||[]);
+    if(name===selectedModel) enforceToolGating();
   }catch{}
 }
 async function syncVision(){ renderComposer(); await ensureCaps(selectedModel); renderComposer(); }
@@ -347,12 +388,12 @@ async function loadModels(){
     const r=await fetchRetry("/api/models",{},{label:"Load models"});
     const j=await r.json();
     lastServerModels=j.data||[];
-    modelEntries=buildModelEntries(lastServerModels, localModelNames);
+    modelEntries=buildModelEntries(lastServerModels, localEntries());
     models=modelEntries.map(e=>e.name);
     syncSelectedFromEntries();
     renderModels();
     syncVision();
-    prefetchCaps();
+    enforceToolGating();
   }catch(e){ renderModels(); modelBtn.title=String(e.message||e); }
 }
 // Re-probe localhost on boot/showApp so a reload reattaches the visitor's
@@ -362,11 +403,11 @@ async function loadModels(){
 async function reattachLocalModels(){
   const res=await discoverLocalModels();
   if(res.ok){ localModels=res.models; localModelNames=res.models.map(m=>m.name); saveLocalModelNames(); }
-  modelEntries=buildModelEntries(lastServerModels, localModelNames);
+  modelEntries=buildModelEntries(lastServerModels, localEntries());
   models=modelEntries.map(e=>e.name);
   syncSelectedFromEntries();
   renderModels();
-  prefetchCaps();
+  enforceToolGating();
   if($("modelsModal").classList.contains("open") && modelsTab==="installed") renderInstalledTab();
 }
 // Discover the visitor's local Ollama (localhost:11434). An HTTPS page makes
@@ -376,11 +417,11 @@ async function reattachLocalModels(){
 async function discoverLocalModels(){
   let r;
   try{ r=await fetch("http://localhost:11434/api/tags"); }
-  catch{ return {ok:false, kind:"refused"}; }
+  catch(e){ return {ok:false, kind:"refused", error:String(e&&e.message||e)}; }
   if(r.status===403) return {ok:false, kind:"origins"};
   if(!r.ok) return {ok:false, kind:"http", status:r.status};
   let j; try{ j=await r.json(); }catch{ return {ok:false, kind:"http", status:r.status}; }
-  const mods=(j.models||[]).map(m=>({name:m.name, sizeGB:m.size?m.size/1e9:0, details:m.details||{}}));
+  const mods=(j.models||[]).map(m=>({name:m.name, sizeGB:m.size?m.size/1e9:0, details:m.details||{}, capabilities:m.capabilities||[]}));
   return {ok:true, models:mods};
 }
 function hostBadge(host){
@@ -468,6 +509,7 @@ function setModelPopup(open){
 function chooseModel(name){
   selectedModel=name; localStorage.setItem("nas-llm-model", selectedModel);
   syncVision(); renderModels();
+  enforceToolGating();
   // Don't overwrite messages while a background job is mid-generation for this
   // conversation — the job finalizes by appending to the stored messages, and a
   // PUT here (which lacks the in-flight assistant reply) would clobber it.
@@ -778,8 +820,18 @@ async function resumeIfGenerating(id){
 // bubble via the same StreamRenderer as server-model chunks, then POSTs the
 // assembled {content, tool_calls} back so the backend can continue the tool
 // loop (web_search/clarify/agent) or finalize. `tools` is null for plain chat.
-function localFetchErrMsg(){
-  return "No Ollama found on this computer — install/start Ollama.";
+// The localhost:11434 fetch threw before any HTTP response — either nothing
+// answered on that port, or a browser security policy blocked the request (an
+// HTTPS page probing a local port trips Chrome's Local/Private Network Access
+// gate; a denied prompt or failed preflight surfaces as a throw, not a 403).
+// Browsers report all of these as an opaque TypeError, so we surface the raw
+// message and point at the console instead of claiming Ollama is missing — it
+// may well be running. `detail` is the captured e.message when available.
+function localFetchErrMsg(detail){
+  const lead = location.protocol === "https:"
+    ? "Could not reach Ollama on this computer. If it's running, the browser likely blocked the request (Private Network Access) — check DevTools → Console; otherwise start Ollama so localhost:11434 answers."
+    : "Could not reach Ollama on this computer — start Ollama so localhost:11434 answers, or check DevTools → Console if it's already running.";
+  return detail ? lead + " (" + detail + ")" : lead;
 }
 function localStatusErrMsg(status){
   if(status===403) return "Your local Ollama rejected the request — start it with OLLAMA_ORIGINS=https://chat.selected.systems ollama serve (or OLLAMA_ORIGINS=*).";
@@ -806,9 +858,9 @@ async function relayLocalModelCall(convId, call, renderer, bubble, signal){
   if(call.tools && call.tools.length) body.tools=call.tools;
   let resp;
   try{ resp=await fetch("http://localhost:11434/v1/chat/completions",{ method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body), signal }); }
-  catch(e){ if(signal.aborted) return null; const msg=localFetchErrMsg(); bubbleError(bubble, msg); postModelResponse(convId, call.jobId, null, null, msg); return null; }
+  catch(e){ if(signal.aborted) return null; const msg=localFetchErrMsg(String(e&&e.message||e)); bubbleError(bubble, msg); postModelResponse(convId, call.jobId, null, null, msg); return null; }
   if(!resp.ok){ const msg=localStatusErrMsg(resp.status); bubbleError(bubble, msg); postModelResponse(convId, call.jobId, null, null, msg); return null; }
-  let content=""; const toolsByIndex=new Map();
+  let content=""; const calls=[];
   const reader=resp.body.getReader(); const dec=new TextDecoder(); let buf=""; let finished=false;
   try{
     while(!finished){
@@ -826,13 +878,18 @@ async function relayLocalModelCall(convId, call, renderer, bubble, signal){
         if(!delta) continue;
         if(delta.content){ content+=delta.content; renderer.append(delta.content); }
         if(delta.tool_calls){
+          // Accumulate by id-presence (mirrors the backend streamOllamaChatWithTools):
+          // a delta carrying a new id starts a new call; one with no id continues
+          // the last call. Ollama emits index:0 for every call, so index-based
+          // merging would concatenate unrelated calls — key on id instead.
           for(const tc of delta.tool_calls){
-            const i=tc.index??0;
-            let cur=toolsByIndex.get(i);
-            if(!cur){ cur={id:tc.id||null, type:tc.type||"function", function:{name:"", arguments:""}}; toolsByIndex.set(i,cur); }
-            if(tc.id) cur.id=tc.id;
-            if(tc.type) cur.type=tc.type;
-            if(tc.function){ if(tc.function.name) cur.function.name+=tc.function.name; if(tc.function.arguments) cur.function.arguments+=tc.function.arguments; }
+            if(tc.id){
+              calls.push({id:tc.id, type:tc.type||"function", function:{name:tc.function?.name||"", arguments:tc.function?.arguments||""}});
+            } else if(calls.length){
+              const c=calls[calls.length-1];
+              if(tc.type) c.type=tc.type;
+              if(tc.function){ if(tc.function.name) c.function.name+=tc.function.name; if(tc.function.arguments) c.function.arguments+=tc.function.arguments; }
+            }
           }
         }
       }
@@ -844,7 +901,7 @@ async function relayLocalModelCall(convId, call, renderer, bubble, signal){
     // Mid-stream network drop: fall through and return whatever streamed so
     // far so the backend gets partial content instead of hanging.
   }
-  const toolCalls=toolsByIndex.size?[...toolsByIndex.entries()].sort((a,b)=>a[0]-b[0]).map(([,v])=>v):null;
+  const toolCalls=calls.length?calls:null;
   return { content, toolCalls };
 }
 
@@ -907,8 +964,9 @@ function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarif
       // Unexpected throw relayLocalModelCall didn't handle: finalize as an
       // error so the backend's connection-bound job doesn't hang.
       if(ctrl.signal.aborted) return;
-      bubbleError(bubble, localFetchErrMsg());
-      postModelResponse(convId, d.jobId, null, null, localFetchErrMsg());
+      const msg=localFetchErrMsg(String(err&&err.message||err));
+      bubbleError(bubble, msg);
+      postModelResponse(convId, d.jobId, null, null, msg);
     }finally{
       if(activeLocalAbort===ctrl) activeLocalAbort=null;
     }
@@ -1243,6 +1301,9 @@ let modelsTab = "installed";
 let pullES = null;       // EventSource tail for the active pull
 let pullEls = null;      // {fill, phase, bytes, cancel} refs into #pullStatus
 let pullJobModel = null; // model name of the active pull (for UI)
+let pullTarget = localStorage.getItem("nas-llm-pull-target") || "auto"; // auto|nas|mac|local
+let pullMode = null;            // "server" | "local" | null — which pull path is active
+let activePullAbort = null;     // AbortController for an in-flight LOCAL (browser-driven) pull
 
 $("manageModels").addEventListener("click", openModelsPanel);
 $("closeModels").addEventListener("click", closeModelsPanel);
@@ -1274,7 +1335,7 @@ async function renderInstalledTab(){
   // Local (this computer) section sits above the server card list. It shows
   // the visitor's own Ollama models, distinct from NAS/Mac server models.
   body.appendChild(renderLocalSection());
-  modelEntries=buildModelEntries(list, localModelNames);
+  modelEntries=buildModelEntries(list, localEntries());
   models=modelEntries.map(e=>e.name);
   syncSelectedFromEntries();
   renderModels();                                   // keep the header selector in sync
@@ -1319,6 +1380,7 @@ function renderLocalCard(m){
   if(m.sizeGB) bits.push(m.sizeGB.toFixed(1)+" GB");
   sub.textContent=bits.join(" · ");
   head.appendChild(title); head.appendChild(sub); card.appendChild(head);
+  if(m.capabilities && m.capabilities.length){ const cb=capBadges(m.capabilities); if(cb) card.appendChild(cb); }
   const actions=document.createElement("div"); actions.className="mcard-actions";
   const use=document.createElement("button"); use.textContent="Use"; use.addEventListener("click",()=>useModel(m.name));
   actions.appendChild(use); card.appendChild(actions);
@@ -1331,13 +1393,14 @@ async function onConnectLocal(){
   else {
     localModels=[];
     if(res.kind==="origins") localDiscoverMsg="Your local Ollama rejected the request — start it with OLLAMA_ORIGINS=https://chat.selected.systems ollama serve (or OLLAMA_ORIGINS=*).";
-    else if(res.kind==="refused") localDiscoverMsg="No Ollama found on this computer — install/start Ollama.";
+    else if(res.kind==="refused") localDiscoverMsg=localFetchErrMsg(res.error);
     else localDiscoverMsg="Local Ollama returned HTTP "+(res.status||"?")+".";
   }
-  modelEntries=buildModelEntries(lastServerModels, localModelNames);
+  modelEntries=buildModelEntries(lastServerModels, localEntries());
   models=modelEntries.map(e=>e.name);
   syncSelectedFromEntries();
   renderModels();
+  enforceToolGating();
   await renderInstalledTab();
 }
 
@@ -1352,6 +1415,7 @@ function renderInstalledCard(m){
   if(m.sizeGB) bits.push(m.sizeGB.toFixed(1)+" GB");
   sub.textContent=bits.join(" · ");
   head.appendChild(title); head.appendChild(sub); card.appendChild(head);
+  if(m.capabilities && m.capabilities.length){ const cb=capBadges(m.capabilities); if(cb) card.appendChild(cb); }
 
   const meta=document.createElement("div"); meta.className="mcard-meta";
   if(m.host) meta.appendChild(badge(hostLabel(m.host), "host"));
@@ -1379,26 +1443,217 @@ function renderInstalledCard(m){
   return card;
 }
 
+// Browse state: the catalog is fetched once per tab render and re-filtered
+// client-side as the user types/selects categories (no re-fetch per filter).
+let browseCatalog=null;       // last catalog response ({models, nas, hosts})
+let browseQuery="";            // current search text (lowercased)
+let browseCategory=null;       // current category filter (null = all)
+// Browse has two modes: "recommended" (hand-curated catalog with fit verdicts)
+// and "library" (live search of the full Ollama library via /api/models/library).
+let browseMode = localStorage.getItem("nas-llm-browse-mode") || "recommended";
+let libQuery="", libCap=null, libOrder="popular"; let libTimer=null;
+const CATEGORY_LABELS={code:"Code",agentic:"Agentic",math:"Math",vision:"Vision","long-context":"Long context",fast:"Fast",chat:"Chat",embeddings:"Embeddings"};
+function categoryLabel(c){ return CATEGORY_LABELS[c]||c; }
+// Download target chooser: Auto (backend picks by catalog intent), NAS, Mac (only
+// when a mac host is configured), or Local (this computer — browser-driven pull).
+function buildPullTargetSelect(){
+  const sel=document.createElement("select"); sel.className="pull-target"; sel.title="Where new models download to";
+  sel.appendChild(new Option("Auto (recommended)","auto"));
+  sel.appendChild(new Option("NAS","nas"));
+  const hosts=(browseCatalog&&browseCatalog.hosts)||[];
+  if(hosts.some(h=>h.name==="mac")) sel.appendChild(new Option("Mac","mac"));
+  sel.appendChild(new Option("Local (this computer)","local"));
+  sel.value=pullTarget;
+  sel.addEventListener("change",()=>{ pullTarget=sel.value; localStorage.setItem("nas-llm-pull-target", pullTarget); renderBrowseList(); });
+  return sel;
+}
+function collectCategories(models){ const set=new Set(); models.forEach(m=>(m.categories||[]).forEach(c=>set.add(c))); return [...set]; }
+function makeCatChip(cat, label, active, onClick){
+  const b=document.createElement("button"); b.type="button"; b.className="cat-chip"+(active?" active":"");
+  b.textContent=label; b.addEventListener("click",onClick); return b;
+}
+// Re-render the filtered catalog into #browseList without re-fetching.
+function renderBrowseList(){
+  const list=$("browseList"); if(!list) return;
+  list.innerHTML="";
+  const models=(browseCatalog&&browseCatalog.models)||[];
+  const q=browseQuery, cat=browseCategory;
+  const filtered=models.filter(m=>{
+    if(cat && !(m.categories||[]).includes(cat)) return false;
+    if(q){ const hay=[m.name,m.family,m.blurb,m.recommendedFor,(m.categories||[]).join(" ")].join(" ").toLowerCase(); if(!hay.includes(q)) return false; }
+    return true;
+  });
+  if(!filtered.length){ list.appendChild(mutedNote("No models match your search.")); return; }
+  filtered.forEach(m=>list.appendChild(renderBrowseCard(m)));
+}
+// The download targets offered on per-card Download menus and the top chooser.
+function availablePullTargets(){
+  const ts=[{value:"auto",label:"Auto (NAS/Mac by fit)"},{value:"nas",label:"NAS"}];
+  const hosts=(browseCatalog&&browseCatalog.hosts)||[];
+  if(hosts.some(h=>h.name==="mac")) ts.push({value:"mac",label:"Mac"});
+  ts.push({value:"local",label:"Local (this computer)"});
+  return ts;
+}
+// Per-card Download menu: click Download → choose where to pull this model.
+// Reuses the row-action menu infra (closeMenu/openMenu).
+function openDownloadMenu(anchor, model){
+  closeMenu();
+  const m=document.createElement("div"); m.className="menu";
+  const title=document.createElement("div"); title.className="menu-msg"; title.textContent="Download "+model+" to:"; m.appendChild(title);
+  availablePullTargets().forEach(t=>{
+    const b=document.createElement("button"); b.innerHTML='<span>'+escapeHtml(t.label)+'</span>';
+    b.addEventListener("click",e=>{ e.stopPropagation(); closeMenu(); startPull(model, t.value); });
+    m.appendChild(b);
+  });
+  document.body.appendChild(m);
+  const r=anchor.getBoundingClientRect();
+  m.style.left=Math.min(r.left, window.innerWidth-m.offsetWidth-8)+"px";
+  m.style.top=(r.bottom+4)+"px";
+  openMenu=m;
+  setTimeout(()=>document.addEventListener("click",closeMenu),0);
+}
 async function renderBrowseTab(){
   const body=$("tabBody"); body.innerHTML="";
+  let data;
+  try{ const r=await fetchRetry("/api/models/catalog",{},{label:"Load catalog"}); data=await r.json(); }
+  catch(e){ body.appendChild(mutedNote("Could not load catalog.")); await resumePullIfActive(); return; }
+  browseCatalog=data;
+  // Download target — prominent, always visible at the top. Applies to every
+  // download (browse cards, pull-by-name, and library cards).
+  const targetRow=document.createElement("div"); targetRow.className="pull-target-row";
+  const tl=document.createElement("span"); tl.className="muted"; tl.textContent="Download to:";
+  targetRow.appendChild(tl); targetRow.appendChild(buildPullTargetSelect());
+  body.appendChild(targetRow);
+  // Pull-by-name.
   const pbn=document.createElement("div"); pbn.className="pullbyname";
   const hint=document.createElement("span"); hint.className="muted"; hint.textContent="Pull any model by name (e.g. mistral:7b, llama3.2:1b):";
   const row=document.createElement("div"); row.className="row";
   const inp=document.createElement("input"); inp.placeholder="model:tag";
   const go=document.createElement("button"); go.textContent="Download";
-  go.addEventListener("click",()=>{ const v=inp.value.trim(); if(v) startPull(v); });
+  go.addEventListener("click",()=>{ const v=inp.value.trim(); if(v) startPull(v, pullTarget); });
   inp.addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault(); go.click(); } });
-  row.appendChild(inp); row.appendChild(go); pbn.appendChild(hint); pbn.appendChild(row); body.appendChild(pbn);
-
-  let data;
-  try{ const r=await fetchRetry("/api/models/catalog",{},{label:"Load catalog"}); data=await r.json(); }
-  catch(e){ body.appendChild(mutedNote("Could not load catalog.")); await resumePullIfActive(); return; }
+  row.appendChild(inp); row.appendChild(go);
+  pbn.appendChild(hint); pbn.appendChild(row); body.appendChild(pbn);
   const nas=data.nas||{};
   const note=document.createElement("div"); note.className="catalog-note muted";
   note.textContent=`Fit is estimated for ${nas.ramGB||8} GB RAM · ${(nas.contextLength||16384).toLocaleString()}-tok context (reserve ${(nas.reserveGB||1.5).toFixed(1)} GB). Benchmark after download for real tok/s.`;
   body.appendChild(note);
-  (data.models||[]).forEach(m=>body.appendChild(renderBrowseCard(m)));
+  // Mode toggle: Recommended (curated, with fit verdicts) vs All models (live
+  // search of the full Ollama library via /api/models/library).
+  const seg=document.createElement("div"); seg.className="browse-seg";
+  const recB=document.createElement("button"); recB.type="button"; recB.className="seg-btn"+(browseMode!=="library"?" active":""); recB.textContent="Recommended";
+  recB.addEventListener("click",()=>{ browseMode="recommended"; localStorage.setItem("nas-llm-browse-mode", browseMode); renderBrowseMode(); });
+  const allB=document.createElement("button"); allB.type="button"; allB.className="seg-btn"+(browseMode==="library"?" active":""); allB.textContent="All models";
+  allB.addEventListener("click",()=>{ browseMode="library"; localStorage.setItem("nas-llm-browse-mode", browseMode); renderBrowseMode(); });
+  seg.appendChild(recB); seg.appendChild(allB); body.appendChild(seg);
+  // Recommended section (curated catalog + client-side search/category filter).
+  const rec=document.createElement("div"); rec.id="browseRec";
+  const controls=document.createElement("div"); controls.className="browse-controls";
+  const search=document.createElement("input"); search.type="search"; search.className="browse-search"; search.placeholder="Search recommended…";
+  search.value=browseQuery;
+  search.addEventListener("input",()=>{ browseQuery=search.value.trim().toLowerCase(); renderBrowseList(); });
+  controls.appendChild(search);
+  const chips=document.createElement("div"); chips.className="cat-chips";
+  chips.appendChild(makeCatChip(null,"All",browseCategory===null,()=>{ browseCategory=null; renderBrowseList(); }));
+  collectCategories(data.models||[]).forEach(c=>chips.appendChild(makeCatChip(c,categoryLabel(c),browseCategory===c,()=>{ browseCategory=c; renderBrowseList(); })));
+  controls.appendChild(chips); rec.appendChild(controls);
+  const rlist=document.createElement("div"); rlist.className="browse-list"; rlist.id="browseList"; rec.appendChild(rlist);
+  body.appendChild(rec);
+  // Library section (live full-library search).
+  body.appendChild(buildLibrarySection());
+  renderBrowseMode();
   await resumePullIfActive();
+}
+
+// Toggle which Browse section is visible and render the active one.
+function renderBrowseMode(){
+  const rec=$("browseRec"), lib=$("browseLib");
+  if(!rec||!lib) return;
+  const libOn=browseMode==="library";
+  rec.classList.toggle("hidden", libOn);
+  lib.classList.toggle("hidden", !libOn);
+  document.querySelectorAll(".browse-seg .seg-btn").forEach((b,i)=>{ b.classList.toggle("active", (i===0 && !libOn) || (i===1 && libOn)); });
+  if(libOn) renderLibraryList(); else renderBrowseList();
+}
+
+// Build the "All models" (live library) controls + empty results container.
+function buildLibrarySection(){
+  const sec=document.createElement("div"); sec.id="browseLib"; if(browseMode!=="library") sec.classList.add("hidden");
+  const controls=document.createElement("div"); controls.className="browse-controls";
+  const search=document.createElement("input"); search.type="search"; search.className="browse-search"; search.placeholder="Search all Ollama models…"; search.value=libQuery;
+  search.addEventListener("input",()=>{
+    libQuery=search.value.trim();
+    if(libTimer) clearTimeout(libTimer);
+    libTimer=setTimeout(()=>{ libTimer=null; renderLibraryList(); }, 350);
+  });
+  controls.appendChild(search);
+  const chips=document.createElement("div"); chips.className="cat-chips";
+  const caps=[["All",null],["Tools","tools"],["Vision","vision"],["Thinking","thinking"],["Embedding","embedding"]];
+  caps.forEach(([label,val])=>chips.appendChild(makeCatChip(val,label,libCap===val,()=>{ libCap=val; renderLibraryList(); })));
+  controls.appendChild(chips);
+  const sortRow=document.createElement("div"); sortRow.className="lib-sort-row";
+  const sortLabel=document.createElement("span"); sortLabel.className="muted"; sortLabel.textContent="Sort:";
+  const sortSel=document.createElement("select"); sortSel.className="lib-sort";
+  sortSel.appendChild(new Option("Popular","popular")); sortSel.appendChild(new Option("Newest","newest"));
+  sortSel.value=libOrder;
+  sortSel.addEventListener("change",()=>{ libOrder=sortSel.value; renderLibraryList(); });
+  sortRow.appendChild(sortLabel); sortRow.appendChild(sortSel); controls.appendChild(sortRow);
+  sec.appendChild(controls);
+  const list=document.createElement("div"); list.className="browse-list"; list.id="browseLibList"; sec.appendChild(list);
+  return sec;
+}
+
+// Fetch /api/models/library (live ollama.com search) and render the results.
+async function renderLibraryList(){
+  const list=$("browseLibList"); if(!list) return;
+  list.innerHTML=""; list.appendChild(mutedNote("Searching the Ollama library…"));
+  try{
+    const params=new URLSearchParams();
+    if(libQuery) params.set("q",libQuery);
+    if(libCap) params.set("c",libCap);
+    if(libOrder) params.set("o",libOrder);
+    const r=await fetchRetry("/api/models/library?"+params.toString(),{},{label:"Library search"});
+    if(r.status===502){ list.replaceChildren(mutedNote("Library search is unavailable right now (couldn't reach ollama.com). Try Recommended.")); return; }
+    if(!r.ok){ list.replaceChildren(mutedNote("Library search failed (HTTP "+r.status+").")); return; }
+    const j=await r.json(); const mods=j.models||[];
+    list.replaceChildren();
+    if(!mods.length){ list.appendChild(mutedNote("No models found. Try a different search or capability.")); return; }
+    mods.forEach(m=>list.appendChild(renderLibraryCard(m)));
+  }catch(e){ list.replaceChildren(mutedNote("Library search failed: "+errText(e))); }
+}
+
+// A library card: name + description + capability/size badges + pulls/tags/
+// updated + a Download button (per-card target menu). No fit verdict (the
+// backend can't estimate KV cache without known arch dims); capabilities +
+// sizes help the user judge, and the pull auto-benchmarks once installed.
+function renderLibraryCard(m){
+  const card=document.createElement("div"); card.className="mcard lib-card";
+  const head=document.createElement("div"); head.className="mcard-head";
+  const title=document.createElement("div"); title.className="mcard-title"; title.textContent=m.name;
+  const sub=document.createElement("div"); sub.className="mcard-sub";
+  const bits=[];
+  if(m.pulls) bits.push(m.pulls+" pulls");
+  if(m.tags) bits.push(m.tags+" tags");
+  if(m.updated) bits.push("updated "+m.updated);
+  sub.textContent=bits.join(" · ");
+  head.appendChild(title); head.appendChild(sub); card.appendChild(head);
+  if(m.description){ const d=document.createElement("div"); d.className="mcard-blurb muted"; d.textContent=m.description; card.appendChild(d); }
+  const caps=document.createElement("div"); caps.className="badges";
+  (m.capabilities||[]).forEach(c=>caps.appendChild(badge(capLabel(c),"cap")));
+  (m.sizes||[]).forEach(s=>caps.appendChild(badge(s,"size")));
+  if(caps.childNodes.length) card.appendChild(caps);
+  const actions=document.createElement("div"); actions.className="mcard-actions";
+  if(models.includes(m.name)){
+    const tag=document.createElement("span"); tag.className="installed-tag"; tag.textContent="Installed";
+    const use=document.createElement("button"); use.textContent="Use"; use.addEventListener("click",()=>useModel(m.name));
+    actions.appendChild(tag); actions.appendChild(use);
+  } else {
+    const dl=document.createElement("button"); dl.innerHTML=icon("download",15)+" Download ▾";
+    dl.addEventListener("click",(e)=>{ e.stopPropagation(); openDownloadMenu(dl, m.name); });
+    actions.appendChild(dl);
+  }
+  card.appendChild(actions);
+  return card;
 }
 
 function renderBrowseCard(m){
@@ -1416,6 +1671,11 @@ function renderBrowseCard(m){
   (m.capabilities||[]).forEach(c=>caps.appendChild(badge(capLabel(c), "cap")));
   if(m.recommendedFor) caps.appendChild(badge(m.recommendedFor, "rec"));
   if(caps.childNodes.length) card.appendChild(caps);
+  if(m.categories && m.categories.length){
+    const cats=document.createElement("div"); cats.className="badges cat-badges";
+    m.categories.forEach(c=>cats.appendChild(badge(categoryLabel(c), "cat")));
+    card.appendChild(cats);
+  }
   const meta=document.createElement("div"); meta.className="mcard-meta";
   meta.appendChild(fitBadge(v)); meta.appendChild(speedBadge(m, v));
   card.appendChild(meta);
@@ -1425,9 +1685,11 @@ function renderBrowseCard(m){
     const use=document.createElement("button"); use.textContent="Use"; use.addEventListener("click",()=>useModel(m.name));
     actions.appendChild(tag); actions.appendChild(use);
   } else {
-    const dl=document.createElement("button"); dl.innerHTML=icon("download",15)+" Download";
+    const dl=document.createElement("button"); dl.innerHTML=icon("download",15)+" Download ▾";
     if(v.fit==="no") dl.title="Likely won't fit in 8 GB RAM — expect swapping/very slow";
-    dl.addEventListener("click",()=>startPull(m.name));
+    // Click opens a per-card target menu (NAS / Mac / Local) so the user
+    // chooses where this specific model downloads to.
+    dl.addEventListener("click",(e)=>{ e.stopPropagation(); openDownloadMenu(dl, m.name); });
     actions.appendChild(dl);
   }
   card.appendChild(actions);
@@ -1435,18 +1697,80 @@ function renderBrowseCard(m){
 }
 
 // --- Pull flow (enqueue a background pull, tail progress over SSE) ----------
-async function startPull(model){
+// startPull routes by target: "local" drives the visitor's own Ollama from the
+// browser (the NAS backend can't reach localhost:11434); "nas"/"mac" hit the
+// backend single-pull worker (sending host so the right backend gets it);
+// "auto" sends no host and the backend picks by catalog intent (mac-tagged →
+// Mac, else NAS). One progress bar serves both paths; cancel routes to the
+// active one.
+async function startPull(model, target){
+  target = target || pullTarget || "auto";
+  if(target === "local"){ startLocalPull(model); return; }
+  pullMode = "server";
   try{
-    const r=await fetchRetry("/api/models/pull",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model})},{label:"Start pull"});
+    const body = { model };
+    if(target === "nas" || target === "mac") body.host = target;
+    const r=await fetchRetry("/api/models/pull",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)},{label:"Start pull"});
     const j=await r.json().catch(()=>({}));
     if(r.status===409){ attachPull(j); return; }       // a pull is already running — tail it
-    if(!r.ok){ flashError(j.error||"Could not start pull"); return; }
+    if(!r.ok){ flashError(j.error||"Could not start pull"); pullMode=null; return; }
     attachPull(j);
-  }catch(e){ flashError(errText(e)); }
+  }catch(e){ flashError(errText(e)); pullMode=null; }
+}
+
+// Browser-driven pull onto the visitor's own Ollama. POST localhost:11434/api/pull
+// with stream:true and parse the NDJSON progress ({status,digest,total,completed}),
+// aggregating per-layer bytes the same way the backend's ingestProgress does, and
+// drive the shared renderPullStatus bar directly (no SSE). Cancel aborts the
+// fetch. On success, re-probe /api/tags so the new model (with capabilities)
+// appears in the selector.
+async function startLocalPull(model){
+  if(pullES){ pullES.close(); pullES=null; }     // a server SSE tail can't drive a local pull
+  if(activePullAbort){ activePullAbort.abort(); }
+  const ctrl=new AbortController(); activePullAbort=ctrl; pullMode="local"; pullJobModel=model;
+  renderPullStatus({ model, percent:0, completed:0, total:0, phase:"pulling manifest", status:"pulling", jobId:"local" });
+  let resp;
+  try{ resp=await fetch("http://localhost:11434/api/pull",{ method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({model, stream:true}), signal:ctrl.signal }); }
+  catch(e){ if(ctrl.signal.aborted){ abortCleanup(); return; } onPullError(localFetchErrMsg(String(e&&e.message||e))); abortCleanup(); return; }
+  if(!resp.ok){ onPullError(localStatusErrMsg(resp.status)); abortCleanup(); return; }
+  const reader=resp.body.getReader(); const dec=new TextDecoder(); let buf=""; const layers=new Map(); let finished=false; let gotSuccess=false;
+  try{
+    while(!finished){
+      const {done,value}=await reader.read();
+      if(done) break;
+      buf+=dec.decode(value,{stream:true});
+      let idx;
+      while((idx=buf.indexOf("\n"))>=0){
+        const line=buf.slice(0,idx).trim(); buf=buf.slice(idx+1);
+        if(!line) continue;
+        let p; try{ p=JSON.parse(line); }catch{ continue; }
+        const status=String(p.status||"");
+        if(status==="success"){ gotSuccess=true; finished=true; break; }
+        if(p.digest && p.total){ layers.set(p.digest, {completed:p.completed||0, total:p.total}); }
+        if(status.startsWith("downloading")){
+          let completed=0,total=0; for(const l of layers.values()){ completed+=l.completed; total+=l.total; }
+          if(pullEls){ pullEls.fill.style.width=(total>0?(completed/total*100):0)+"%"; pullEls.bytes.textContent=fmtPullBytes(completed,total); pullEls.phase.textContent=prettyPhase("pulling"); }
+        } else if(status && pullEls){ pullEls.phase.textContent=prettyPhase(status); }
+      }
+    }
+  }catch(e){ if(ctrl.signal.aborted){ abortCleanup(); return; } }
+  activePullAbort=null;
+  if(gotSuccess){ await onLocalPullDone(); } else { pullMode=null; }
+}
+function abortCleanup(){ activePullAbort=null; pullMode=null; $("pullStatus").classList.add("hidden"); pullEls=null; }
+async function onLocalPullDone(){
+  if(pullEls){ pullEls.fill.style.width="100%"; pullEls.phase.textContent="Installed ✓"; pullEls.cancel.disabled=true; }
+  setTimeout(async ()=>{
+    $("pullStatus").classList.add("hidden"); pullEls=null; pullMode=null;
+    await reattachLocalModels();   // re-probe localhost → new model + caps appear in selector
+    await loadModels();
+    await switchTab(modelsTab);
+  }, 1100);
 }
 
 function attachPull(job){
   pullJobModel=job.model||null;
+  pullMode="server";
   renderPullStatus(job);
   tailPull(job.jobId);
 }
@@ -1498,6 +1822,7 @@ function tailPull(jobId){
 
 async function onPullDone(){
   if(pullEls){ pullEls.fill.style.width="100%"; pullEls.phase.textContent="Installed ✓ — benchmarked"; pullEls.cancel.disabled=true; }
+  pullMode=null;
   setTimeout(async ()=>{
     $("pullStatus").classList.add("hidden"); pullEls=null;
     await loadModels();                              // refresh the header selector (benchmark now persisted)
@@ -1506,18 +1831,22 @@ async function onPullDone(){
 }
 
 function onPullError(msg){
+  pullMode=null;
   if(pullEls) pullEls.phase.textContent="Error";
   flashError(String(msg||"pull failed"));
 }
 
 async function cancelPull(jobId){
-  try{ await fetchRetry("/api/models/pull/"+encodeURIComponent(jobId)+"/cancel",{method:"POST"},{label:"Cancel pull"}); }catch{} }
-
+  // A local (browser-driven) pull has no backend job to cancel — abort the fetch.
+  if(pullMode==="local" && activePullAbort){ activePullAbort.abort(); return; }
+  try{ await fetchRetry("/api/models/pull/"+encodeURIComponent(jobId)+"/cancel",{method:"POST"},{label:"Cancel pull"}); }catch{}
+}
 // --- Per-model actions ------------------------------------------------------
 function useModel(name){
   selectedModel=name; localStorage.setItem("nas-llm-model", selectedModel);
   syncVision();
   renderModels();
+  enforceToolGating();
   if(activeId && !generatingIds.has(activeId)) saveConversation();
   closeModelsPanel();
 }
@@ -1598,6 +1927,14 @@ async function toggleDetails(name, card){
 function badge(label, cls){ const b=document.createElement("span"); b.className="badge "+(cls||""); b.textContent=label; return b; }
 function mutedNote(text){ const d=document.createElement("div"); d.className="muted"; d.textContent=text; return d; }
 function capLabel(c){ return {completion:"chat",tools:"tools",vision:"vision",thinking:"thinking",embedding:"embeddings"}[c]||c; }
+// A .badges row of capability badges (tools/vision/thinking/embeddings) for a
+// model card. "completion" is universal so it's skipped. Returns null when the
+// model has no displayable caps (so callers can avoid an empty row).
+function capBadges(caps){
+  const d=document.createElement("div"); d.className="badges";
+  (caps||[]).forEach(c=>{ if(c==="completion") return; const b=badge(capLabel(c),"cap"); d.appendChild(b); });
+  return d.childNodes.length ? d : null;
+}
 function fmtPullBytes(completed, total){ if(!total) return ""; return `${(completed/1e9).toFixed(2)} / ${(total/1e9).toFixed(2)} GB`; }
 function prettyPhase(p){ const m={queued:"Queued…","pulling manifest":"Pulling manifest…","verifying sha256 digest":"Verifying…","writing manifest":"Writing manifest…","removing any unused layers":"Cleaning up…",success:"Downloaded — benchmarking…",pulling:"Pulling…",benchmarking:"Benchmarking…"}; return m[p]||p; }
 function fitBadge(v){

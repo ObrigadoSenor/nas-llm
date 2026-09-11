@@ -489,3 +489,68 @@ func TestHandleModelResponse_NoActiveJobOrWrongUser(t *testing.T) {
 		t.Errorf("stale-jobId status = %d, want 409", rec3.Code)
 	}
 }
+
+// TestAgentLoop_LocalRelayToolCallsExecuteAndContinue is the integration test the
+// relay unit tests can't cover: a local (browser-relay) agent job where the
+// browser POSTs a tool_call for one round and a final answer for the next. It
+// proves the relay's tool_calls round-trip feeds the agent loop, the tool
+// executes server-side, and the loop continues to a clean done (the failure
+// mode the reported bug was blamed on). Uses the calculator tool (pure, no
+// SearXNG/config needed) so the execution is deterministic.
+func TestAgentLoop_LocalRelayToolCallsExecuteAndContinue(t *testing.T) {
+	st, err := newStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	defer st.close()
+	srv := &server{cfg: config{contextLength: 8192, maxAgentSteps: 2}, store: st}
+	srv.jobs = newJobManager(st, srv)
+
+	const email = "user@example.com"
+	convID := "conv-agent"
+	if _, err := st.createConversation(email, convID, "t", "local:1b",
+		[]Message{{Role: "user", Content: "what is 2+3*4?"}}); err != nil {
+		t.Fatalf("createConversation: %v", err)
+	}
+
+	j := newJob(convID, email, "local:1b", false, false, true) // agent=true
+	j.local = true
+	if err := srv.jobs.enqueue(j); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	// Round 1: the browser runs inference on its own Ollama and POSTs a
+	// calculator tool_call back (as handleModelResponse would deliver it).
+	waitForRelay(t, j, 5*time.Second)
+	tc := oaiToolCall{ID: "tc1", Type: "function"}
+	tc.Function.Name = "calculator"
+	tc.Function.Arguments = `{"expression":"2+3*4"}`
+	claimRelay(t, j, relayResponse{content: "let me compute that", toolCalls: []oaiToolCall{tc}})
+
+	// Round 2: the browser POSTs the final synthesized answer.
+	waitForRelay(t, j, 5*time.Second)
+	claimRelay(t, j, relayResponse{content: "done"})
+
+	select {
+	case <-j.finished:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("agent job did not finalize after the final answer")
+	}
+	status, content, _ := j.snapshot()
+	if status != "done" {
+		t.Errorf("job status = %q, want \"done\"", status)
+	}
+	if !strings.Contains(content, "done") {
+		t.Errorf("accumulated content = %q, want it to contain the final answer", content)
+	}
+	steps := j.stepSnapshot()
+	if len(steps) == 0 {
+		t.Fatalf("expected at least one agent step (the calculator call), got 0")
+	}
+	if steps[0].Tool != "calculator" {
+		t.Errorf("first step tool = %q, want \"calculator\"", steps[0].Tool)
+	}
+	if !strings.Contains(steps[0].Preview, "14") {
+		t.Errorf("first step preview = %q, want it to contain the result 14", steps[0].Preview)
+	}
+}

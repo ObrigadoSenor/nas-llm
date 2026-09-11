@@ -195,6 +195,7 @@ func (s *server) routes() http.Handler {
 
 	mux.HandleFunc("GET /api/models", s.requireAuth(s.handleModels))
 	mux.HandleFunc("GET /api/models/catalog", s.requireAuth(s.handleModelCatalog))
+	mux.HandleFunc("GET /api/models/library", s.requireAuth(s.handleModelLibrary))
 	mux.HandleFunc("POST /api/models/pull", s.requireAuth(s.handleModelPull))
 	mux.HandleFunc("GET /api/models/pulls/active", s.requireAuth(s.handleActivePulls))
 	mux.HandleFunc("GET /api/models/pull/{jobId}/events", s.requireAuth(s.handlePullEvents))

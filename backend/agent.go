@@ -342,6 +342,12 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 			// rendered by the browser (relay), and stays in the bubble + j.content
 			// (the answer, not thinking).
 			emitPhase("answering")
+			// If the model answered on its very first turn without ever calling a
+			// tool, surface that as a trace step so a tool-capable model declining to
+			// use tools reads as model behavior, not a silent "agent did nothing".
+			if step == 0 {
+				emitTool(agentStep{Step: 1, Tool: "(direct)", Preview: "Answered directly — no tools were needed."})
+			}
 			if roundText == "" {
 				emit("(no response)")
 			}
