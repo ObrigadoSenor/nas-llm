@@ -492,9 +492,16 @@ async fn proxy_api(State(st): State<AppState>, req: Request<Body>) -> Response {
         }
     }
 
-    // An empty Set-Cookie value (logout clears the cookie) empties the jar.
-    let to_store = captured.and_then(|v| if v.is_empty() { None } else { Some(v) });
-    st.set_cookie(to_store).await;
+    // Only touch the jar when the backend actually sent a Set-Cookie for the
+    // session. The vast majority of /api/* responses (auth/me, models, chats,
+    // events…) carry NO Set-Cookie, and wiping the jar on those would log the
+    // user out after the first post-login call. An explicit clear
+    // (nas-llm-session=; MaxAge=-1, as sent by /api/auth/logout) empties the jar.
+    match captured {
+        Some(v) if v.is_empty() => st.set_cookie(None).await,
+        Some(v) => st.set_cookie(Some(v)).await,
+        None => { /* no Set-Cookie — leave the persisted jar untouched */ }
+    }
 
     let stream = resp
         .bytes_stream()
@@ -720,7 +727,12 @@ async fn sidecar_verify(State(st): State<AppState>, Json(body): Json<VerifyBody>
         Some(o) => o,
         None => return verify_err("link did not reach a magic-link verify URL (/api/auth/verify)"),
     };
-    let to_store = captured.and_then(|v| if v.is_empty() { None } else { Some(v) });
+    // Only update the jar when we actually captured a NEW session cookie. A
+    // failed/expired verify (no Set-Cookie on any hop) must NOT log the user
+    // out of an existing valid session — clearing is the job of /__sidecar/logout.
+    // This also keeps a bogus probe (e.g. a test against a host that returns no
+    // nas-llm-session cookie) from wiping a real persisted session.
+    let new_cookie = captured.and_then(|v| if v.is_empty() { None } else { Some(v) });
     // The cookie is scoped to the verify URL's origin, so all subsequent /api/*
     // calls must go there too. Persist it so a relaunch keeps talking to the
     // same host.
@@ -728,12 +740,15 @@ async fn sidecar_verify(State(st): State<AppState>, Json(body): Json<VerifyBody>
         *st.backend_url.write().await = origin.clone();
     }
     persist_backend(&st.data_dir, &origin);
-    st.set_cookie(to_store.clone()).await;
-    let email = if to_store.is_some() {
-        probe_email(&st.client, &origin, to_store.as_deref()).await
+    let cookie_for_probe = if let Some(cv) = new_cookie.clone() {
+        st.set_cookie(Some(cv.clone())).await;
+        Some(cv)
     } else {
-        None
+        // Leave the existing jar untouched on failure; probe with whatever's
+        // already there so the response reflects the real auth state.
+        st.cookie_value().await
     };
+    let email = probe_email(&st.client, &origin, cookie_for_probe.as_deref()).await;
     let ok = email.is_some();
     json_ok(&VerifyResponse {
         ok,
