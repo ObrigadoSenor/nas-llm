@@ -189,9 +189,10 @@ branch** so `main` is never dirtied:
 idempotent — reuses an existing `agent/<slug>`) and stores `repo_branch` on the
 conversation. If the tree is dirty and the checkout would fail, you get a toast
 and a choice to continue on the current branch instead — nothing is forced.
-- A **branch rail** sits in the header while a repo-bound chat is open:
-`⎇ branch · ●N dirty · ↑a ↓b`, polled every few seconds and refreshed after each
-tool call. Click it to open the **session panel**.
+- A small **status line** below the input field shows the repo, branch, and git
+state (`owner/repo · ⎇ branch · ●N dirty · ↑a ↓b`, plus `no remote` when there
+isn't one) while a repo-bound chat is open — polled every few seconds and
+refreshed after each tool call. Click it to open the **session panel**.
 - Agent edits arrive as `apply_patch`/`run_command` calls, each shown in an
 approval dialog prefixed with `tool → owner/repo @ branch` so you see where a
 write lands before approving.

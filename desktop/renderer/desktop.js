@@ -725,29 +725,36 @@ async function branchForRepo(name) {
   return "";
 }
 
-function ensureBranchRail() {
-  let rail = $("dsBranchRail");
-  if (rail) return;
-  const meta = $("chatMeta");
-  if (!meta) return;
-  rail = el("button", "ds-branch-rail");
-  rail.id = "dsBranchRail"; rail.type = "button";
-  rail.title = "Open the repo session panel"; rail.setAttribute("aria-label", "Repo session");
-  rail.onclick = (e) => { e.stopPropagation(); if (railRepo) openSessionPanel(railRepo); };
-  meta.parentElement.insertBefore(rail, meta.nextSibling);
+// ensureComposerStatus creates the small repo/branch status line below the
+// composer input (desktop-only) if it isn't already present. Clicking it opens
+// the repo session panel. Lives inside .composer, after .input-wrap.
+function ensureComposerStatus() {
+  let status = $("dsComposerStatus");
+  if (status) return;
+  const wrap = document.querySelector(".composer .input-wrap");
+  if (!wrap || !wrap.parentElement) return;
+  status = el("div", "ds-composer-status");
+  status.id = "dsComposerStatus";
+  status.title = "Open the repo session panel";
+  status.onclick = (e) => { e.stopPropagation(); if (railRepo) openSessionPanel(railRepo); };
+  wrap.parentElement.appendChild(status);
 }
 
-function renderBranchRail() {
-  const rail = $("dsBranchRail");
-  if (!rail) return;
-  if (!railRepo) { rail.classList.add("hidden"); return; }
+// renderComposerStatus fills the below-input line with the repo + branch + git
+// state. Hidden for non-repo chats / login view.
+function renderComposerStatus() {
+  const status = $("dsComposerStatus");
+  if (!status) return;
+  if (!railRepo) { status.classList.add("hidden"); status.textContent = ""; return; }
   const s = railState || {};
-  const parts = ["⎇ " + (s.branch || railRepo)];
+  const parts = [railRepo];
+  if (s.branch) parts.push("⎇ " + s.branch);
   if (s.dirty) parts.push("●" + s.dirty + " dirty");
   if (s.ahead) parts.push("↑" + s.ahead);
   if (s.behind) parts.push("↓" + s.behind);
-  rail.textContent = parts.join(" · ");
-  rail.classList.remove("hidden");
+  if (s.hasRemote === false) parts.push("no remote");
+  status.textContent = parts.join(" · ");
+  status.classList.remove("hidden");
 }
 
 function stopRailPoll() { if (railTimer) { clearInterval(railTimer); railTimer = null; } }
@@ -756,13 +763,13 @@ function startRailPoll() { stopRailPoll(); if (railRepo) railTimer = setInterval
 async function refreshRailState() {
   if (!railRepo) return;
   const r = await sid("repos/state?name=" + encodeURIComponent(railRepo));
-  if (r.ok && r.data) { railState = r.data; renderBranchRail(); }
+  if (r.ok && r.data) { railState = r.data; renderComposerStatus(); }
 }
 
 function hideBranchRail() {
   railRepo = null; railState = null; stopRailPoll();
-  const rail = $("dsBranchRail");
-  if (rail) rail.classList.add("hidden");
+  const status = $("dsComposerStatus");
+  if (status) { status.classList.add("hidden"); status.textContent = ""; }
 }
 
 // Re-bind the rail to the active conversation's repo (or hide it for non-repo
@@ -784,9 +791,9 @@ async function actualSyncBranchRail() {
   if (!repo || !repo.fullName) { hideBranchRail(); return; }
   const changed = railRepo !== repo.fullName;
   railRepo = repo.fullName;
-  ensureBranchRail();
+  ensureComposerStatus();
   if (changed) { await refreshRailState(); startRailPoll(); }
-  renderBranchRail();
+  renderComposerStatus();
 }
 
 // Create a repo-bound agent chat on its own agent/<slug> branch, place it in

@@ -312,23 +312,19 @@
   margin-top: 8px;
 }
 
-/* --- Branch rail (header, desktop-only) --- */
-.ds-branch-rail {
-  background: transparent;
-  border: 1px solid #2a2e37;
-  color: #c7ccd4;
-  border-radius: 8px;
-  height: 28px;
-  margin-left: 8px;
-  padding: 0 10px;
-  font-size: 12px;
-  line-height: 1;
-  cursor: pointer;
-  white-space: nowrap;
+/* --- Composer status line (below the input, desktop-only) --- */
+/* Small muted text: repo + branch + git state for a repo-bound chat. Click opens
+   the repo session panel. */
+.ds-composer-status {
+  margin: 6px 4px 0;
+  font-size: 11px;
+  color: #6b707a;
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  cursor: pointer; user-select: none;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.ds-branch-rail:hover { background: #1b1f27; color: #e6e6e6; }
-.ds-branch-rail.hidden { display: none; }
+.ds-composer-status:hover { color: #9aa0aa; }
+.ds-composer-status.hidden { display: none; }
 
 /* --- Sidebar chat rows: title + branch under it --- */
 .ds-repo-chat-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
