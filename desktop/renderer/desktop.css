@@ -146,6 +146,13 @@
 }
 .ds-btn-approve:hover { background: #a93226; }
 .ds-approval-row { justify-content: flex-end; margin-top: 14px; }
+/* Which chat is asking — shown above the tool/repo/branch line so a second
+   concurrent chat's approval isn't mistaken for the one you expected. */
+.ds-approval-chat {
+  font-size: 12px; color: #8ab4f8; font-weight: 600;
+  margin-bottom: 4px;
+}
+.ds-approval-chat.hidden { display: none; }
 .ds-approval-kind {
   font-size: 14px; color: #e6e6e6; font-weight: 600;
   background: #1a1d24; border: 1px solid #2a2e37; border-radius: 8px;
@@ -368,6 +375,10 @@
 }
 .ds-composer-status:hover { color: #9aa0aa; }
 .ds-composer-status.hidden { display: none; }
+/* Branch segment of the composer status line: its own click target (opens
+   openChatBranchPicker) distinct from the rest of the line (session panel). */
+.ds-branch-chip { color: #8ab4f8; cursor: pointer; }
+.ds-branch-chip:hover { text-decoration: underline; }
 
 /* --- Sidebar chat rows: title + branch under it --- */
 .ds-repo-chat-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
