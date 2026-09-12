@@ -62,6 +62,7 @@ fn main() {
     );
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(state.clone())
         .setup(move |app| {
             // Run the sidecar HTTP server on the Tauri async runtime (tokio).
