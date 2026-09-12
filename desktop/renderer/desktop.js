@@ -892,60 +892,99 @@ function hostOf(remote) {
   return "";
 }
 
-// localRow renders one connected repo as a workspace: the repo row (name,
-// badges, Pull/Ship/+ New chat) plus the list of chats attached to it.
+// Which repos are expanded in the sidebar dropdown (persisted by full_name).
+let expandedRepos = new Set();
+try { expandedRepos = new Set(JSON.parse(localStorage.getItem("nas-llm-repo-expanded") || "[]")); } catch {}
+function saveExpandedRepos() { try { localStorage.setItem("nas-llm-repo-expanded", JSON.stringify([...expandedRepos])); } catch {} }
+
+// pullRepo runs `git pull --ff-only` on a connected repo and refreshes the list.
+async function pullRepo(r) {
+  const res = await sid("repos/refresh", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: r.name }) });
+  const d = (res && res.data) || {};
+  if (!d.ok) flashDsErr(d.error || res.status);
+  refreshLocal();
+}
+
+// repoMenu opens a small popup of per-repo actions anchored under the ⋯ button.
+// Closes on outside click, Esc, or item selection.
+function repoMenu(r, anchor) {
+  closeRepoMenu();
+  const menu = el("div", "ds-repo-menu");
+  menu.id = "dsRepoMenu";
+  const add = (label, title, fn) => {
+    const item = el("button", "ds-repo-menu-item", label);
+    if (title) item.title = title;
+    item.onclick = (e) => { e.stopPropagation(); closeRepoMenu(); fn(); };
+    menu.appendChild(item);
+  };
+  add("Pull", "git pull --ff-only", () => pullRepo(r));
+  add("Session…", "Diff, commit & push, open PR, revert", () => openSessionPanel(r.name));
+  add("Ship…", "Versioned release (changelog + commit/push)", () => openShipChanges(r));
+  document.body.appendChild(menu);
+  const rect = anchor.getBoundingClientRect();
+  menu.style.right = (window.innerWidth - rect.right) + "px";
+  menu.style.top = (rect.bottom + 4) + "px";
+  // Defer the outside-click listener so the same click that opened it doesn't
+  // immediately close it (the click stops propagating, but this is belt+braces).
+  setTimeout(() => {
+    menu._outside = (e) => { if (!menu.contains(e.target)) closeRepoMenu(); };
+    menu._esc = (e) => { if (e.key === "Escape") closeRepoMenu(); };
+    document.addEventListener("click", menu._outside);
+    document.addEventListener("keydown", menu._esc);
+  }, 0);
+}
+function closeRepoMenu() {
+  const menu = $("dsRepoMenu");
+  if (!menu) return;
+  if (menu._outside) document.removeEventListener("click", menu._outside);
+  if (menu._esc) document.removeEventListener("keydown", menu._esc);
+  menu.remove();
+}
+
+// localRow renders one connected repo as a dropdown: a header with the repo
+// name, a ⋯ actions menu, and a + to start a new agent chat. Expanding the
+// header shows the chats attached to it. Branch/dirty state lives in the
+// header rail (in-chat) and the session panel, so the sidebar row stays clean.
 function localRow(r, chats) {
   const wrap = el("div", "ds-repo-wrap");
-  const row = el("div", "ds-repo-row");
-  const main = el("div", "ds-repo-main");
-  const name = el("div", "ds-repo-name", r.name);
-  const dirtyBadge = r.dirty > 0 ? el("span", "ds-badge ds-badge-dirty", r.dirty + " dirty") : el("span", "ds-badge ds-badge-clean", "clean");
-  name.appendChild(dirtyBadge);
-  if (r.linked) name.appendChild(el("span", "ds-badge ds-badge-linked", "linked"));
-  else name.appendChild(el("span", "ds-badge ds-badge-cloned", "cloned"));
-  const host = hostOf(r.remote);
-  if (host) name.appendChild(el("span", "ds-badge ds-badge-remote", host));
-  main.appendChild(name);
-  const meta = el("div", "ds-repo-meta", r.branch);
-  main.appendChild(meta);
-  row.appendChild(main);
+  if (expandedRepos.has(r.name)) wrap.classList.add("expanded");
 
-  const session = el("button", "ds-btn ds-btn-ghost ds-btn-sm", "⋯");
-  session.title = "Repo session: diff, commit/push, open PR, ship"; session.setAttribute("aria-label", "Repo session");
-  session.onclick = (e) => { e.stopPropagation(); openSessionPanel(r.name); };
-  row.appendChild(session);
-
-  const refresh = el("button", "ds-btn ds-btn-ghost ds-btn-sm", "Pull");
-  refresh.onclick = async () => {
-    refresh.disabled = true; refresh.textContent = "Pulling…";
-    const res = await sid("repos/refresh", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: r.name }) });
-    refresh.disabled = false; refresh.textContent = "Pull";
-    const d = (res && res.data) || {};
-    if (!d.ok) flashDsErr(d.error || res.status);
-    refreshLocal();
+  const head = el("div", "ds-repo-head");
+  const chev = el("span", "ds-repo-chev", "▸");
+  head.appendChild(chev);
+  const nameBtn = el("button", "ds-repo-name-btn");
+  nameBtn.title = r.branch ? (r.name + " · on " + r.branch) : r.name;
+  nameBtn.appendChild(el("span", "ds-repo-name", r.name));
+  if (r.dirty > 0) nameBtn.appendChild(el("span", "ds-repo-dirty", "●" + r.dirty));
+  nameBtn.onclick = () => {
+    if (expandedRepos.has(r.name)) expandedRepos.delete(r.name);
+    else expandedRepos.add(r.name);
+    saveExpandedRepos();
+    wrap.classList.toggle("expanded");
   };
-  row.appendChild(refresh);
+  head.appendChild(nameBtn);
 
-  const ship = el("button", "ds-btn ds-btn-ghost ds-btn-sm", "Ship");
-  ship.title = "Review changes, write a changelog, and commit/push a version";
-  ship.onclick = () => openShipChanges(r);
-  row.appendChild(ship);
-
-  const agent = el("button", "ds-btn ds-btn-sm", "+ New chat");
-  agent.onclick = async () => {
-    agent.disabled = true; agent.textContent = "Creating…";
+  const actions = el("div", "ds-repo-actions");
+  const menuBtn = el("button", "ds-btn ds-btn-ghost ds-btn-sm", "⋯");
+  menuBtn.title = "Repo actions"; menuBtn.setAttribute("aria-label", "Repo actions");
+  menuBtn.onclick = (e) => { e.stopPropagation(); repoMenu(r, menuBtn); };
+  actions.appendChild(menuBtn);
+  const addBtn = el("button", "ds-btn ds-btn-sm ds-repo-add", "+");
+  addBtn.title = "New agent chat on a fresh branch"; addBtn.setAttribute("aria-label", "New chat");
+  addBtn.onclick = async (e) => {
+    e.stopPropagation();
+    addBtn.disabled = true; addBtn.textContent = "…";
     try { await createRepoChat(r); }
-    catch (e) { flashDsErr(String(e && e.message || e)); }
-    finally { agent.disabled = false; agent.textContent = "+ New chat"; }
+    catch (err) { flashDsErr(String((err && err.message) || err)); }
+    finally { addBtn.disabled = false; addBtn.textContent = "+"; }
   };
-  row.appendChild(agent);
-  wrap.appendChild(row);
+  actions.appendChild(addBtn);
+  head.appendChild(actions);
+  wrap.appendChild(head);
 
-  // Attached chats (the workspace).
+  // Attached chats (the dropdown body).
   const chatsEl = el("div", "ds-repo-chats");
   if (chats && chats.length) {
-    const head = el("div", "ds-repo-chats-head", chats.length + " chat" + (chats.length === 1 ? "" : "s"));
-    chatsEl.appendChild(head);
     chats.forEach((c) => {
       const cr = el("div", "ds-repo-chat");
       const cmain = el("div", "ds-repo-chat-main");
@@ -962,7 +1001,7 @@ function localRow(r, chats) {
       chatsEl.appendChild(cr);
     });
   } else {
-    chatsEl.appendChild(el("div", "ds-note", "No chats yet. Click + New chat to start one against this repo."));
+    chatsEl.appendChild(el("div", "ds-note", "No chats yet. Click + to start one."));
   }
   wrap.appendChild(chatsEl);
   return wrap;

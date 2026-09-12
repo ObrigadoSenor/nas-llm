@@ -176,6 +176,42 @@ Open **⚙ Desktop settings → Updates** to see the current version, click
 **Update to latest** to download, install, and relaunch. The app verifies the
 download against the pubkey in `tauri.conf.json` before installing.
 
+## Repo → agent chat → commit/push/PR (the workflow)
+
+The sidebar **Repos** section is the entry point. Connect a local git repo with
+**+** (folder picker; a parent dir with several repos yields a checklist). Each
+connected repo is a workspace with **Pull**, **Ship** (versioned release), and
+**+ New chat**.
+
+**+ New chat** starts an agent work session against that repo on its **own
+branch** so `main` is never dirtied:
+- The sidecar runs `git switch -c agent/<slug>` (slug from the chat title;
+idempotent — reuses an existing `agent/<slug>`) and stores `repo_branch` on the
+conversation. If the tree is dirty and the checkout would fail, you get a toast
+and a choice to continue on the current branch instead — nothing is forced.
+- A **branch rail** sits in the header while a repo-bound chat is open:
+`⎇ branch · ●N dirty · ↑a ↓b`, polled every few seconds and refreshed after each
+tool call. Click it to open the **session panel**.
+- Agent edits arrive as `apply_patch`/`run_command` calls, each shown in an
+approval dialog prefixed with `tool → owner/repo @ branch` so you see where a
+write lands before approving.
+
+**Finishing the work** — from the session panel (or per-repo ⋯):
+- **Commit** / **Commit & push** — plain `git add -A` + commit (+ optional push);
+no version/CHANGELOG ceremony. Push is disabled when the repo has no remote.
+- **Open PR** — pushes the head branch and opens a GitHub pull request (head =
+the chat's `agent/<slug>`, base = the repo's default branch) via the stored
+keychain token; returns the PR URL. Only for `github.com` repos with a token.
+- **Ship** — the existing versioned release flow (version + CHANGELOG + push).
+- **Revert** — `git checkout -- . && git clean -fd` to undo agent edits.
+
+The agent can also finish the loop itself: `git_commit`, `git_push`, and
+`create_pr` are agent tools (each approval-gated, same dialog). They're
+auto-enabled for repo-bound chats.
+
+After a session, switch the repo back to `main` (`git switch main`) to start
+clean; each chat keeps its own branch.
+
 ## Notes / out of scope for Phase 0
 
 - **Local LLMs (Ollama on this machine):** managed. The sidecar auto-starts an
