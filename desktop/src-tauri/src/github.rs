@@ -438,13 +438,21 @@ struct ExecBody {
     repo: String,
     tool: String,
     args: String,
+    #[serde(default)]
+    approved: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 struct ExecResult {
     observation: String,
     preview: String,
     is_error: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    needs_approval: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval_preview: Option<String>,
 }
 
 // repos_exec receives a file-tool call from the renderer (which got it from the
@@ -458,11 +466,12 @@ async fn repos_exec(State(st): State<AppState>, Json(body): Json<ExecBody>) -> R
             observation: format!("Repository {repo_name} is not cloned locally."),
             preview: "repo not found".into(),
             is_error: true,
+            ..Default::default()
         });
     }
     let root = match std::fs::canonicalize(&dest) {
         Ok(r) => r,
-        Err(e) => return json_ok(&ExecResult { observation: format!("repo dir: {e}"), preview: "error".into(), is_error: true }),
+        Err(e) => return json_ok(&ExecResult { observation: format!("repo dir: {e}"), preview: "error".into(), is_error: true, ..Default::default() }),
     };
     let result = match body.tool.as_str() {
         "read_file" => exec_read_file(&root, &body.args),
@@ -470,7 +479,9 @@ async fn repos_exec(State(st): State<AppState>, Json(body): Json<ExecBody>) -> R
         "glob" => exec_glob(&root, &body.args),
         "grep" => exec_grep(&root, &body.args),
         "git_status" => exec_git_status(&root).await,
-        other => ExecResult { observation: format!("Unknown tool: {other}"), preview: "unknown tool".into(), is_error: true },
+        "apply_patch" => exec_apply_patch(&root, &body.args, body.approved).await,
+        "run_command" => exec_run_command(&root, &body.args, body.approved).await,
+        other => ExecResult { observation: format!("Unknown tool: {other}"), preview: "unknown tool".into(), is_error: true, ..Default::default() },
     };
     json_ok(&result)
 }
@@ -498,18 +509,24 @@ fn cap(s: &str) -> String {
 fn exec_read_file(root: &Path, args: &str) -> ExecResult {
     let p = match serde_json::from_str::<serde_json::Value>(args) {
         Ok(v) => v.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string(),
-        Err(_) => return ExecResult { observation: "Invalid args for read_file.".into(), preview: "bad args".into(), is_error: true },
+        Err(_) => return ExecResult { observation: "Invalid args for read_file.".into(), preview: "bad args".into(), is_error: true,
+            ..Default::default()
+        },
     };
     if p.is_empty() {
-        return ExecResult { observation: "No path provided.".into(), preview: "no path".into(), is_error: true };
+        return ExecResult { observation: "No path provided.".into(), preview: "no path".into(), is_error: true,
+            ..Default::default()
+        };
     }
     let path = match safe_path(root, &p) {
         Ok(p) => p,
-        Err(e) => return ExecResult { observation: e.clone(), preview: e, is_error: true },
+        Err(e) => return ExecResult { observation: e.clone(), preview: e, is_error: true,
+            ..Default::default()
+        },
     };
     match std::fs::read_to_string(&path) {
-        Ok(content) => ExecResult { observation: cap(&content), preview: format!("read {} ({} bytes)", p, content.len()), is_error: false },
-        Err(e) => ExecResult { observation: format!("Could not read {p}: {e}"), preview: format!("read error: {p}"), is_error: true },
+        Ok(content) => ExecResult { observation: cap(&content), preview: format!("read {} ({} bytes)", p, content.len()), is_error: false, ..Default::default() },
+        Err(e) => ExecResult { observation: format!("Could not read {p}: {e}"), preview: format!("read error: {p}"), is_error: true, ..Default::default() },
     }
 }
 
@@ -523,11 +540,13 @@ fn exec_list_files(root: &Path, args: &str) -> ExecResult {
     } else {
         match safe_path(root, &subdir) {
             Ok(p) => p,
-            Err(e) => return ExecResult { observation: e.clone(), preview: e, is_error: true },
+            Err(e) => return ExecResult { observation: e.clone(), preview: e, is_error: true,
+            ..Default::default()
+        },
         }
     };
     if !dir.is_dir() {
-        return ExecResult { observation: format!("{subdir} is not a directory."), preview: "not a dir".into(), is_error: true };
+        return ExecResult { observation: format!("{subdir} is not a directory."), preview: "not a dir".into(), is_error: true, ..Default::default() };
     }
     let mut entries: Vec<String> = std::fs::read_dir(&dir)
         .map(|rd| rd.filter_map(|e| e.ok())
@@ -539,20 +558,24 @@ fn exec_list_files(root: &Path, args: &str) -> ExecResult {
         .unwrap_or_default();
     entries.sort();
     let listing = entries.join("\n");
-    ExecResult { observation: cap(&listing), preview: format!("{} entries", entries.len()), is_error: false }
+    ExecResult { observation: cap(&listing), preview: format!("{} entries", entries.len()), is_error: false, ..Default::default() }
 }
 
 fn exec_glob(root: &Path, args: &str) -> ExecResult {
     let pattern = match serde_json::from_str::<serde_json::Value>(args) {
         Ok(v) => v.get("pattern").and_then(|p| p.as_str()).unwrap_or("").to_string(),
-        Err(_) => return ExecResult { observation: "Invalid args for glob.".into(), preview: "bad args".into(), is_error: true },
+        Err(_) => return ExecResult { observation: "Invalid args for glob.".into(), preview: "bad args".into(), is_error: true,
+            ..Default::default()
+        },
     };
     if pattern.is_empty() {
-        return ExecResult { observation: "No pattern provided.".into(), preview: "no pattern".into(), is_error: true };
+        return ExecResult { observation: "No pattern provided.".into(), preview: "no pattern".into(), is_error: true,
+            ..Default::default()
+        };
     }
     let matches = glob_walk(root, root, &pattern, 0, 1000);
     let result = matches.join("\n");
-    ExecResult { observation: cap(&result), preview: format!("{} matches", matches.len()), is_error: false }
+    ExecResult { observation: cap(&result), preview: format!("{} matches", matches.len()), is_error: false, ..Default::default() }
 }
 
 // glob_walk recursively walks the tree and collects paths matching a simple
@@ -617,18 +640,24 @@ fn glob_match_segments(pat: &[&str], path: &[&str]) -> bool {
 fn exec_grep(root: &Path, args: &str) -> ExecResult {
     let v = match serde_json::from_str::<serde_json::Value>(args) {
         Ok(v) => v,
-        Err(_) => return ExecResult { observation: "Invalid args for grep.".into(), preview: "bad args".into(), is_error: true },
+        Err(_) => return ExecResult { observation: "Invalid args for grep.".into(), preview: "bad args".into(), is_error: true,
+            ..Default::default()
+        },
     };
     let pattern = v.get("pattern").and_then(|p| p.as_str()).unwrap_or("").to_string();
     if pattern.is_empty() {
-        return ExecResult { observation: "No pattern provided.".into(), preview: "no pattern".into(), is_error: true };
+        return ExecResult { observation: "No pattern provided.".into(), preview: "no pattern".into(), is_error: true,
+            ..Default::default()
+        };
     }
     let subdir = v.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
-    let search_root = if subdir.is_empty() { root.to_path_buf() } else { match safe_path(root, &subdir) { Ok(p) => p, Err(e) => return ExecResult { observation: e.clone(), preview: e, is_error: true } } };
+    let search_root = if subdir.is_empty() { root.to_path_buf() } else { match safe_path(root, &subdir) { Ok(p) => p, Err(e) => return ExecResult { observation: e.clone(), preview: e, is_error: true,
+            ..Default::default()
+        } } };
     let mut matches = Vec::new();
     grep_walk(root, &search_root, &pattern, &mut matches, 0, 200);
     let result = matches.join("\n");
-    ExecResult { observation: cap(&result), preview: format!("{} matches", matches.len()), is_error: false }
+    ExecResult { observation: cap(&result), preview: format!("{} matches", matches.len()), is_error: false, ..Default::default() }
 }
 
 fn grep_walk(root: &Path, dir: &Path, pattern: &str, out: &mut Vec<String>, depth: usize, max: usize) {
@@ -665,7 +694,6 @@ fn grep_walk(root: &Path, dir: &Path, pattern: &str, out: &mut Vec<String>, dept
 }
 
 async fn exec_git_status(root: &Path) -> ExecResult {
-    // Note: this is async to match the signature, but git status is sync.
     let out = tokio::process::Command::new("git")
         .arg("-C").arg(root)
         .arg("status").arg("--porcelain")
@@ -675,12 +703,102 @@ async fn exec_git_status(root: &Path) -> ExecResult {
             let s = String::from_utf8_lossy(&o.stdout).to_string();
             let trimmed = s.trim();
             if trimmed.is_empty() {
-                ExecResult { observation: "Working tree clean.".into(), preview: "clean".into(), is_error: false }
+                ExecResult { observation: "Working tree clean.".into(), preview: "clean".into(), is_error: false, needs_approval: None, approval_kind: None, approval_preview: None }
             } else {
-                ExecResult { observation: cap(trimmed), preview: format!("{} changes", trimmed.lines().count()), is_error: false }
+                ExecResult { observation: cap(trimmed), preview: format!("{} changes", trimmed.lines().count()), is_error: false, needs_approval: None, approval_kind: None, approval_preview: None }
             }
         }
-        _ => ExecResult { observation: "git status failed.".into(), preview: "git error".into(), is_error: true },
+        _ => ExecResult { observation: "git status failed.".into(), preview: "git error".into(), is_error: true, needs_approval: None, approval_kind: None, approval_preview: None },
+    }
+}
+
+// --- Write tools (Phase 4: per-invocation approval required) ---
+
+// apply_patch applies a unified diff to the repo via `git apply`. The user
+// must approve each application: if not approved, returns needs_approval with
+// the diff as the preview so the UI can show it. On approval, applies the
+// patch and returns the result.
+async fn exec_apply_patch(root: &Path, args: &str, approved: bool) -> ExecResult {
+    let patch = match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(v) => v.get("patch").and_then(|p| p.as_str()).unwrap_or("").to_string(),
+        Err(_) => return ExecResult { observation: "Invalid args for apply_patch.".into(), preview: "bad args".into(), is_error: true, needs_approval: None, approval_kind: None, approval_preview: None },
+    };
+    if patch.is_empty() {
+        return ExecResult { observation: "No patch provided.".into(), preview: "no patch".into(), is_error: true, needs_approval: None, approval_kind: None, approval_preview: None };
+    }
+    if !approved {
+        // Return a preview of the diff for the user to approve. Cap it so a
+        // huge diff doesn't flood the UI.
+        let preview = if patch.len() > 2000 { format!("{}\n...[{} more chars]", &patch[..2000], patch.len() - 2000) } else { patch.clone() };
+        return ExecResult {
+            observation: String::new(),
+            preview: "awaiting approval".into(),
+            is_error: false,
+            needs_approval: Some(true),
+            approval_kind: Some("apply_patch".into()),
+            approval_preview: Some(preview),
+        };
+    }
+    // Write the patch to a temp file and apply it with `git apply`.
+    let patch_file = root.join(".nas-llm-patch.tmp");
+    if let Err(e) = std::fs::write(&patch_file, &patch) {
+        return ExecResult { observation: format!("Could not write patch file: {e}"), preview: "write error".into(), is_error: true, needs_approval: None, approval_kind: None, approval_preview: None };
+    }
+    let out = tokio::process::Command::new("git")
+        .arg("-C").arg(root)
+        .arg("apply").arg(&patch_file)
+        .output().await;
+    let _ = std::fs::remove_file(&patch_file);
+    match out {
+        Ok(o) if o.status.success() => {
+            ExecResult { observation: "Patch applied successfully.".into(), preview: "applied".into(), is_error: false, needs_approval: None, approval_kind: None, approval_preview: None }
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            ExecResult { observation: format!("git apply failed: {stderr}"), preview: "apply failed".into(), is_error: true, needs_approval: None, approval_kind: None, approval_preview: None }
+        }
+        Err(e) => ExecResult { observation: format!("Could not run git: {e}"), preview: "git error".into(), is_error: true, needs_approval: None, approval_kind: None, approval_preview: None },
+    }
+}
+
+// run_command runs a shell command in the repo root. The user must approve each
+// command: if not approved, returns needs_approval with the command as the
+// preview. On approval, runs the command and returns its combined stdout+stderr
+// (capped). Commands run via `sh -c` in the repo directory.
+async fn exec_run_command(root: &Path, args: &str, approved: bool) -> ExecResult {
+    let command = match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(v) => v.get("command").and_then(|p| p.as_str()).unwrap_or("").to_string(),
+        Err(_) => return ExecResult { observation: "Invalid args for run_command.".into(), preview: "bad args".into(), is_error: true, needs_approval: None, approval_kind: None, approval_preview: None },
+    };
+    if command.is_empty() {
+        return ExecResult { observation: "No command provided.".into(), preview: "no command".into(), is_error: true, needs_approval: None, approval_kind: None, approval_preview: None };
+    }
+    if !approved {
+        return ExecResult {
+            observation: String::new(),
+            preview: "awaiting approval".into(),
+            is_error: false,
+            needs_approval: Some(true),
+            approval_kind: Some("run_command".into()),
+            approval_preview: Some(command.clone()),
+        };
+    }
+    let out = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .current_dir(root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output().await;
+    match out {
+        Ok(o) => {
+            let combined = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+            let trimmed = combined.trim();
+            let is_err = !o.status.success();
+            let preview = if is_err { format!("exit {}", o.status.code().unwrap_or(-1)) } else { "command completed".into() };
+            ExecResult { observation: cap(trimmed), preview, is_error: is_err, needs_approval: None, approval_kind: None, approval_preview: None }
+        }
+        Err(e) => ExecResult { observation: format!("Could not run command: {e}"), preview: "exec error".into(), is_error: true, needs_approval: None, approval_kind: None, approval_preview: None },
     }
 }
 

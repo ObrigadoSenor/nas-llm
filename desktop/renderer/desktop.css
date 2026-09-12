@@ -128,3 +128,26 @@
 
 /* Small button variant for row actions. */
 .ds-btn-sm { padding: 5px 10px; font-size: 12px; }
+
+/* --- Approval dialog (Phase 4: write tools) --- */
+.ds-btn-approve {
+  background: #c0392b; color: #fff; border: 0; border-radius: 8px;
+  padding: 8px 14px; font-size: 13px; cursor: pointer; white-space: nowrap; font-weight: 600;
+}
+.ds-btn-approve:hover { background: #a93226; }
+.ds-approval-row { justify-content: flex-end; margin-top: 14px; }
+.ds-approval-kind {
+  font-size: 14px; color: #e6e6e6; font-weight: 600;
+  background: #1a1d24; border: 1px solid #2a2e37; border-radius: 8px;
+  padding: 8px 12px; margin-bottom: 12px;
+}
+.ds-approval-pre-wrap {
+  max-height: 50vh; overflow: auto;
+  background: #0e1014; border: 1px solid #2a2e37; border-radius: 8px;
+}
+.ds-approval-pre {
+  margin: 0; padding: 10px 12px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px; line-height: 1.5; color: #c7ccd4;
+  white-space: pre-wrap; word-break: break-word;
+}

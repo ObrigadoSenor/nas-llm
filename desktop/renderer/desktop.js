@@ -74,21 +74,7 @@ function el(tag, cls, text) {
     es.addEventListener("toolExec", async (e) => {
       let d = {}; try { d = JSON.parse(e.data); } catch { return; }
       if (!d.jobId || !d.tool) return;
-      // Run the tool via the sidecar.
-      let execRes;
-      try {
-        const r = await fetch("/__sidecar/repos/exec", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repo: d.repo, tool: d.tool, args: d.args || "" }) });
-        execRes = await r.json();
-      } catch (err) {
-        execRes = { observation: String(err && err.message || err), preview: "exec error", is_error: true };
-      }
-      // Post the observation back to the backend so the agent loop continues.
-      try {
-        await fetch("/api/conversations/" + encodeURIComponent(convId) + "/tool-response", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ jobId: d.jobId, observation: execRes.observation || "", preview: execRes.preview || "", isError: !!execRes.is_error })
-        });
-      } catch {}
+      await runToolExec(convId, d);
     });
     return es;
   }
@@ -245,6 +231,93 @@ function fillOverlay() {
   if (u && !u.value) u.value = state.backend_url || "";
   const a = $("dsAuthOut");
   if (a) a.textContent = state.authed ? ("Signed in as " + (state.email || "?")) : "Not signed in.";
+}
+
+// Run one file-tool call via the sidecar. Write tools (apply_patch, run_command)
+// require per-invocation approval: the sidecar returns {needs_approval:true} with
+// a preview; we show an approval dialog and only re-POST with approved:true once
+// the user clicks Approve. On Reject, we post a rejection as the observation so
+// the agent loop can adjust. Read tools run immediately.
+async function runToolExec(convId, d) {
+  const execBody = { repo: d.repo, tool: d.tool, args: d.args || "" };
+  let execRes;
+  try {
+    const r = await fetch("/__sidecar/repos/exec", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(execBody) });
+    execRes = await r.json();
+  } catch (err) {
+    execRes = { observation: String(err && err.message || err), preview: "exec error", is_error: true };
+  }
+  // Write tools need approval — show a dialog and await the user's decision.
+  if (execRes && execRes.needs_approval) {
+    const approved = await showApprovalDialog(execRes.approval_kind || d.tool, execRes.approval_preview || "");
+    if (!approved) {
+      // Rejected: tell the agent so it can adjust.
+      execRes = { observation: "The user rejected this " + d.tool + " call. Do not retry it; adjust your approach.", preview: "rejected", is_error: true };
+    } else {
+      // Approved: re-POST with approved:true to actually execute.
+      try {
+        const r = await fetch("/__sidecar/repos/exec", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...execBody, approved: true }) });
+        execRes = await r.json();
+      } catch (err) {
+        execRes = { observation: String(err && err.message || err), preview: "exec error", is_error: true };
+      }
+    }
+  }
+  // Post the observation back to the backend so the agent loop continues.
+  try {
+    await fetch("/api/conversations/" + encodeURIComponent(convId) + "/tool-response", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jobId: d.jobId, observation: execRes.observation || "", preview: execRes.preview || "", isError: !!execRes.is_error })
+    });
+  } catch {}
+}
+
+// showApprovalDialog returns a Promise<boolean> — true if the user clicks
+// Approve, false if Reject. Renders an overlay with the tool kind, a
+// scrollable <pre> preview (diff or command), and the two buttons.
+function showApprovalDialog(kind, preview) {
+  return new Promise((resolve) => {
+    let overlay = $("dsApprovalOverlay");
+    if (!overlay) {
+      overlay = el("div", "ds-overlay");
+      overlay.id = "dsApprovalOverlay";
+      overlay.setAttribute("role", "dialog");
+      overlay.setAttribute("aria-modal", "true");
+      overlay.setAttribute("aria-label", "Approve tool call");
+      const card = el("div", "ds-card ds-card-wide");
+      const head = el("div", "ds-head");
+      head.appendChild(el("h2", null, "Approve tool call"));
+      const x = el("button", "ds-x"); x.textContent = "×"; x.title = "Reject"; x.setAttribute("aria-label", "Reject");
+      x.onclick = () => { closeApproval(false); };
+      head.appendChild(x);
+      card.appendChild(head);
+      const kindLabel = el("div", "ds-label", "Tool");
+      card.appendChild(kindLabel);
+      const kindVal = el("div", "ds-approval-kind", kind);
+      card.appendChild(kindVal);
+      const preWrap = el("div", "ds-approval-pre-wrap");
+      const pre = document.createElement("pre"); pre.className = "ds-approval-pre";
+      preWrap.appendChild(pre);
+      card.appendChild(preWrap);
+      const row = el("div", "ds-row ds-approval-row");
+      const approve = el("button", "ds-btn ds-btn-approve", "Approve");
+      const reject = el("button", "ds-btn ds-btn-ghost", "Reject");
+      row.appendChild(reject); row.appendChild(approve);
+      card.appendChild(row);
+      overlay.appendChild(card);
+      document.body.appendChild(overlay);
+      overlay._close = (val) => { overlay.classList.remove("open"); resolve(val); };
+      const closeApproval = (val) => { if (overlay._close) overlay._close(val); };
+      approve.onclick = () => closeApproval(true);
+      reject.onclick = () => closeApproval(false);
+      overlay.addEventListener("click", (e) => { if (e.target === overlay) closeApproval(false); });
+      overlay._pre = pre;
+      overlay._kind = kindVal;
+    }
+    overlay._kind.textContent = kind;
+    overlay._pre.textContent = preview;
+    overlay.classList.add("open");
+  });
 }
 
 // --- Repos panel (GitHub + local clones) ---

@@ -281,6 +281,8 @@ func (s *server) toolRegistry(email string) map[string]agentTool {
 		"glob":      globTool(),
 		"grep":      grepTool(),
 		"git_status": gitStatusTool(),
+		"apply_patch": applyPatchTool(),
+		"run_command": runCommandTool(),
 	} {
 		reg[name] = agentTool{schema: schema, local: true}
 	}
@@ -338,6 +340,26 @@ func gitStatusTool() oaiTool {
 	}}
 }
 
+func applyPatchTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "apply_patch",
+		Description: "Apply a unified diff to the repository. Each change must be a valid unified diff (git diff format) with --- and +++ headers and @@ hunks. The user must approve each application.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"patch": map[string]any{"type": "string", "description": "The unified diff to apply, e.g. --- a/file.go\n+++ b/file.go\n@@ -1,3 +1,4 @@\n line1\n+new line\n line3"},
+		}, "required": []string{"patch"}},
+	}}
+}
+
+func runCommandTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "run_command",
+		Description: "Run a shell command in the repository root (e.g. go test, npm run lint, make build). The user must approve each command before it runs. Output is captured and returned.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"command": map[string]any{"type": "string", "description": "The shell command to run, e.g. go test ./..."},
+		}, "required": []string{"command"}},
+	}}
+}
+
 // injectRepoContext prepends a repo context block to the agent system prompt
 // so the model knows which repository it's working against: the repo name,
 // current branch, HEAD, and the top-level file tree. This is injected only for
@@ -358,7 +380,7 @@ func injectRepoContext(sys string, r *Repo) string {
 	} else {
 		b.WriteString("(empty)")
 	}
-	b.WriteString(". Use the read_file, list_files, glob, grep, and git_status tools to explore the codebase and answer questions about it. Paths are repository-relative. Keep answers grounded in what you read — do not guess at file contents.\n\n")
+b.WriteString(". Use the read_file, list_files, glob, grep, and git_status tools to explore the codebase. Use apply_patch to make edits (each requires user approval) and run_command to run build/test commands (each requires approval). Paths are repository-relative. Keep answers grounded in what you read — do not guess at file contents.\n\n")
 	b.WriteString(sys)
 	return b.String()
 }
@@ -668,6 +690,8 @@ func availableTools(fetchPage bool) []toolMeta {
 		toolMeta{Name: "glob", Label: "Glob", Description: "Find files by name pattern (desktop only)."},
 		toolMeta{Name: "grep", Label: "Grep", Description: "Search file contents in the repository (desktop only)."},
 		toolMeta{Name: "git_status", Label: "Git status", Description: "Show the working tree status (desktop only)."},
+		toolMeta{Name: "apply_patch", Label: "Apply patch", Description: "Apply a unified diff to the repo (desktop only, requires approval)."},
+		toolMeta{Name: "run_command", Label: "Run command", Description: "Run a shell command in the repo (desktop only, requires approval)."},
 	)
 	return out
 }

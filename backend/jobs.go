@@ -889,7 +889,7 @@ func (s *server) runGeneration(j *job) error {
 		var toolExecRelay func(context.Context, int, string, string) toolOutcome
 		if repoID != "" {
 			if repo, err := s.store.getRepo(j.email, repoID); err == nil && repo != nil {
-				allow = append(allow, "read_file", "list_files", "glob", "grep", "git_status")
+			allow = append(allow, "read_file", "list_files", "glob", "grep", "git_status", "apply_patch", "run_command")
 				sys = injectRepoContext(sys, repo)
 				toolExecRelay = func(ctx context.Context, step int, tool, args string) toolOutcome {
 					respCh := make(chan toolExecResponse, 1)
