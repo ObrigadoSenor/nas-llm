@@ -69,3 +69,19 @@
   padding: 8px 10px;
 }
 .ds-login-hint strong { color: #c7ccd4; }
+
+/* Fixed gear — shown on the login view (when #app is hidden) so settings /
+   paste-link sign-in are reachable before auth. Same look as .ds-gear. */
+.ds-gear-fixed {
+  position: fixed; top: 10px; right: 12px; z-index: 9000;
+}
+
+/* Paste-link box appended to the login card. */
+.ds-login-box { margin-top: 14px; }
+.ds-sep {
+  display: flex; align-items: center; gap: 10px;
+  color: #6b707a; font-size: 11px; margin: 14px 0 8px;
+}
+.ds-sep::before, .ds-sep::after {
+  content: ""; flex: 1; height: 1px; background: #2a2e37;
+}

@@ -134,15 +134,38 @@ function fillOverlay() {
   if (a) a.textContent = state.authed ? ("Signed in as " + (state.email || "?")) : "Not signed in.";
 }
 
-function addSettingsButton() {
-  const header = document.querySelector("#app header");
-  if (!header || header.querySelector(".ds-gear")) return;
+function makeGear() {
   const btn = el("button", "ds-gear");
   btn.title = "Desktop settings"; btn.setAttribute("aria-label", "Desktop settings");
   btn.textContent = "⚙";
   btn.onclick = (e) => { e.stopPropagation(); openSettings(); };
-  const sel = header.querySelector(".model-select");
-  if (sel) header.insertBefore(btn, sel); else header.appendChild(btn);
+  return btn;
+}
+
+// The gear must be reachable BEFORE login too — to set the backend URL and to
+// open the paste-link sign-in. When #app is visible (authed), place the gear in
+// the header; when #app is hidden (login view), pin a fixed gear to the viewport
+// so it's always visible. Called on boot and whenever #app's class toggles.
+function addSettingsButton() {
+  const app = $("app");
+  const appVisible = !!app && !app.classList.contains("hidden");
+  const header = document.querySelector("#app header");
+  const headerGear = header ? header.querySelector(".ds-gear") : null;
+  if (appVisible && header && !headerGear) {
+    const gear = makeGear();
+    const sel = header.querySelector(".model-select");
+    if (sel) header.insertBefore(gear, sel); else header.appendChild(gear);
+  } else if (!appVisible && headerGear) {
+    headerGear.remove();
+  }
+  let fixed = document.querySelector("body > .ds-gear-fixed");
+  if (!appVisible && !fixed) {
+    fixed = makeGear();
+    fixed.classList.add("ds-gear-fixed");
+    document.body.appendChild(fixed);
+  } else if (appVisible && fixed) {
+    fixed.remove();
+  }
 }
 
 function hookLogin() {
@@ -150,19 +173,37 @@ function hookLogin() {
   if (!login) return;
   const update = () => {
     const hidden = login.classList.contains("hidden");
-    let hint = $("dsLoginHint");
+    let box = $("dsLoginBox");
     if (!hidden) {
-      if (!hint) {
-        hint = el("div", "ds-login-hint");
-        hint.id = "dsLoginHint";
-        const strong = el("strong", null, "Desktop app sign-in:");
-        hint.appendChild(strong);
-        hint.appendChild(document.createTextNode(" click “Send link”, then paste the link from your email via ⚙ Desktop settings (or below)."));
+      if (!box) {
         const card = login.querySelector(".card");
-        if (card) card.appendChild(hint);
+        if (!card) return;
+        box = el("div", "ds-login-box");
+        box.id = "dsLoginBox";
+        box.appendChild(el("div", "ds-sep", "or paste a sign-in link"));
+        const row = el("div", "ds-row");
+        const linkInput = document.createElement("input");
+        linkInput.id = "dsLoginUrl"; linkInput.type = "url";
+        linkInput.placeholder = "https://chat.selected.systems/api/auth/verify?token=…";
+        const signInBtn = el("button", "ds-btn", "Sign in");
+        row.appendChild(linkInput); row.appendChild(signInBtn);
+        box.appendChild(row);
+        const out = el("div", "ds-note"); out.id = "dsLoginOut";
+        box.appendChild(out);
+        card.appendChild(box);
+        signInBtn.onclick = async () => {
+          const url = linkInput.value.trim();
+          if (!url) { out.textContent = "Paste the sign-in link from your email."; return; }
+          signInBtn.disabled = true; out.textContent = "Signing in…";
+          const r = await sid("verify", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url }) });
+          signInBtn.disabled = false;
+          const d = r.data || {};
+          if (d.ok) { out.textContent = "Signed in as " + (d.email || "?") + ". Reloading…"; setTimeout(() => location.reload(), 600); }
+          else out.textContent = "Failed: " + (d.error || r.status);
+        };
       }
-    } else if (hint) {
-      hint.remove();
+    } else if (box) {
+      box.remove();
     }
   };
   update();
@@ -175,6 +216,9 @@ async function bootDesktop() {
   fillOverlay();
   addSettingsButton();
   hookLogin();
+  // Re-run gear placement when the auth view toggles (#app hidden ⇄ shown).
+  const app = $("app");
+  if (app) new MutationObserver(addSettingsButton).observe(app, { attributes: true, attributeFilter: ["class"] });
 }
 
 // The injected <script> is placed after app.js, so #app/#login already exist.
