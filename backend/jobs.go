@@ -149,9 +149,9 @@ type toolExecPayload struct {
 // all (sidecar down, repo not found) — surfaced as an error observation.
 type toolExecResponse struct {
 	Observation string `json:"observation"`
-	Preview    string `json:"preview"`
-	IsError    bool   `json:"isError"`
-	Error      string `json:"error,omitempty"`
+	Preview     string `json:"preview"`
+	IsError     bool   `json:"isError"`
+	Error       string `json:"error,omitempty"`
 }
 
 func newJobID() string {
@@ -889,7 +889,7 @@ func (s *server) runGeneration(j *job) error {
 		var toolExecRelay func(context.Context, int, string, string) toolOutcome
 		if repoID != "" {
 			if repo, err := s.store.getRepo(j.email, repoID); err == nil && repo != nil {
-			allow = append(allow, "read_file", "list_files", "glob", "grep", "git_status", "apply_patch", "run_command")
+				allow = append(allow, "read_file", "list_files", "glob", "grep", "git_status", "apply_patch", "run_command", "git_commit", "git_push", "create_pr")
 				sys = injectRepoContext(sys, repo)
 				toolExecRelay = func(ctx context.Context, step int, tool, args string) toolOutcome {
 					respCh := make(chan toolExecResponse, 1)

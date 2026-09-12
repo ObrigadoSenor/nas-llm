@@ -47,6 +47,7 @@ type Conversation struct {
 	Model       string    `json:"model"`
 	FolderID    string    `json:"folderId,omitempty"`
 	RepoID      string    `json:"repoId,omitempty"`
+	RepoBranch  string    `json:"repoBranch,omitempty"`
 	TitleCustom bool      `json:"titleCustom"`
 	CreatedAt   int64     `json:"createdAt"`
 	UpdatedAt   int64     `json:"updatedAt"`
@@ -64,14 +65,14 @@ type Folder struct {
 // sidecar pushes this context (branch, HEAD, top-level tree) on clone/open so
 // the agent loop can inject it into the system prompt for repo-bound chats.
 type Repo struct {
-	ID        string `json:"id"`
-	Email     string `json:"-"`
-	FullName  string `json:"fullName"`
-	LocalPath string `json:"localPath"`
-	Branch    string `json:"branch"`
-	Head      string `json:"head"`
+	ID        string   `json:"id"`
+	Email     string   `json:"-"`
+	FullName  string   `json:"fullName"`
+	LocalPath string   `json:"localPath"`
+	Branch    string   `json:"branch"`
+	Head      string   `json:"head"`
 	Tree      []string `json:"tree"`
-	CreatedAt int64     `json:"createdAt"`
+	CreatedAt int64    `json:"createdAt"`
 }
 
 type store struct {
@@ -269,6 +270,11 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 	}
+	if !cols["repo_branch"] {
+		if _, err := db.Exec(`ALTER TABLE conversations ADD COLUMN repo_branch TEXT`); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -348,7 +354,7 @@ func (s *store) newConversationID() string {
 }
 
 func (s *store) listConversations(email string) ([]Conversation, error) {
-	rows, err := s.db.Query(`SELECT id, title, model, folder_id, repo_id, title_custom, created_at, updated_at FROM conversations WHERE email = ? ORDER BY updated_at DESC`, email)
+	rows, err := s.db.Query(`SELECT id, title, model, folder_id, repo_id, repo_branch, title_custom, created_at, updated_at FROM conversations WHERE email = ? ORDER BY updated_at DESC`, email)
 	if err != nil {
 		return nil, err
 	}
@@ -356,13 +362,14 @@ func (s *store) listConversations(email string) ([]Conversation, error) {
 	var out []Conversation
 	for rows.Next() {
 		var c Conversation
-		var folderID, repoID sql.NullString
+		var folderID, repoID, repoBranch sql.NullString
 		var titleCustom int
-		if err := rows.Scan(&c.ID, &c.Title, &c.Model, &folderID, &repoID, &titleCustom, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.Title, &c.Model, &folderID, &repoID, &repoBranch, &titleCustom, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		c.FolderID = folderID.String
 		c.RepoID = repoID.String
+		c.RepoBranch = repoBranch.String
 		c.TitleCustom = titleCustom != 0
 		out = append(out, c)
 	}
@@ -372,10 +379,10 @@ func (s *store) listConversations(email string) ([]Conversation, error) {
 func (s *store) getConversation(email, id string) (*Conversation, error) {
 	var c Conversation
 	var msgs string
-	var folderID, repoID sql.NullString
+	var folderID, repoID, repoBranch sql.NullString
 	var titleCustom int
-	err := s.db.QueryRow(`SELECT id, title, model, folder_id, repo_id, title_custom, created_at, updated_at, messages FROM conversations WHERE id = ? AND email = ?`, id, email).
-		Scan(&c.ID, &c.Title, &c.Model, &folderID, &repoID, &titleCustom, &c.CreatedAt, &c.UpdatedAt, &msgs)
+	err := s.db.QueryRow(`SELECT id, title, model, folder_id, repo_id, repo_branch, title_custom, created_at, updated_at, messages FROM conversations WHERE id = ? AND email = ?`, id, email).
+		Scan(&c.ID, &c.Title, &c.Model, &folderID, &repoID, &repoBranch, &titleCustom, &c.CreatedAt, &c.UpdatedAt, &msgs)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -384,6 +391,7 @@ func (s *store) getConversation(email, id string) (*Conversation, error) {
 	}
 	c.FolderID = folderID.String
 	c.RepoID = repoID.String
+	c.RepoBranch = repoBranch.String
 	c.TitleCustom = titleCustom != 0
 	if err := json.Unmarshal([]byte(msgs), &c.Messages); err != nil {
 		return nil, err
@@ -521,7 +529,7 @@ func (s *store) deleteFolder(email, id string) (bool, error) {
 // An empty folderID clears the folder (sets it to NULL). A non-empty title marks
 // the conversation as having a custom title (title_custom = 1) so later saves
 // won't overwrite it with the auto-derived first-message title.
-func (s *store) patchConversation(email, id string, title, folderID, model, agentSystem, agentTools, repoID *string) (*Conversation, error) {
+func (s *store) patchConversation(email, id string, title, folderID, model, agentSystem, agentTools, repoID, repoBranch *string) (*Conversation, error) {
 	now := time.Now().UnixMilli()
 	sets := []string{"updated_at = ?"}
 	args := []any{now}
@@ -555,6 +563,14 @@ func (s *store) patchConversation(email, id string, title, folderID, model, agen
 		} else {
 			sets = append(sets, "repo_id = ?")
 			args = append(args, *repoID)
+		}
+	}
+	if repoBranch != nil {
+		if *repoBranch == "" {
+			sets = append(sets, "repo_branch = NULL")
+		} else {
+			sets = append(sets, "repo_branch = ?")
+			args = append(args, *repoBranch)
 		}
 	}
 	args = append(args, id, email)

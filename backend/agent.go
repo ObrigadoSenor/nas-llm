@@ -276,13 +276,16 @@ func (s *server) toolRegistry(email string) map[string]agentTool {
 	// relay, not server-side. execute is nil — runAgentLoop routes local tools
 	// through the relay when a repo is bound.
 	for name, schema := range map[string]oaiTool{
-		"read_file":  readFileTool(),
-		"list_files": listFilesTool(),
-		"glob":      globTool(),
-		"grep":      grepTool(),
-		"git_status": gitStatusTool(),
+		"read_file":   readFileTool(),
+		"list_files":  listFilesTool(),
+		"glob":        globTool(),
+		"grep":        grepTool(),
+		"git_status":  gitStatusTool(),
 		"apply_patch": applyPatchTool(),
 		"run_command": runCommandTool(),
+		"git_commit":  gitCommitTool(),
+		"git_push":    gitPushTool(),
+		"create_pr":   createPrTool(),
 	} {
 		reg[name] = agentTool{schema: schema, local: true}
 	}
@@ -336,7 +339,7 @@ func gitStatusTool() oaiTool {
 	return oaiTool{Type: "function", Function: oaiToolFunction{
 		Name:        "git_status",
 		Description: "Show the working tree status (modified, staged, untracked files). Use this to see what changes exist in the repository.",
-		Parameters: map[string]any{"type": "object", "properties": map[string]any{}},
+		Parameters:  map[string]any{"type": "object", "properties": map[string]any{}},
 	}}
 }
 
@@ -360,6 +363,35 @@ func runCommandTool() oaiTool {
 	}}
 }
 
+func gitCommitTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "git_commit",
+		Description: "Stage all changes and commit on the current branch with the given message. Requires user approval.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"message": map[string]any{"type": "string", "description": "The commit message."},
+		}, "required": []string{"message"}},
+	}}
+}
+
+func gitPushTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "git_push",
+		Description: "Push the current branch to its remote. Requires user approval.",
+		Parameters:  map[string]any{"type": "object", "properties": map[string]any{}},
+	}}
+}
+
+func createPrTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "create_pr",
+		Description: "Open a pull request from the current branch into the repo's default branch. Requires user approval.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"title": map[string]any{"type": "string", "description": "The pull request title."},
+			"body":  map[string]any{"type": "string", "description": "The pull request body/description."},
+		}, "required": []string{"title", "body"}},
+	}}
+}
+
 // injectRepoContext prepends a repo context block to the agent system prompt
 // so the model knows which repository it's working against: the repo name,
 // current branch, HEAD, and the top-level file tree. This is injected only for
@@ -380,7 +412,7 @@ func injectRepoContext(sys string, r *Repo) string {
 	} else {
 		b.WriteString("(empty)")
 	}
-b.WriteString(". Use the read_file, list_files, glob, grep, and git_status tools to explore the codebase. Use apply_patch to make edits (each requires user approval) and run_command to run build/test commands (each requires approval). Paths are repository-relative. Keep answers grounded in what you read — do not guess at file contents.\n\n")
+	b.WriteString(". Use the read_file, list_files, glob, grep, and git_status tools to explore the codebase. Use apply_patch to make edits (each requires user approval) and run_command to run build/test commands (each requires approval). When the work is done, use git_commit to commit, git_push to push the branch, and create_pr to open a pull request (each requires approval). Paths are repository-relative. Keep answers grounded in what you read — do not guess at file contents.\n\n")
 	b.WriteString(sys)
 	return b.String()
 }
@@ -692,6 +724,9 @@ func availableTools(fetchPage bool) []toolMeta {
 		toolMeta{Name: "git_status", Label: "Git status", Description: "Show the working tree status (desktop only)."},
 		toolMeta{Name: "apply_patch", Label: "Apply patch", Description: "Apply a unified diff to the repo (desktop only, requires approval)."},
 		toolMeta{Name: "run_command", Label: "Run command", Description: "Run a shell command in the repo (desktop only, requires approval)."},
+		toolMeta{Name: "git_commit", Label: "Git commit", Description: "Stage and commit changes on the current branch (desktop only, requires approval)."},
+		toolMeta{Name: "git_push", Label: "Git push", Description: "Push the current branch to its remote (desktop only, requires approval)."},
+		toolMeta{Name: "create_pr", Label: "Create PR", Description: "Open a pull request from the current branch (desktop only, requires approval)."},
 	)
 	return out
 }
