@@ -741,8 +741,14 @@ async function loadFolders(){
 function saveCollapsed(){ localStorage.setItem("nas-llm-collapsed", JSON.stringify(collapsedFolders)); }
 function renderSidebar(){
   convList.innerHTML="";
+  // When the desktop repo sidebar is present (#dsSidebarRepos, injected by the
+  // sidecar bridge), repo-bound chats are shown nested under their repo there —
+  // so skip them here to avoid duplicating them in the flat folder list. On the
+  // plain web UI (no repo sidebar) every chat stays in the folder list.
+  const hasRepoSidebar=!!document.getElementById("dsSidebarRepos");
+  const visible=hasRepoSidebar?conversations.filter(c=>!c.repoId):conversations;
   const byFolder={};
-  conversations.forEach(c=>{ const key=c.folderId||""; (byFolder[key]=byFolder[key]||[]).push(c); });
+  visible.forEach(c=>{ const key=c.folderId||""; (byFolder[key]=byFolder[key]||[]).push(c); });
   folders.forEach(f=>{ convList.appendChild(renderFolder(f, byFolder[f.id]||[])); delete byFolder[f.id]; });
   if(byFolder[""]) convList.appendChild(renderFolder(null, byFolder[""]));
 }
@@ -951,6 +957,10 @@ window.addEventListener("nasllm:openConv", (e) => {
   const id = e && e.detail ? String(e.detail) : "";
   if (id) openConversation(id);
 });
+// Desktop bridge hook: refresh the conversation list after a desktop-side
+// change (e.g. deleting a repo chat from the repo dropdown) so the flat list
+// stays in sync without a full reload.
+window.addEventListener("nasllm:refreshConvs", () => { loadConversations(); });
 
 // --- Background generation ---
 
@@ -1570,6 +1580,92 @@ $("tabInstalled").addEventListener("click", ()=>switchTab("installed"));
 $("tabBrowse").addEventListener("click", ()=>switchTab("browse"));
 $("modelsModal").addEventListener("click", e=>{ if(e.target===$("modelsModal")) closeModelsPanel(); });
 document.addEventListener("keydown", e=>{ if(e.key==="Escape" && $("modelsModal").classList.contains("open")) closeModelsPanel(); });
+
+// --- Drawer horizontal resize (Models + Agent panels) ----------------------
+// The right-side slide-in drawers (.modal-card) default to 460px. This injects
+// a left-edge grab handle into each, drives width via the --drawer-w CSS
+// variable, and persists the chosen width so it survives reloads. The drawer
+// is pinned to the right edge, so its width = viewport width - left-edge x.
+// Shared by both .modal panels; no-op on mobile where the cards go full-width.
+const DRAWER_MIN=360, DRAWER_KEY="nas-llm-drawer-w";
+function drawerMaxW(){ return Math.floor(window.innerWidth*0.92); }
+function applyDrawerW(card,w){ card.style.setProperty("--drawer-w", Math.max(DRAWER_MIN, Math.min(w, drawerMaxW()))+"px"); }
+function initDrawerResize(){
+  document.querySelectorAll(".modal-card").forEach(card=>{
+    if(card.querySelector(".modal-resize")) return;
+    const handle=document.createElement("div"); handle.className="modal-resize";
+    handle.setAttribute("role","separator"); handle.setAttribute("aria-orientation","vertical"); handle.title="Drag to resize";
+    card.prepend(handle);
+    const saved=parseFloat(localStorage.getItem(DRAWER_KEY)); if(saved>0) applyDrawerW(card,saved);
+    handle.addEventListener("pointerdown",e=>{
+      e.preventDefault();
+      document.body.classList.add("drawer-resizing");
+      const move=ev=>applyDrawerW(card, window.innerWidth-ev.clientX);
+      const up=()=>{
+        document.removeEventListener("pointermove",move);
+        document.removeEventListener("pointerup",up);
+        document.removeEventListener("pointercancel",up);
+        document.body.classList.remove("drawer-resizing");
+        const w=parseFloat(getComputedStyle(card).getPropertyValue("--drawer-w"));
+        if(w>0) localStorage.setItem(DRAWER_KEY,String(w));
+      };
+      document.addEventListener("pointermove",move);
+      document.addEventListener("pointerup",up);
+      document.addEventListener("pointercancel",up);
+      move(e);
+    });
+  });
+}
+// Re-clamp on viewport changes so a shrunk window never overflows the handle.
+window.addEventListener("resize",()=>{
+  document.querySelectorAll(".modal-card").forEach(card=>{
+    const w=parseFloat(getComputedStyle(card).getPropertyValue("--drawer-w"));
+    if(w>0) applyDrawerW(card,w);
+  });
+});
+initDrawerResize();
+
+// --- Left sidebar horizontal resize -----------------------------------------
+// #sidebar is a flex item (default 248px). A 6px grab gutter (.sidebar-resize)
+// is injected as the next flex child in #app, between #sidebar and main. The
+// sidebar sits on the left of the viewport, so its width = pointer x. Driven
+// via --sidebar-w and persisted; hidden on mobile (CSS) where the sidebar is a
+// slide-over. No-op if #sidebar isn't present.
+const SIDEBAR_MIN=200, SIDEBAR_KEY="nas-llm-sidebar-w";
+function sidebarMaxW(){ return Math.floor(window.innerWidth*0.5); }
+function applySidebarW(w){ const s=$("sidebar"); if(s) s.style.setProperty("--sidebar-w", Math.max(SIDEBAR_MIN, Math.min(w, sidebarMaxW()))+"px"); }
+function initSidebarResize(){
+  const s=$("sidebar"); if(!s) return;
+  const app=s.parentElement; if(!app) return;
+  if(app.querySelector(".sidebar-resize")) return;
+  const handle=document.createElement("div"); handle.className="sidebar-resize";
+  handle.setAttribute("role","separator"); handle.setAttribute("aria-orientation","vertical"); handle.title="Drag to resize";
+  app.insertBefore(handle, s.nextSibling);
+  const saved=parseFloat(localStorage.getItem(SIDEBAR_KEY)); if(saved>0) applySidebarW(saved);
+  handle.addEventListener("pointerdown",e=>{
+    e.preventDefault();
+    document.body.classList.add("sidebar-resizing");
+    const move=ev=>applySidebarW(ev.clientX);
+    const up=()=>{
+      document.removeEventListener("pointermove",move);
+      document.removeEventListener("pointerup",up);
+      document.removeEventListener("pointercancel",up);
+      document.body.classList.remove("sidebar-resizing");
+      const s2=$("sidebar"); const w=parseFloat(getComputedStyle(s2).getPropertyValue("--sidebar-w"));
+      if(w>0) localStorage.setItem(SIDEBAR_KEY,String(w));
+    };
+    document.addEventListener("pointermove",move);
+    document.addEventListener("pointerup",up);
+    document.addEventListener("pointercancel",up);
+    move(e);
+  });
+}
+window.addEventListener("resize",()=>{
+  const s=$("sidebar"); if(!s) return;
+  const w=parseFloat(getComputedStyle(s).getPropertyValue("--sidebar-w"));
+  if(w>0) applySidebarW(w);
+});
+initSidebarResize();
 
 function openModelsPanel(tab){ $("modelsModal").classList.add("open"); renderModelBanner(); switchTab(tab||"installed"); }
 function closeModelsPanel(){

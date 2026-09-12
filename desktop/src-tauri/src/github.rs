@@ -909,15 +909,150 @@ async fn repos_refresh(State(st): State<AppState>, Json(body): Json<NameBody>) -
 }
 
 async fn repos_open(State(st): State<AppState>, Json(body): Json<NameBody>) -> Response {
-    // Returns the local path; the renderer binds the repo to a conversation
-    // via the backend's repos table + conversations.repo_id.
+    // Returns the local path and re-pushes repo context to the backend so the
+    // agent loop can inject it into the system prompt for repo-bound chats.
+    // createRepoChat calls this right before looking the repo up via /api/repos,
+    // so re-pushing here makes a re-connect work in one click even when the
+    // original clone/add-local push failed (e.g. the sidecar wasn't signed in
+    // yet, so the requireAuth-gated POST /api/repos silently 401'd).
     let name = body.name.trim().to_string();
     let dest = match resolve_repo(&st.data_dir, &name) {
         Some(p) => p,
         None => return json_err("not found locally", StatusCode::NOT_FOUND),
     };
     let branch = git_branch(&dest).await;
-    json_ok(&serde_json::json!({ "ok": true, "name": name, "path": dest.display().to_string(), "branch": branch }))
+    let head = git_head(&dest).await;
+    let tree = top_level_tree(&dest);
+    let _ = push_repo_context(&st, &name, &dest, &branch, &head, &tree).await;
+    json_ok(&serde_json::json!({ "ok": true, "name": name, "path": dest.display().to_string(), "branch": branch, "head": head, "tree": tree }))
+}
+
+// --- Branch listing + checkout (UI branch switcher) -------------------------
+
+// git_branches returns (current_branch, branches) where each branch is
+// (name, is_remote). Uses `git branch -a` so remote-only branches (not yet
+// checked out locally) appear too — the UI can offer to track+checkout them.
+// Remote names are stripped of the `remotes/<remote>/` prefix; the HEAD symlink
+// line and names already present locally are skipped (a local wins over its
+// remote twin).
+async fn git_branches(path: &Path) -> (String, Vec<(String, bool)>) {
+    let out = tokio::process::Command::new("git")
+        .arg("-C").arg(path)
+        .arg("branch").arg("-a")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output().await;
+    let mut current = String::new();
+    let mut locals: Vec<String> = Vec::new();
+    let mut remote_names: Vec<String> = Vec::new();
+    match out {
+        Ok(o) if o.status.success() => {
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                let is_cur = line.starts_with("* ");
+                let raw = line.trim_start_matches('*').trim().to_string();
+                if raw.is_empty() || raw.contains(" -> ") { continue; }
+                if let Some(rest) = raw.strip_prefix("remotes/") {
+                    if let Some(name) = rest.split_once('/').map(|(_, n)| n.to_string()) {
+                        if name == "HEAD" { continue; }
+                        remote_names.push(name);
+                    }
+                    continue;
+                }
+                if is_cur { current = raw.clone(); }
+                locals.push(raw);
+            }
+        }
+        _ => {}
+    }
+    let local_set: std::collections::HashSet<String> = locals.iter().cloned().collect();
+    let mut branches: Vec<(String, bool)> = locals.into_iter().map(|n| (n, false)).collect();
+    let mut seen: std::collections::HashSet<String> = local_set;
+    for n in remote_names {
+        if seen.insert(n.clone()) {
+            branches.push((n, true));
+        }
+    }
+    (current, branches)
+}
+
+// repos_branches lists the local + remote-only branches of a connected repo,
+// marking the current one. Each branch is {name, remote} where remote=true
+// means it exists only on the remote (not yet checked out locally) and needs a
+// tracking checkout. Used by the UI branch picker.
+async fn repos_branches(State(st): State<AppState>, Json(body): Json<NameBody>) -> Response {
+    let name = body.name.trim().to_string();
+    let dest = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_err("not found locally", StatusCode::NOT_FOUND),
+    };
+    let (current, branches) = git_branches(&dest).await;
+    let entries: Vec<serde_json::Value> = branches
+        .into_iter()
+        .map(|(n, remote)| serde_json::json!({ "name": n, "remote": remote }))
+        .collect();
+    json_ok(&serde_json::json!({ "ok": true, "current": current, "branches": entries }))
+}
+
+#[derive(Deserialize)]
+struct CheckoutBody {
+    repo: String,
+    branch: String,
+    #[serde(default)]
+    remote: bool,
+}
+
+// repos_checkout switches a local repo to a branch. For a local branch it runs
+// `git checkout <branch>`; for a remote-only branch (remote=true) it runs
+// `git checkout -t origin/<branch>` to create a local tracking branch. Refuses
+// to force over a dirty tree (returns the git error so the UI can tell the user
+// to commit/stash first). After checkout, re-pushes repo context to the backend
+// so the agent loop sees the new branch, and updates the sidecar registry.
+async fn repos_checkout(State(st): State<AppState>, Json(body): Json<CheckoutBody>) -> Response {
+    let name = body.repo.trim().to_string();
+    let branch = body.branch.trim().to_string();
+    if branch.is_empty() {
+        return json_err("branch is required", StatusCode::BAD_REQUEST);
+    }
+    let dest = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_err("not found locally", StatusCode::NOT_FOUND),
+    };
+    // Strip any accidental origin/ prefix so we don't pass origin/origin/foo.
+    let bare = branch.strip_prefix("origin/").unwrap_or(&branch).to_string();
+    let out = if body.remote {
+        tokio::process::Command::new("git")
+            .arg("-C").arg(&dest)
+            .arg("checkout").arg("-t").arg(format!("origin/{bare}"))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output().await
+    } else {
+        tokio::process::Command::new("git")
+            .arg("-C").arg(&dest)
+            .arg("checkout").arg(&bare)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output().await
+    };
+    match out {
+        Ok(o) if o.status.success() => {
+            // Refresh registry + backend context so the agent loop + sidebar
+            // reflect the new branch.
+            let br = git_branch(&dest).await;
+            let head = git_head(&dest).await;
+            let tree = top_level_tree(&dest);
+            if let Some(rec) = load_registry(&st.data_dir).into_iter().find(|r| r.full_name == name) {
+                upsert_registry(&st.data_dir, &RepoRecord { branch: br.clone(), ..rec });
+            }
+            let _ = push_repo_context(&st, &name, &dest, &br, &head, &tree).await;
+            json_ok(&serde_json::json!({ "ok": true, "branch": br, "head": head }))
+        }
+        Ok(o) => {
+            let msg = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            json_ok(&serde_json::json!({ "ok": false, "error": if msg.is_empty() { "git checkout failed".into() } else { msg } }))
+        }
+        Err(e) => json_err(&format!("git checkout failed: {e}"), StatusCode::BAD_GATEWAY),
+    }
 }
 
 // --- Review/undo endpoints (Phase 4: working changes) -----------------------
@@ -2075,6 +2210,8 @@ pub fn router(state: AppState) -> Router {
         .route("/__sidecar/repos/set-folder", post(repos_set_folder))
         .route("/__sidecar/repos/branch", post(repos_branch))
         .route("/__sidecar/repos/state", get(repos_state))
+        .route("/__sidecar/repos/branches", post(repos_branches))
+        .route("/__sidecar/repos/checkout", post(repos_checkout))
         .route("/__sidecar/repos/commit", post(repos_commit))
         .route("/__sidecar/repos/create-pr", post(repos_create_pr))
         .with_state(state)
