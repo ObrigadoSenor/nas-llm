@@ -113,10 +113,13 @@ desktop/
 
 ## Notes / out of scope for Phase 0
 
-- **Local LLMs (Ollama on this machine):** not auto-connected yet. The web UI's
-  "Connect local models" button still hits `http://localhost:11434` directly and
-  will likely report an origins error from the WebView. Managed Ollama lifecycle
-  + a sidecar proxy for `localhost:11434` is Phase 1.
+- **Local LLMs (Ollama on this machine):** managed. The sidecar auto-starts an
+  installed Ollama on app boot and proxies `localhost:11434` at same-origin
+  `/__ollama/*` (a `fetch` shim in `desktop.js` rewrites the web UI's direct
+  localhost calls), so local models appear in the picker with no
+  `OLLAMA_ORIGINS` setup and no WebView CORS/CSP issues. ⚙ Desktop settings →
+  Ollama shows status and Start/Stop. (macOS: app or Homebrew CLI; Windows
+  lifecycle is a follow-up.)
 - **Rust is compile- and runtime-validated** (`cargo build` clean; the sidecar was probed headlessly — control plane, static assets, index injection, and the `/api/*` proxy to the NAS all work). A real `tauri dev` launch (which also opens the WebView window) is the remaining manual check; run `npm run desktop`.
 - **Bundling** (signed macOS/Windows installers, app icons) is deferred to
   Phase 5 (`bundle.active: false` for now). Generate icons later with

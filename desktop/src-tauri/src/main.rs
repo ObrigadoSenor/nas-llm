@@ -76,6 +76,23 @@ fn main() {
                 }
             });
 
+            // Auto-start a local Ollama if it's installed but not running, so
+            // local models are discoverable through the /__ollama proxy by the
+            // time the web UI boots. Fire-and-forget; status is surfaced in the
+            // ⚙ Desktop settings -> Ollama panel, and a manual Start is there if
+            // this fails.
+            let autostart = state.clone();
+            tauri::async_runtime::spawn(async move {
+                if sidecar::probe_ollama(&autostart.ollama).await.is_none()
+                    && (sidecar::find_ollama_app().is_some() || sidecar::find_ollama_cli().is_some())
+                {
+                    match sidecar::start_ollama(&autostart.ollama).await {
+                        Ok(via) => log::info!("auto-started local Ollama (via {via})"),
+                        Err(e) => log::info!("local Ollama auto-start skipped: {e}"),
+                    }
+                }
+            });
+
             let handle = app.handle().clone();
             WebviewWindowBuilder::new(
                 &handle,

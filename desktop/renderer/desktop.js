@@ -26,6 +26,35 @@ function el(tag, cls, text) {
   return e;
 }
 
+// --- Local-Ollama fetch shim (installed first, before app.js's first localhost fetch) ---
+// Rewrite the web UI's direct http://localhost:11434/* calls to same-origin
+// /__ollama/* so they go through the sidecar proxy. The proxy strips the
+// browser Origin/Referer (Ollama 403s them) and talks to localhost server-side,
+// so no OLLAMA_ORIGINS setup is needed and WebView CORS/CSP never apply.
+// Covers discoverLocalModels (GET /api/tags), relayLocalModelCall
+// (POST /v1/chat/completions, streaming) and startLocalPull (POST /api/pull).
+(function installOllamaShim() {
+  const orig = window.fetch ? window.fetch.bind(window) : null;
+  if (!orig) return;
+  function isOllama(u) {
+    return u.port === "11434" && (u.hostname === "localhost" || u.hostname === "127.0.0.1");
+  }
+  window.fetch = function (input, init) {
+    try {
+      const raw = typeof input === "string" ? input : (input && input.url);
+      if (raw) {
+        const u = new URL(raw, location.origin);
+        if (isOllama(u)) {
+          const same = "/__ollama" + u.pathname + (u.search || "");
+          if (input instanceof Request && !init) input = new Request(same, input);
+          else input = same;
+        }
+      }
+    } catch {}
+    return orig(input, init);
+  };
+})();
+
 let state = null;
 
 async function refreshState() {
@@ -81,6 +110,47 @@ function buildOverlay() {
   card.appendChild(linkRow);
   const authOut = el("div", "ds-note"); authOut.id = "dsAuthOut";
   card.appendChild(authOut);
+
+  // Ollama (local models) — status + Start/Stop, backed by /__sidecar/ollama/*.
+  card.appendChild(el("div", "ds-label", "Ollama (local models)"));
+  const ollamaOut = el("div", "ds-note");
+  card.appendChild(ollamaOut);
+  const ollamaRow = el("div", "ds-row");
+  const startOllama = el("button", "ds-btn", "Start Ollama");
+  const stopOllama = el("button", "ds-btn ds-btn-ghost", "Stop Ollama");
+  ollamaRow.appendChild(startOllama); ollamaRow.appendChild(stopOllama);
+  card.appendChild(ollamaRow);
+  async function refreshOllama() {
+    const r = await sid("ollama/status"); const d = (r && r.data) || {};
+    if (d.running) {
+      const n = (d.models && d.models.length) || 0;
+      ollamaOut.textContent = `Running — ${n} model${n === 1 ? "" : "s"} (port ${d.port})`;
+    } else if (d.installed) {
+      ollamaOut.textContent = "Not running. Click Start to launch Ollama.";
+    } else {
+      ollamaOut.textContent = "Not installed. Install from https://ollama.com, then reopen the app.";
+    }
+    startOllama.disabled = !!d.running || !d.installed;
+    stopOllama.disabled = !d.running;
+  }
+  startOllama.onclick = async () => {
+    startOllama.disabled = true; ollamaOut.textContent = "Starting…";
+    const r = await sid("ollama/start", { method: "POST" }); const d = (r && r.data) || {};
+    if (d.ok) {
+      ollamaOut.textContent = "Started. Reloading…";
+      try { sessionStorage.setItem("nasllm-ollama-reloaded", "1"); } catch {}
+      setTimeout(() => location.reload(), 700);
+    } else {
+      ollamaOut.textContent = "Failed: " + (d.error || r.status);
+      refreshOllama();
+    }
+  };
+  stopOllama.onclick = async () => {
+    stopOllama.disabled = true; ollamaOut.textContent = "Stopping…";
+    await sid("ollama/stop", { method: "POST" });
+    refreshOllama();
+  };
+  refreshOllama();
 
   overlay.appendChild(card);
   document.body.appendChild(overlay);
@@ -211,6 +281,11 @@ function hookLogin() {
 }
 
 async function bootDesktop() {
+  // A reload after a manual Ollama start sets this guard; consume it and skip
+  // auto-start this boot so a start that didn't actually bring Ollama up can't
+  // loop the reload.
+  let justReloaded = false;
+  try { justReloaded = sessionStorage.getItem("nasllm-ollama-reloaded") === "1"; sessionStorage.removeItem("nasllm-ollama-reloaded"); } catch {}
   await refreshState();
   buildOverlay();
   fillOverlay();
@@ -219,6 +294,20 @@ async function bootDesktop() {
   // Re-run gear placement when the auth view toggles (#app hidden ⇄ shown).
   const app = $("app");
   if (app) new MutationObserver(addSettingsButton).observe(app, { attributes: true, attributeFilter: ["class"] });
+  // Auto-start a local Ollama if installed but not running, so local models are
+  // discoverable through the /__ollama proxy by the time the web UI needs them.
+  // If the app is already authed and Ollama just came up, reload once so app.js
+  // re-attaches local models (its reattachLocalModels already ran pre-start).
+  (async () => {
+    if (justReloaded) return;
+    const s = await sid("ollama/status"); const sd = (s && s.data) || {};
+    if (sd.running || !sd.installed) return;
+    const r = await sid("ollama/start", { method: "POST" }); const d = (r && r.data) || {};
+    if (d.ok && $("app") && !$("app").classList.contains("hidden")) {
+      try { sessionStorage.setItem("nasllm-ollama-reloaded", "1"); } catch {}
+      location.reload();
+    }
+  })();
 }
 
 // The injected <script> is placed after app.js, so #app/#login already exist.

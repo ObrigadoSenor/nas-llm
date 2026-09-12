@@ -100,6 +100,7 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub origin: String,
     pub client: reqwest::Client,
+    pub ollama: Arc<OllamaManager>,
 }
 
 impl AppState {
@@ -129,6 +130,7 @@ impl AppState {
             data_dir: data_dir.to_path_buf(),
             origin,
             client,
+            ollama: Arc::new(OllamaManager::new(11434)),
         }
     }
 
@@ -148,6 +150,137 @@ impl AppState {
     }
 }
 
+// --- Ollama lifecycle + local proxy ---------------------------------------
+// The web UI talks to the visitor's Ollama at localhost:11434 directly from
+// the browser. In a Tauri WebView that cross-origin http://localhost call trips
+// CORS/CSP and Ollama's non-localhost-Host/Origin 403 (the web UI currently
+// works around it with OLLAMA_ORIGINS + text/plain "simple request" tricks).
+// The sidecar removes all of that: a /__ollama/* proxy talks to localhost
+// server-side (Host derived from the localhost URL, Origin/Referer stripped),
+// and a fetch shim in desktop.js rewrites localhost:11434 -> /__ollama same-
+// origin. The manager also auto-starts an installed Ollama on app boot so local
+// models appear in the picker without manual setup.
+
+pub struct OllamaManager {
+    // A CLI-spawned `ollama serve` we own (so stop can kill it). None when
+    // Ollama is run by the macOS app or was already running externally.
+    child: std::sync::Mutex<Option<tokio::process::Child>>,
+    pub port: u16,
+    pub client: reqwest::Client,
+}
+
+impl OllamaManager {
+    pub fn new(port: u16) -> Self {
+        // No total timeout: /v1/chat/completions and /api/pull stream for as
+        // long as the model runs. A short connect timeout fails fast when
+        // Ollama isn't up.
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .build()
+            .expect("ollama reqwest client");
+        Self {
+            child: std::sync::Mutex::new(None),
+            port,
+            client,
+        }
+    }
+
+    pub fn base_url(&self) -> String {
+        format!("http://localhost:{}", self.port)
+    }
+
+    pub fn managed(&self) -> bool {
+        self.child.lock().expect("ollama child lock").is_some()
+    }
+}
+
+// probe_ollama returns the /api/tags JSON if Ollama is up on localhost:port, else
+// None. The URL host is localhost so the Host header is exactly what Ollama's
+// DNS-rebinding guard wants; no header rewrite needed.
+pub async fn probe_ollama(mgr: &OllamaManager) -> Option<serde_json::Value> {
+    let url = format!("{}/api/tags", mgr.base_url());
+    let resp = mgr
+        .client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<serde_json::Value>().await.ok()
+}
+
+// macOS: the Ollama app and the Homebrew/bundled CLI. Windows/Linux paths are
+// a small follow-up; Phase 1 targets macOS (the authoring platform).
+pub fn find_ollama_app() -> Option<PathBuf> {
+    let p = PathBuf::from("/Applications/Ollama.app");
+    if p.is_dir() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+pub fn find_ollama_cli() -> Option<PathBuf> {
+    for c in [
+        "/opt/homebrew/bin/ollama",
+        "/usr/local/bin/ollama",
+        "/Applications/Ollama.app/Contents/Resources/ollama",
+    ] {
+        let p = PathBuf::from(c);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+// start_ollama launches Ollama if installed and not already running. Prefers
+// the macOS app (`open -a Ollama` starts its tray + server); falls back to
+// `ollama serve` from a CLI binary, owning that child so stop can kill it.
+// Returns a via tag ("already" | "app" | "cli") on success.
+pub async fn start_ollama(mgr: &OllamaManager) -> Result<String, String> {
+    if probe_ollama(mgr).await.is_some() {
+        return Ok("already".into());
+    }
+    if let Some(app) = find_ollama_app() {
+        std::process::Command::new("open")
+            .arg("-a")
+            .arg(&app)
+            .spawn()
+            .map_err(|e| format!("could not open Ollama app: {e}"))?;
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if probe_ollama(mgr).await.is_some() {
+                return Ok("app".into());
+            }
+        }
+        return Err("Ollama app opened but its API did not come up".into());
+    }
+    if let Some(cli) = find_ollama_cli() {
+        let mut cmd = tokio::process::Command::new(&cli);
+        cmd.arg("serve")
+            .env("OLLAMA_HOST", format!("127.0.0.1:{}", mgr.port))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let child = cmd.spawn().map_err(|e| format!("could not start ollama: {e}"))?;
+        {
+            *mgr.child.lock().expect("ollama child lock") = Some(child);
+        }
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if probe_ollama(mgr).await.is_some() {
+                return Ok("cli".into());
+            }
+        }
+        return Err("ollama serve started but its API did not come up".into());
+    }
+    Err("Ollama is not installed. Install it from https://ollama.com and reopen the app.".into())
+}
+
 // --- router ----------------------------------------------------------------
 
 pub fn router(state: AppState) -> Router {
@@ -161,6 +294,10 @@ pub fn router(state: AppState) -> Router {
         .route("/__sidecar/logout", post(sidecar_logout))
         .route("/__sidecar/desktop.js", get(desktop_js))
         .route("/__sidecar/desktop.css", get(desktop_css))
+        .route("/__sidecar/ollama/status", get(ollama_status))
+        .route("/__sidecar/ollama/start", post(ollama_start))
+        .route("/__sidecar/ollama/stop", post(ollama_stop))
+        .route("/__ollama/*path", any(proxy_ollama))
         .route("/api/*path", any(proxy_api))
         .fallback(serve_www)
         .with_state(state)
@@ -177,14 +314,14 @@ async fn index_html(State(st): State<AppState>) -> Response {
             if !html.contains("/__sidecar/desktop.css") {
                 html = html.replacen(
                     "</head>",
-                    "<link rel=\"stylesheet\" href=\"/__sidecar/desktop.css?v=3\">\n</head>",
+                    "<link rel=\"stylesheet\" href=\"/__sidecar/desktop.css?v=4\">\n</head>",
                     1,
                 );
             }
             if !html.contains("/__sidecar/desktop.js") {
                 html = html.replacen(
                     "</body>",
-                    "<script type=\"module\" src=\"/__sidecar/desktop.js?v=3\"></script>\n</body>",
+                    "<script type=\"module\" src=\"/__sidecar/desktop.js?v=4\"></script>\n</body>",
                     1,
                 );
             }
@@ -670,4 +807,148 @@ fn json_err(msg: &str, status: StatusCode) -> Response {
     r.headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     r
+}
+
+// --- Ollama proxy + lifecycle handlers ------------------------------------
+
+// proxy_ollama forwards /__ollama/<path> to the local Ollama at
+// localhost:11434. Strips the browser Origin/Referer (Ollama 403s them) and
+// the inbound Host/Content-Length, lets reqwest set Host from the localhost
+// URL, and streams the response back so /v1/chat/completions and /api/pull
+// NDJSON flow through chunk-by-chunk. A connection failure (Ollama not up)
+// yields a 502 with a hint to start it from the settings panel.
+async fn proxy_ollama(State(st): State<AppState>, req: Request<Body>) -> Response {
+    let (parts, body) = req.into_parts();
+    let pq = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let target_path = pq.strip_prefix("/__ollama").unwrap_or(pq);
+    let url = format!("{}{}", st.ollama.base_url(), target_path);
+    let method =
+        reqwest::Method::from_bytes(parts.method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET);
+
+    let mut req_h = reqwest::header::HeaderMap::new();
+    for (k, v) in parts.headers.iter() {
+        let name = k.as_str().to_ascii_lowercase();
+        if is_hop_by_hop(&name)
+            || name == "host"
+            || name == "origin"
+            || name == "referer"
+            || name == "cookie"
+            || name == "content-length"
+        {
+            continue;
+        }
+        if let (Ok(rk), Ok(rv)) = (
+            reqwest::header::HeaderName::from_bytes(k.as_str().as_bytes()),
+            reqwest::header::HeaderValue::from_bytes(v.as_bytes()),
+        ) {
+            req_h.insert(rk, rv);
+        }
+    }
+    let bytes = to_bytes(body, 100_000_000).await.unwrap_or_default();
+    let mut builder = st.ollama.client.request(method, &url).headers(req_h);
+    if !bytes.is_empty() {
+        builder = builder.body(bytes);
+    }
+    let resp = match builder.send().await {
+        Ok(r) => r,
+        Err(_) => return ollama_proxy_error(),
+    };
+
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut out_h = axum::http::HeaderMap::new();
+    for (k, v) in resp.headers().iter() {
+        let name = k.as_str().to_ascii_lowercase();
+        if is_hop_by_hop(&name) || name == "content-length" {
+            continue;
+        }
+        if let (Ok(an), Ok(av)) = (
+            HeaderName::from_bytes(k.as_str().as_bytes()),
+            HeaderValue::from_bytes(v.as_bytes()),
+        ) {
+            out_h.insert(an, av);
+        }
+    }
+    let stream = resp
+        .bytes_stream()
+        .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+    let mut out = Response::new(Body::from_stream(stream));
+    *out.status_mut() = status;
+    *out.headers_mut() = out_h;
+    out
+}
+
+fn ollama_proxy_error() -> Response {
+    let body = serde_json::json!({ "error": "Ollama is not running on this computer. Open ⚙ Desktop settings -> Ollama to start it." });
+    let mut r = Response::new(Body::from(body.to_string()));
+    *r.status_mut() = StatusCode::BAD_GATEWAY;
+    r.headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    r
+}
+
+#[derive(Serialize)]
+struct OllamaStatus {
+    running: bool,
+    installed: bool,
+    app_installed: bool,
+    cli: Option<String>,
+    port: u16,
+    managed: bool,
+    models: Vec<String>,
+}
+
+async fn ollama_status(State(st): State<AppState>) -> Response {
+    let probe = probe_ollama(&st.ollama).await;
+    let models = probe
+        .as_ref()
+        .and_then(|v| v.get("models").and_then(|m| m.as_array()))
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| m.get("name").and_then(|n| n.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    json_ok(&OllamaStatus {
+        running: probe.is_some(),
+        installed: find_ollama_app().is_some() || find_ollama_cli().is_some(),
+        app_installed: find_ollama_app().is_some(),
+        cli: find_ollama_cli().map(|p| p.display().to_string()),
+        port: st.ollama.port,
+        managed: st.ollama.managed(),
+        models,
+    })
+}
+
+async fn ollama_start(State(st): State<AppState>) -> Response {
+    match start_ollama(&st.ollama).await {
+        Ok(via) => json_ok(&serde_json::json!({ "ok": true, "via": via })),
+        Err(e) => json_ok(&serde_json::json!({ "ok": false, "error": e })),
+    }
+}
+
+async fn ollama_stop(State(st): State<AppState>) -> Response {
+    // Take the child out of the lock and drop the guard before awaiting kill():
+    // std::sync::MutexGuard is !Send, and holding it across an await would make
+    // the handler future !Send (axum's Handler requires Send).
+    let taken = {
+        let mut guard = st.ollama.child.lock().expect("ollama child lock");
+        guard.take()
+    };
+    let killed_managed = if let Some(mut child) = taken {
+        let _ = child.kill().await;
+        true
+    } else {
+        false
+    };
+    if killed_managed {
+        return json_ok(&serde_json::json!({ "ok": true, "via": "cli" }));
+    }
+    // App-managed or external: quit the macOS app gently if present.
+    if find_ollama_app().is_some() {
+        let _ = std::process::Command::new("osascript")
+            .args(["-e", "quit app \"Ollama\""])
+            .spawn();
+        return json_ok(&serde_json::json!({ "ok": true, "via": "app" }));
+    }
+    json_ok(&serde_json::json!({ "ok": false, "error": "Ollama is running but not managed by the desktop app" }))
 }
