@@ -521,16 +521,16 @@ fn verify_err(msg: &str) -> Response {
     })
 }
 
-// The user pastes the magic-link URL from their email. The link is
-// self-describing — its origin IS the backend to talk to — so we derive the
-// backend from it instead of requiring a separately-configured host to match
-// (that was too rigid: it broke legitimate setups where the NAS's
-// APP_BASE_URL host differs from the desktop's configured backend, e.g. a LAN
-// IP vs the public domain). We only guard that it's an http(s) magic-link-
-// shaped URL (path starts with /api/auth/verify), fetch it with redirects off
-// (the backend 303s to / after Set-Cookie; we capture the cookie from the 303),
-// set the derived origin as the backend, capture the session cookie into the
-// jar, and confirm via /api/auth/me on that same origin.
+// The user pastes the magic-link URL from their email. Transactional email
+// providers (Brevo here) wrap links in click-tracking redirects, so the pasted
+// URL may be a tracking URL (https://r.noreply.../tr/cl/…) that 302s to the
+// real verify URL, which itself 303s to / after Set-Cookie. We walk the
+// redirect chain manually (the client has redirects off) so we can capture
+// Set-Cookie at each hop — reqwest's built-in follow-redirects only exposes
+// the final response's headers and would lose the cookie set on the 303. We
+// require the chain to reach a /api/auth/verify URL (light guard that it's a
+// magic link, not an arbitrary probe), derive the backend from that URL's
+// origin, capture the session cookie, and confirm via /api/auth/me.
 async fn sidecar_verify(State(st): State<AppState>, Json(body): Json<VerifyBody>) -> Response {
     let url = body.url.trim().to_string();
     let parsed = match url::Url::parse(&url) {
@@ -540,33 +540,53 @@ async fn sidecar_verify(State(st): State<AppState>, Json(body): Json<VerifyBody>
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
         return verify_err("link must be an http(s) URL");
     }
-    if !parsed.path().starts_with("/api/auth/verify") {
-        return verify_err("not a magic-link URL — expected /api/auth/verify?token=…");
-    }
-    let host = match parsed.host_str() {
-        Some(h) if !h.is_empty() => h,
-        _ => return verify_err("link has no host"),
-    };
-    let origin = match parsed.port() {
-        Some(p) => format!("{}://{}:{}", parsed.scheme(), host, p),
-        None => format!("{}://{}", parsed.scheme(), host),
-    };
 
-    let resp = match st.client.get(&url).timeout(std::time::Duration::from_secs(8)).send().await {
-        Ok(r) => r,
-        Err(e) => return verify_err(&e.to_string()),
-    };
+    let mut current = parsed;
     let mut captured: Option<String> = None;
-    for v in resp.headers().get_all(reqwest::header::SET_COOKIE).iter() {
-        if let Ok(s) = v.to_str() {
-            if let Some(cv) = parse_session_cookie(s) {
-                captured = Some(cv);
+    let mut backend_origin: Option<String> = None;
+    const MAX_HOPS: u8 = 12;
+    for _ in 0..MAX_HOPS {
+        // Record the backend origin the first time we see a verify URL in the
+        // chain (the tracking redirect's destination, or the pasted link itself).
+        if backend_origin.is_none() && current.path().starts_with("/api/auth/verify") {
+            backend_origin = origin_of(&current);
+        }
+        let resp = match st
+            .client
+            .get(current.as_str())
+            .timeout(std::time::Duration::from_secs(8))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return verify_err(&e.to_string()),
+        };
+        for v in resp.headers().get_all(reqwest::header::SET_COOKIE).iter() {
+            if let Ok(s) = v.to_str() {
+                if let Some(cv) = parse_session_cookie(s) {
+                    captured = Some(cv);
+                }
             }
         }
+        match resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|loc| current.join(loc).ok())
+        {
+            Some(next) => current = next,
+            None => break,
+        }
     }
+
+    let origin = match backend_origin {
+        Some(o) => o,
+        None => return verify_err("link did not reach a magic-link verify URL (/api/auth/verify)"),
+    };
     let to_store = captured.and_then(|v| if v.is_empty() { None } else { Some(v) });
-    // The cookie is scoped to the link's origin, so all subsequent /api/* calls
-    // must go there too. Persist it so a relaunch keeps talking to the same host.
+    // The cookie is scoped to the verify URL's origin, so all subsequent /api/*
+    // calls must go there too. Persist it so a relaunch keeps talking to the
+    // same host.
     {
         *st.backend_url.write().await = origin.clone();
     }
@@ -583,6 +603,20 @@ async fn sidecar_verify(State(st): State<AppState>, Json(body): Json<VerifyBody>
         email,
         backend_url: Some(origin),
         error: if ok { None } else { Some("no session cookie in the response".into()) },
+    })
+}
+
+// origin_of returns "scheme://host[:port]" for a URL, or None if it has no
+// host. Used to derive the backend origin from the verify URL in a redirect
+// chain.
+fn origin_of(u: &url::Url) -> Option<String> {
+    let host = u.host_str()?;
+    if host.is_empty() {
+        return None;
+    }
+    Some(match u.port() {
+        Some(p) => format!("{}://{}:{}", u.scheme(), host, p),
+        None => format!("{}://{}", u.scheme(), host),
     })
 }
 
