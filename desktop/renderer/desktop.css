@@ -225,3 +225,11 @@
   border-radius: 8px; padding: 8px 10px; font-size: 13px; font-family: inherit;
 }
 #dsShipChangelog:focus { outline: none; border-color: #3a4150; }
+
+/* --- Updates section (in-app updater) --- */
+/* Scrollable release-notes container; the inner <pre> reuses .ds-approval-pre. */
+.ds-update-notes {
+  max-height: 38vh; overflow: auto;
+  background: #0e1014; border: 1px solid #2a2e37; border-radius: 8px;
+  margin-top: 8px;
+}

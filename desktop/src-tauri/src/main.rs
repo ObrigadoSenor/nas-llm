@@ -11,6 +11,7 @@
 
 mod github;
 mod sidecar;
+mod updater;
 
 use std::path::PathBuf;
 use tauri::{WebviewUrl, WebviewWindowBuilder};
@@ -63,6 +64,7 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(state.clone())
         .setup(move |app| {
             // Run the sidecar HTTP server on the Tauri async runtime (tokio).
@@ -110,6 +112,11 @@ fn main() {
 
             Ok(())
         })
+        .invoke_handler(tauri::generate_handler![
+            updater::app_version,
+            updater::check_for_updates,
+            updater::download_and_install_update
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -46,6 +46,9 @@ Chat UI: **`https://chat.selected.systems`** — a minimal streaming chat page (
 | `scripts/pull-models.sh` | `docker exec ollama ollama ...` over SSH |
 | `scripts/smoke-test.sh` | API auth/CORS/allowlist/port-isolation/streaming + chat `/api/*` 401 + SearXNG internal JSON checks |
 | `ai/tasks.md` | phased task list |
+| `desktop/` | Tauri 2 desktop shell around the chat UI (sign-in, repos, in-app updates); see `desktop/README.md` for the release process |
+| `scripts/bump-desktop-version.sh` | bump the desktop app version (patch/minor/major) and tag a release |
+| `.github/workflows/desktop-release.yml` | build + sign + publish the desktop app to a GitHub Release on a `v*` tag push |
 
 ## Chat login & history
 

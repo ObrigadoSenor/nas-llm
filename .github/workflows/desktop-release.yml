@@ -4,22 +4,58 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag to publish, e.g. v0.2.0 (must start with 'v')"
+        required: true
 
+# Builds, signs, and publishes the desktop app per platform, creates a GitHub
+# Release for the tag, and writes a combined `latest.json` updater manifest as a
+# release asset. The in-app updater (Settings → Updates) fetches that manifest
+# from releases/latest/download/latest.json, verifies it against the pubkey in
+# tauri.conf.json (plugins.updater.pubkey), and offers "Update to latest".
+#
+# Prerequisites (one-time, manual):
+#   npx tauri signer generate -w ~/.tauri/nas-llm.key
+#   -> paste the PUBLIC key into tauri.conf.json plugins.updater.pubkey
+#   -> add repo secrets TAURI_PRIVATE_KEY and TAURI_KEY_PASSWORD
+# macOS signing/notarization is optional: uncomment the APPLE_* env below.
 jobs:
-  build:
+  publish:
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: macos-latest
             args: "--bundles dmg,app"
-            artifact: nas-llm_dmg
           - platform: windows-latest
             args: "--bundles msi,nsis"
-            artifact: nas-llm_windows
     runs-on: ${{ matrix.platform }}
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate release notes
+        id: notes
+        shell: bash
+        run: |
+          # Release notes = commit subjects since the previous tag (fallback:
+          # last 30 commits). These become the in-app changelog via the
+          # `notes` field tauri-action writes into latest.json.
+          prev=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)
+          if [ -n "$prev" ]; then
+            notes=$(git log --pretty=format:"- %s" "$prev"..HEAD)
+          else
+            notes=$(git log --pretty=format:"- %s" --max-count=30)
+          fi
+          {
+            echo "body<<EOF"
+            echo "$notes"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -29,38 +65,21 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install Tauri CLI
-        working-directory: desktop
-        run: npm install
-
-      - name: Build and bundle (macOS)
-        if: matrix.platform == 'macos-latest'
-        working-directory: desktop
-        # Unsigned builds for local testing. To sign + notarize, add an `env:`
-        # block here with APPLE_SIGNING_IDENTITY / APPLE_ID / APPLE_PASSWORD /
-        # APPLE_TEAM_ID secrets and uncomment them.
-        run: npx tauri build ${{ matrix.args }}
-
-      - name: Build and bundle (Windows)
-        if: matrix.platform == 'windows-latest'
-        working-directory: desktop
-        run: npx tauri build ${{ matrix.args }}
-        shell: pwsh
-
-      - name: Upload macOS artifacts
-        if: matrix.platform == 'macos-latest'
-        uses: actions/upload-artifact@v4
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+          # APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # APPLE_ID: ${{ secrets.APPLE_ID }}
+          # APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
-          name: ${{ matrix.artifact }}
-          path: |
-            desktop/src-tauri/target/release/bundle/dmg/*.dmg
-            desktop/src-tauri/target/release/bundle/macos/*.app
-
-      - name: Upload Windows artifacts
-        if: matrix.platform == 'windows-latest'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: |
-            desktop/src-tauri/target/release/bundle/msi/*.msi
-            desktop/src-tauri/target/release/bundle/nsis/*.exe
+          projectPath: desktop
+          tagName: ${{ github.event.inputs.tag || github.ref_name }}
+          releaseName: nas-llm ${{ github.event.inputs.tag || github.ref_name }}
+          releaseBody: ${{ steps.notes.outputs.body }}
+          releaseDraft: false
+          prerelease: false
+          updaterJsonPreferNsis: true
+          args: ${{ matrix.args }}

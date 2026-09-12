@@ -20,6 +20,17 @@
     "publisher": "nas-llm",
     "category": "DeveloperTool",
     "shortDescription": "Local-LLM codebase agent",
-    "longDescription": "A Copilot-style desktop app that connects GitHub, clones repos, and runs a local agent against a codebase using local LLMs."
+    "longDescription": "A Copilot-style desktop app that connects GitHub, clones repos, and runs a local agent against a codebase using local LLMs.",
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "endpoints": ["https://github.com/ObrigadoSenor/nas-llm/releases/latest/download/latest.json"],
+      "pubkey": "REPLACE_WITH_TAURI_UPDATER_PUBKEY",
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

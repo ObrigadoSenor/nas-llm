@@ -111,6 +111,71 @@ desktop/
       sidecar.rs            axum server: www/ + /api/* proxy + /__sidecar control plane
 ```
 
+## Versioning & updates
+
+The app version lives in three places that must stay in sync: `package.json`,
+`src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml`. Use the bump helper so
+they never drift. Pick the bump level by what changed:
+
+- **patch** — bug fixes / small non-breaking changes
+- **minor** — new backward-compatible features
+- **major** — breaking changes
+
+### One-time setup (signing)
+
+Auto-update verifies each bundle against a Tauri signing keypair. Do this once:
+
+1. Generate a keypair:
+   ```sh
+   cd desktop
+   npx tauri signer generate -w ~/.tauri/nas-llm.key
+   ```
+2. Paste the printed **public key** into `src-tauri/tauri.conf.json`
+   (`plugins.updater.pubkey`, replacing `REPLACE_WITH_TAURI_UPDATER_PUBKEY`).
+   Commit it — the public key is not secret.
+3. Add the **private key + password** as GitHub repo secrets
+   `TAURI_PRIVATE_KEY` and `TAURI_KEY_PASSWORD` (repo Settings → Secrets and
+   variables → Actions → New repository secret).
+
+Until these are set, CI builds are unsigned and in-app updates won't verify.
+macOS code-signing + notarization is optional: uncomment the `APPLE_*` env in
+`.github/workflows/desktop-release.yml` and add those secrets.
+
+### Triggering a release
+
+From a clean `main` with your changes committed:
+
+1. Bump the version — the helper edits all three files, commits `Release vX.Y.Z`,
+   and tags `vX.Y.Z` (it does **not** push anything):
+   ```sh
+   scripts/bump-desktop-version.sh patch   # or minor / major
+   ```
+2. Push the tag (and the `main` commit, if not already pushed) to start the
+   publish workflow:
+   ```sh
+   git push origin main
+   git push origin vX.Y.Z
+   ```
+
+`.github/workflows/desktop-release.yml` then builds and signs macOS (`.dmg` +
+`.app`) and Windows (`.msi` + `.exe`) bundles, creates the GitHub Release for
+the tag, and uploads a combined `latest.json` updater manifest as a release
+asset. The release **notes are generated automatically from the commit
+subjects since the previous tag** — write clear commit messages and they
+become the in-app changelog. To hand-write notes instead, edit the GitHub
+Release body and re-run the workflow (it rewrites `latest.json` from the
+current release body).
+
+Manual dispatch (no tag push): run the workflow from the **Actions** tab with
+the `tag` input set to the version to publish, e.g. `v0.2.0`.
+
+### Checking for updates (in-app)
+
+Open **⚙ Desktop settings → Updates** to see the current version, click
+**Check for updates** to fetch the latest release and its notes, and click
+**Update to latest** to download, install, and relaunch. The app verifies the
+download against the pubkey in `tauri.conf.json` before installing.
+
 ## Notes / out of scope for Phase 0
 
 - **Local LLMs (Ollama on this machine):** managed. The sidecar auto-starts an
@@ -122,6 +187,6 @@ desktop/
   lifecycle is a follow-up.)
 - **Rust is compile- and runtime-validated** (`cargo build` clean; the sidecar was probed headlessly — control plane, static assets, index injection, and the `/api/*` proxy to the NAS all work). A real `tauri dev` launch (which also opens the WebView window) is the remaining manual check; run `npm run desktop`.
 - **macOS bundle built**: `npx tauri build` produces `nas-llm.app` + `nas-llm_0.1.0_aarch64.dmg` (4.9 MB) in `src-tauri/target/release/bundle/`. Unsigned (for local testing); sign + notarize by setting `APPLE_SIGNING_IDENTITY` / `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` secrets in CI.
-- **Windows builds via CI**: a Windows `.msi`/`.exe` can't be cross-compiled from macOS. `.github/workflows/desktop-release.yml` builds both platforms on a tag push (`v*`) or manual trigger — macOS produces `.dmg`+`.app`, Windows produces `.msi`+`.exe` — and uploads them as artifacts.
+- **Windows builds via CI**: a Windows `.msi`/`.exe` can't be cross-compiled from macOS. `.github/workflows/desktop-release.yml` builds both platforms on a `v*` tag push or manual dispatch — macOS produces `.dmg`+`.app`, Windows produces `.msi`+`.exe` — and publishes them to a GitHub Release with a `latest.json` updater manifest (see Versioning & updates above).
 - **Icons** are generated: `npx tauri icon src-tauri/icons/icon-source.png` produces `.icns`, `.ico`, and all PNG sizes in `src-tauri/icons/`. Regenerate with a new 1024×1024 source if you want a different look.
-- **Signing/notarization** is not yet wired (unsigned builds for local testing). To enable on macOS, set the `APPLE_*` secrets in the GitHub repo and uncomment the env block in `.github/workflows/desktop-release.yml`. Auto-update (Tauri updater) is a follow-up — needs a signing key pair (`npx tauri signer generate`).
+- **Signing/notarization**: updater signing is wired (one-time keypair setup — see Versioning & updates). macOS code-signing + notarization is still optional; set the `APPLE_*` secrets and uncomment the env block in `.github/workflows/desktop-release.yml` to enable it.

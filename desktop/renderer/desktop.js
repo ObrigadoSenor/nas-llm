@@ -181,6 +181,8 @@ function buildOverlay() {
   };
   refreshOllama();
 
+  addUpdatesSection(card);
+
   overlay.appendChild(card);
   document.body.appendChild(overlay);
   overlay.addEventListener("click", (e) => { if (e.target === overlay) closeSettings(); });
@@ -231,6 +233,84 @@ function fillOverlay() {
   if (u && !u.value) u.value = state.backend_url || "";
   const a = $("dsAuthOut");
   if (a) a.textContent = state.authed ? ("Signed in as " + (state.email || "?")) : "Not signed in.";
+}
+
+// --- Updates section (in-app updater) ---
+// Shows the current app version, a Check-for-updates button that fetches the
+// latest release + its notes from the updater endpoint, and an on-click
+// "Update to latest" that downloads + installs + relaunches. Talks to the
+// Tauri commands in updater.rs over IPC; degrades gracefully when IPC isn't
+// available (e.g. served outside the installed app).
+function addUpdatesSection(card) {
+  card.appendChild(el("div", "ds-label", "Updates"));
+  const versionOut = el("div", "ds-note");
+  card.appendChild(versionOut);
+  const row = el("div", "ds-row");
+  const checkBtn = el("button", "ds-btn", "Check for updates");
+  const updateBtn = el("button", "ds-btn ds-btn-approve", "Update to latest");
+  updateBtn.disabled = true;
+  row.appendChild(checkBtn); row.appendChild(updateBtn);
+  card.appendChild(row);
+  const out = el("div", "ds-note"); out.id = "dsUpdateOut";
+  card.appendChild(out);
+
+  // Current version (best-effort; unknown when not running in Tauri).
+  (async () => {
+    try {
+      const v = await tauriInvoke("app_version");
+      versionOut.textContent = "Current version: " + v;
+    } catch {
+      versionOut.textContent = "Current version: (unknown outside the desktop app)";
+    }
+  })();
+
+  checkBtn.onclick = async () => {
+    checkBtn.disabled = true; out.textContent = "Checking…";
+    try {
+      const r = await tauriInvoke("check_for_updates");
+      out.innerHTML = "";
+      if (r && r.available) {
+        const head = el("div", "ds-note");
+        head.style.color = "#c7ccd4";
+        head.textContent = "Latest: " + r.version + (r.date ? " (published " + String(r.date).slice(0, 10) + ")" : "");
+        out.appendChild(head);
+        if (r.body && String(r.body).trim()) {
+          const wrap = el("div", "ds-update-notes");
+          const pre = document.createElement("pre");
+          pre.className = "ds-approval-pre";
+          pre.textContent = r.body;
+          wrap.appendChild(pre);
+          out.appendChild(wrap);
+        }
+        updateBtn.disabled = false;
+      } else {
+        out.appendChild(el("div", "ds-note", "You're on the latest version" + (r && r.currentVersion ? " (" + r.currentVersion + ")." : ".")));
+        updateBtn.disabled = true;
+      }
+      checkBtn.textContent = "Recheck";
+    } catch (e) {
+      out.textContent = "Could not check for updates: " + String(e && e.message || e);
+    } finally {
+      checkBtn.disabled = false;
+    }
+  };
+
+  updateBtn.onclick = async () => {
+    updateBtn.disabled = true; out.textContent = "Starting download…";
+    let unlisten = null;
+    try {
+      unlisten = await tauriListen("update://progress", (pct) => {
+        out.textContent = "Downloading… " + pct + "%";
+      });
+      await tauriInvoke("download_and_install_update");
+      out.textContent = "Installed. Restarting…";
+    } catch (e) {
+      out.textContent = "Update failed: " + String(e && e.message || e);
+      updateBtn.disabled = false;
+    } finally {
+      if (unlisten) try { unlisten(); } catch {}
+    }
+  };
 }
 
 // Run one file-tool call via the sidecar. Write tools (apply_patch, run_command)
@@ -374,6 +454,16 @@ function tauriInvoke(cmd, args) {
   const inv = g && ((g.__TAURI__ && g.__TAURI__.core && g.__TAURI__.core.invoke) || (g.__TAURI_INTERNALS__ && g.__TAURI_INTERNALS__.invoke));
   if (!inv) return Promise.reject(new Error("Tauri IPC is not available (running outside the desktop app?)"));
   return inv(cmd, args || {});
+}
+
+// Listen to a Tauri event (withGlobalTauri). Returns a Promise that resolves
+// to an unlisten function. Falls back to a no-op unlisten when the event API
+// isn't available (e.g. running outside the installed app).
+function tauriListen(event, cb) {
+  const g = (typeof window !== "undefined") ? window : null;
+  const listen = g && ((g.__TAURI__ && g.__TAURI__.event && g.__TAURI__.event.listen) || (g.__TAURI_INTERNALS__ && g.__TAURI_INTERNALS__.event && g.__TAURI_INTERNALS__.event.listen));
+  if (!listen) return Promise.resolve(() => {});
+  return Promise.resolve(listen(event, (e) => cb(e && e.payload))).then((un) => (typeof un === "function" ? un : (() => {})));
 }
 
 // Open the native directory picker; returns a single absolute path or null.
