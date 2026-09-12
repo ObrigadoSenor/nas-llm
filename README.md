@@ -253,6 +253,52 @@ directory and per-invocation approved.
 
 Env (`.env`, with safe defaults): `MAX_AGENT_STEPS=6`, `FETCH_PAGE_ENABLED=false`.
 
+### Running several chats at once
+
+Chats generate concurrently, and a chat keeps running when you switch away from
+it or reload. Three pieces make that work:
+
+**A worker pool, with server inference still serialized.** `jobManager` runs
+`MAX_CONCURRENT_JOBS` workers (default 4) instead of one. Jobs that dial a
+server host take a per-host semaphore of capacity 1, preserving the
+`OLLAMA_NUM_PARALLEL=1` behaviour the NAS and Mac are configured for — so NAS
+throughput is unchanged and extra chats queue rather than thrash an 8 GB box.
+Browser-relay (local-model) jobs skip the semaphore entirely and run truly in
+parallel, because their inference happens on the visitor's machine, not here.
+This also fixes a sharper bug: a relay job *occupied* the single worker while it
+waited on the browser, so one local-model chat stalled every other chat.
+
+**One multiplexed event stream.** `GET /api/events` is a user-scoped SSE stream
+carrying `modelCall`, `toolExec`, `phase`, `done` and `joberror` for all of that
+user's running jobs, every payload tagged with `convId` and `jobId` (terminal
+ones also carry `status`/`error`). The foreground chat still uses the
+per-conversation `/api/conversations/:id/events` tail for chunk-level rendering.
+Two connections total regardless of how many chats run — deliberate, since the
+desktop sidecar is HTTP/1.1 on localhost and browsers cap connections per origin.
+
+**A grace period instead of an instant cancel.** A job that needs the browser —
+local-model inference, or a repo-bound run whose file tools are relayed through
+it — used to be cancelled the moment its SSE tail dropped, which is why switching
+chats killed a run. It is now cancelled only if neither that tail nor the user's
+`/api/events` stream reattaches within `BROWSER_RELAY_GRACE`. Chat switches and
+reloads survive; a closed tab or app still gets cleaned up.
+
+Timeouts account for a human in the loop: plain chat stays at 5 minutes, but an
+agent run gets `AGENT_JOB_TIMEOUT` and an approval-gated tool call gets
+`TOOL_EXEC_TIMEOUT`, since `apply_patch`/`run_command`/`git_*` block on you
+clicking Approve.
+
+When a job finishes, the UI badges that chat in the sidebar and shows a toast
+(the desktop app additionally raises a native notification); the badge clears
+when you open the chat.
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `MAX_CONCURRENT_JOBS` | `4` | Generation workers. Server inference is still serialized per host. |
+| `BROWSER_RELAY_GRACE` | `45s` | How long a browser-bound job waits for a stream to reattach before being cancelled. |
+| `AGENT_JOB_TIMEOUT` | `30m` | Overall deadline for an agent-mode run (plain chat stays at 5m). |
+| `TOOL_EXEC_TIMEOUT` | `15m` | How long a relayed tool call may wait, including time spent awaiting your approval. |
+
 ## Remote Mac backend (optional, bigger models)
 
 The NAS (8 GB) caps you at ~3B models. If you have a Mac with more RAM on the

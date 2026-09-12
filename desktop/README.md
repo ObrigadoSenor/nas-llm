@@ -192,10 +192,12 @@ and a choice to continue on the current branch instead — nothing is forced.
 - A small **status line** below the input field shows the repo, branch, and git
 state (`owner/repo · ⎇ branch · ●N dirty · ↑a ↓b`, plus `no remote` when there
 isn't one) while a repo-bound chat is open — polled every few seconds and
-refreshed after each tool call. Click it to open the **session panel**.
+refreshed after each tool call. Click it to open the **session panel**; click
+the **⎇ branch chip** to change which branch this chat works on.
 - Agent edits arrive as `apply_patch`/`run_command` calls, each shown in an
-approval dialog prefixed with `tool → owner/repo @ branch` so you see where a
-write lands before approving.
+approval dialog prefixed with the asking chat and `tool → owner/repo @ branch`,
+so you see which chat wants to write and where before approving. Approvals from
+different chats queue up one at a time rather than fighting over one dialog.
 
 **Finishing the work** — from the session panel (or per-repo ⋯):
 - **Commit** / **Commit & push** — plain `git add -A` + commit (+ optional push);
@@ -210,8 +212,60 @@ The agent can also finish the loop itself: `git_commit`, `git_push`, and
 `create_pr` are agent tools (each approval-gated, same dialog). They're
 auto-enabled for repo-bound chats.
 
-After a session, switch the repo back to `main` (`git switch main`) to start
-clean; each chat keeps its own branch.
+### Several chats at once
+
+Chats run in parallel. Starting a second chat does not stop the first, and
+switching away from a running chat — or reloading the app — leaves it running:
+
+- The chat you are looking at streams over its own SSE tail; every other running
+  chat is driven by a single multiplexed `GET /api/events` stream. Two
+  connections total, however many agents are going. (This matters: the sidecar
+  speaks HTTP/1.1 on localhost and the WebView caps connections per origin, so
+  one stream per chat would starve ordinary API calls.)
+- A chat using a **local** model, or any repo-bound chat, needs the app to relay
+  work — so if every stream drops, the backend waits out a grace period
+  (`BROWSER_RELAY_GRACE`, 45 s) before cancelling. Switching chats and reloading
+  are well inside it; quitting the app cleans the run up.
+- Local-model chats genuinely run at the same time, because inference happens on
+  this machine. Chats on NAS/Mac models still take turns, because those hosts run
+  with `OLLAMA_NUM_PARALLEL=1` — they queue rather than fail.
+
+### A branch per chat
+
+Each chat is pinned to a branch (`repo_branch`), and every tool call it makes is
+executed against **that** branch — not whatever the repo happens to be on:
+
+- If the chat's branch is the one checked out in the repo folder, tools run
+  there, exactly as before.
+- Otherwise the sidecar provisions a **git worktree** for that branch under
+  `<app-data>/nas-llm-desktop/worktrees/<repo>/<branch>` and runs there. Git
+  allows a branch in at most one worktree, which is what keeps two chats on two
+  branches from treading on each other.
+- Change a chat's branch any time with the **⎇ chip** under the input: pick an
+  existing branch or create a new one. It provisions the worktree and re-points
+  the chat in one step.
+- The per-repo **⋯ → Branch…** picker is unchanged and still switches the repo
+  folder itself — that is the tree you have open in your editor.
+
+**Worktrees start clean.** A newly created worktree contains tracked files only:
+no `node_modules`, no `.env`, no build caches. The first `run_command` on a new
+branch may need an install step. Remove ones you are done with via
+`git worktree remove <path>` (or `git worktree prune` after deleting by hand).
+
+**Known wrinkle:** **+ New chat** still switches the *repo folder* to the new
+`agent/<slug>` branch instead of provisioning a worktree up front. Later tool
+calls self-correct (an older chat's branch simply gets its own worktree on next
+use), but if the repo folder has uncommitted changes when you start a new chat,
+git carries them onto the new branch. Commit or stash before starting a new chat
+on a repo you were mid-edit on.
+
+### Notifications
+
+When a chat finishes work you are not watching, the app raises a native
+notification ("Chat finished" / "Chat cancelled" / "Chat failed" plus the chat
+title) and marks the chat in the sidebar; the badge clears when you open it.
+macOS asks for notification permission the first time. Nothing fires for the
+chat that is on screen while the window is focused — you can already see it.
 
 ## Notes / out of scope for Phase 0
 
