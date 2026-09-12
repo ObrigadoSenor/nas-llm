@@ -14,7 +14,7 @@
 
 use axum::{
     body::Body,
-    extract::State,
+    extract::{Query, State},
     http::{header, HeaderValue, StatusCode},
     response::Response,
     routing::{get, post},
@@ -119,6 +119,25 @@ async fn gh_list_repos(
     resp.json::<Vec<serde_json::Value>>()
         .await
         .map_err(|e| format!("bad github response: {e}"))
+}
+
+// parse_github_error extracts a human-readable error message from a GitHub API
+// error response body (typically {"message": "...", "errors": [...]}).
+fn parse_github_error(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    if let Some(msg) = v.get("message").and_then(|m| m.as_str()) {
+        if let Some(errors) = v.get("errors").and_then(|e| e.as_array()) {
+            let details: Vec<String> = errors
+                .iter()
+                .filter_map(|e| e.get("message").and_then(|m| m.as_str()).map(String::from))
+                .collect();
+            if !details.is_empty() {
+                return Some(format!("{}: {}", msg, details.join("; ")));
+            }
+        }
+        return Some(msg.to_string());
+    }
+    None
 }
 
 // --- git operations (system git) ------------------------------------------
@@ -389,6 +408,43 @@ async fn git_log_subjects(path: &Path, range: &str) -> Vec<String> {
     }
 }
 
+// git_default_branch resolves the repo's default branch via
+// `git symbolic-ref --short refs/remotes/origin/HEAD`, falling back to "main"
+// then "master" if origin/HEAD is not set or git errors.
+async fn git_default_branch(path: &Path) -> String {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("symbolic-ref")
+        .arg("--short")
+        .arg("refs/remotes/origin/HEAD")
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if let Some(b) = s.strip_prefix("origin/") {
+                if !b.is_empty() {
+                    return b.to_string();
+                }
+            }
+            if !s.is_empty() {
+                return s;
+            }
+            "main".to_string()
+        }
+        _ => {
+            if git_has_ref(path, "refs/heads/main").await {
+                "main".to_string()
+            } else if git_has_ref(path, "refs/heads/master").await {
+                "master".to_string()
+            } else {
+                "main".to_string()
+            }
+        }
+    }
+}
+
 // git_commit_all stages all changes and commits with the given message.
 // token is only used to scrub any captured output. Returns an error string
 // (e.g. "nothing to commit") when the commit does not succeed.
@@ -516,6 +572,49 @@ fn derive_full_name(remote: Option<&str>, root: &Path) -> String {
     root.file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "repo".to_string())
+}
+
+// github_full_name returns Some("owner/repo") when the remote is a github.com
+// origin (https or SSH), else None. Used to gate PR creation on github.com.
+fn github_full_name(remote: &str) -> Option<String> {
+    if let Ok(u) = url::Url::parse(remote) {
+        if u.host_str() == Some("github.com") {
+            let path = u.path().trim_start_matches('/');
+            let path = path.strip_suffix(".git").unwrap_or(path).trim_end_matches('/');
+            if !path.is_empty() {
+                return Some(path.to_string());
+            }
+        }
+    }
+    if let Some(rest) = remote.strip_prefix("git@github.com:") {
+        let path = rest.strip_suffix(".git").unwrap_or(rest).trim_end_matches('/');
+        if !path.is_empty() {
+            return Some(path.to_string());
+        }
+    }
+    None
+}
+
+// slugify turns a chat title into a branch-safe slug: lowercase, non-[a-z0-9]
+// replaced with `-`, leading/trailing `-` trimmed, fallback "chat", capped at
+// ~40 chars. The result is ASCII-only so byte slicing for the cap is safe.
+fn slugify(s: &str) -> String {
+    let mut slug: String = s
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() {
+        return "chat".to_string();
+    }
+    if slug.len() > 40 {
+        slug = slug[..40].trim_end_matches('-').to_string();
+        if slug.is_empty() {
+            slug = "chat".to_string();
+        }
+    }
+    slug
 }
 
 // today_ymd returns the current UTC date as YYYY-MM-DD, computed from the Unix
@@ -916,6 +1015,9 @@ async fn repos_exec(State(st): State<AppState>, Json(body): Json<ExecBody>) -> R
         "glob" => exec_glob(&root, &body.args),
         "grep" => exec_grep(&root, &body.args),
         "git_status" => exec_git_status(&root).await,
+        "git_commit" => exec_git_commit(&root, &body.args, body.approved).await,
+        "git_push" => exec_git_push(&root, &body.args, body.approved).await,
+        "create_pr" => exec_create_pr(&st.client, &root, &body.args, body.approved).await,
         "apply_patch" => exec_apply_patch(&root, &body.args, body.approved).await,
         "run_command" => exec_run_command(&root, &body.args, body.approved).await,
         other => ExecResult { observation: format!("Unknown tool: {other}"), preview: "unknown tool".into(), is_error: true, ..Default::default() },
@@ -1239,6 +1341,149 @@ async fn exec_run_command(root: &Path, args: &str, approved: bool) -> ExecResult
     }
 }
 
+// --- Git workflow tools (Phase 5: commit/push/PR, approval-gated) ---
+
+// exec_git_commit stages all changes and commits with the provided message.
+// Approval-gated: returns needs_approval with the commit message as the preview
+// when not yet approved.
+async fn exec_git_commit(root: &Path, args: &str, approved: bool) -> ExecResult {
+    let message = match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(v) => v.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string(),
+        Err(_) => return ExecResult {
+            observation: "Invalid args for git_commit.".into(),
+            preview: "bad args".into(),
+            is_error: true,
+            ..Default::default()
+        },
+    };
+    if message.is_empty() {
+        return ExecResult {
+            observation: "No commit message provided.".into(),
+            preview: "no message".into(),
+            is_error: true,
+            ..Default::default()
+        };
+    }
+    if !approved {
+        return ExecResult {
+            observation: String::new(),
+            preview: "awaiting approval".into(),
+            is_error: false,
+            needs_approval: Some(true),
+            approval_kind: Some("git_commit".into()),
+            approval_preview: Some(message),
+        };
+    }
+    let token = token_get().unwrap_or_default();
+    match git_commit_all(root, &message, &token).await {
+        Ok(()) => {
+            let head = git_head(root).await;
+            ExecResult {
+                observation: format!("Committed changes.\nHEAD: {}", head),
+                preview: "committed".into(),
+                is_error: false,
+                ..Default::default()
+            }
+        }
+        Err(e) => ExecResult {
+            observation: format!("git commit failed: {}", e),
+            preview: "commit failed".into(),
+            is_error: true,
+            ..Default::default()
+        },
+    }
+}
+
+// exec_git_push pushes HEAD to origin/<current-branch>. Approval-gated:
+// returns needs_approval with "push HEAD:<branch> to origin" as the preview.
+async fn exec_git_push(root: &Path, _args: &str, approved: bool) -> ExecResult {
+    let branch = git_branch(root).await;
+    if !approved {
+        return ExecResult {
+            observation: String::new(),
+            preview: "awaiting approval".into(),
+            is_error: false,
+            needs_approval: Some(true),
+            approval_kind: Some("git_push".into()),
+            approval_preview: Some(format!("push HEAD:{} to origin", branch)),
+        };
+    }
+    let token = token_get().unwrap_or_default();
+    match git_push(root, &branch, &token).await {
+        Ok(out) => {
+            let msg = if out.trim().is_empty() {
+                format!("Pushed HEAD:{} to origin.", branch)
+            } else {
+                format!("Pushed HEAD:{} to origin.\n{}", branch, out.trim())
+            };
+            ExecResult {
+                observation: cap(&msg),
+                preview: "pushed".into(),
+                is_error: false,
+                ..Default::default()
+            }
+        }
+        Err(e) => ExecResult {
+            observation: format!("git push failed: {}", e),
+            preview: "push failed".into(),
+            is_error: true,
+            ..Default::default()
+        },
+    }
+}
+
+// exec_create_pr opens a GitHub PR: head = current branch, base = repo default
+// branch. Approval-gated: returns needs_approval with the PR title + base as
+// the preview. Errors clearly when not a github.com repo, no token, no remote,
+// or the push/PR call fails.
+async fn exec_create_pr(client: &reqwest::Client, root: &Path, args: &str, approved: bool) -> ExecResult {
+    let v = match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(v) => v,
+        Err(_) => return ExecResult {
+            observation: "Invalid args for create_pr.".into(),
+            preview: "bad args".into(),
+            is_error: true,
+            ..Default::default()
+        },
+    };
+    let title = v.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string();
+    let body_text = v.get("body").and_then(|b| b.as_str()).unwrap_or("").to_string();
+    if title.is_empty() {
+        return ExecResult {
+            observation: "No PR title provided.".into(),
+            preview: "no title".into(),
+            is_error: true,
+            ..Default::default()
+        };
+    }
+    let head = git_branch(root).await;
+    let base = git_default_branch(root).await;
+    if !approved {
+        return ExecResult {
+            observation: String::new(),
+            preview: "awaiting approval".into(),
+            is_error: false,
+            needs_approval: Some(true),
+            approval_kind: Some("create_pr".into()),
+            approval_preview: Some(format!("PR \"{}\": {} → {}", title, head, base)),
+        };
+    }
+    match create_pr_for_repo(client, root, &title, &body_text, &head, Some(&base)).await {
+        Ok(url) => ExecResult {
+            observation: format!("PR created: {}", url),
+            preview: "PR opened".into(),
+            is_error: false,
+            ..Default::default()
+        },
+        Err(e) => ExecResult {
+            observation: format!("create_pr failed: {}", e),
+            preview: "PR failed".into(),
+            is_error: true,
+            ..Default::default()
+        },
+    }
+}
+
 // --- Repo context helpers ---
 
 async fn git_head(path: &Path) -> String {
@@ -1540,6 +1785,274 @@ async fn repos_set_folder(State(st): State<AppState>, Json(body): Json<SetFolder
     }
 }
 
+// --- Branch + state + commit + PR (agent workflow) ------------------------
+
+// create_pr_for_repo pushes the head branch to origin, then opens a GitHub PR
+// via POST /repos/{owner}/{repo}/pulls. head defaults to the current branch;
+// base defaults to the repo's default branch. The token is scrubbed from any
+// captured error text. Returns Ok(html_url) on success.
+async fn create_pr_for_repo(
+    client: &reqwest::Client,
+    root: &Path,
+    title: &str,
+    body: &str,
+    head: &str,
+    base: Option<&str>,
+) -> Result<String, String> {
+    let remote = git_remote_url(root)
+        .await
+        .ok_or_else(|| "no remote configured".to_string())?;
+    let full_name = github_full_name(&remote)
+        .ok_or_else(|| "create-pr is only supported for github.com repos".to_string())?;
+    let token = token_get()
+        .ok_or_else(|| "no github token stored (connect github first)".to_string())?;
+    let base_branch = match base {
+        Some(b) if !b.is_empty() => b.to_string(),
+        _ => git_default_branch(root).await,
+    };
+    git_push(root, head, &token)
+        .await
+        .map_err(|e| format!("push failed: {}", scrub(e, &token)))?;
+    let pr_json = serde_json::json!({
+        "title": title,
+        "head": head,
+        "base": base_branch,
+        "body": body,
+    });
+    let url = format!("{GH_API}/repos/{}/pulls", full_name);
+    let resp = client
+        .post(&url)
+        .headers(gh_headers(&token))
+        .json(&pr_json)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("github unreachable: {}", scrub(e.to_string(), &token)))?;
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        let v: serde_json::Value = serde_json::from_str(&body_text)
+            .map_err(|e| format!("bad github response: {}", scrub(e.to_string(), &token)))?;
+        v.get("html_url")
+            .and_then(|u| u.as_str())
+            .map(String::from)
+            .ok_or_else(|| "PR created but no URL in response".to_string())
+    } else {
+        let msg = parse_github_error(&body_text)
+            .unwrap_or_else(|| format!("github returned {}", status));
+        Err(scrub(msg, &token))
+    }
+}
+
+#[derive(Deserialize)]
+struct BranchBody {
+    name: String,
+    title: String,
+}
+
+// repos_branch creates (or reuses) an `agent/<slug>` branch for a chat title.
+// Idempotent: if the branch already exists, switches to it instead of creating.
+// On a dirty-tree checkout failure, returns the git error in {error} (no force
+// or stash). After a successful switch, updates the registry and re-pushes repo
+// context to the backend with the new branch (best-effort).
+async fn repos_branch(State(st): State<AppState>, Json(body): Json<BranchBody>) -> Response {
+    let name = body.name.trim().to_string();
+    let title = body.title.trim().to_string();
+    let dest = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_err("not found locally", StatusCode::NOT_FOUND),
+    };
+    let slug = slugify(&title);
+    let branch = format!("agent/{}", slug);
+    let ref_name = format!("refs/heads/{}", branch);
+    let token = token_get().unwrap_or_default();
+    let out = if git_has_ref(&dest, &ref_name).await {
+        tokio::process::Command::new("git")
+            .arg("-C").arg(&dest)
+            .arg("switch").arg(&branch)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await
+    } else {
+        tokio::process::Command::new("git")
+            .arg("-C").arg(&dest)
+            .arg("switch").arg("-c").arg(&branch)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await
+    };
+    match out {
+        Ok(o) if o.status.success() => {
+            // Update the registry so the sidebar reflects the new branch.
+            let mut repos = load_registry(&st.data_dir);
+            if let Some(r) = repos.iter_mut().find(|r| r.full_name == name) {
+                r.branch = branch.clone();
+                save_registry(&st.data_dir, &repos);
+            }
+            // Re-push repo context with the new branch (best-effort).
+            let head = git_head(&dest).await;
+            let tree = top_level_tree(&dest);
+            let _ = push_repo_context(&st, &name, &dest, &branch, &head, &tree).await;
+            json_ok(&serde_json::json!({ "ok": true, "branch": branch }))
+        }
+        Ok(o) => {
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            let msg = scrub(combined.trim().to_string(), &token);
+            json_ok(&serde_json::json!({ "ok": false, "branch": branch, "error": msg }))
+        }
+        Err(e) => {
+            json_ok(&serde_json::json!({ "ok": false, "branch": branch, "error": format!("git switch: {e}") }))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct StateQuery {
+    name: String,
+}
+
+// repos_state returns the live git state for a repo in one call: current
+// branch, dirty file count, ahead/behind vs origin/<branch>, and whether a
+// remote is configured. ahead/behind are 0/0 when the upstream ref is absent.
+async fn repos_state(State(st): State<AppState>, Query(q): Query<StateQuery>) -> Response {
+    let name = q.name.trim().to_string();
+    let dest = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_err("not found locally", StatusCode::NOT_FOUND),
+    };
+    let branch = git_branch(&dest).await;
+    let dirty = git_dirty_count(&dest).await;
+    let has_remote = git_remote_url(&dest).await.is_some();
+    let upstream = format!("origin/{}", branch);
+    let (ahead, behind) = if git_has_ref(&dest, &upstream).await {
+        (
+            git_rev_count(&dest, &format!("origin/{}..HEAD", branch)).await,
+            git_rev_count(&dest, &format!("HEAD..origin/{}", branch)).await,
+        )
+    } else {
+        (0, 0)
+    };
+    json_ok(&serde_json::json!({
+        "name": name,
+        "branch": branch,
+        "dirty": dirty,
+        "ahead": ahead,
+        "behind": behind,
+        "hasRemote": has_remote,
+    }))
+}
+
+#[derive(Deserialize)]
+struct CommitBody {
+    repo: String,
+    message: String,
+    #[serde(default)]
+    push: bool,
+}
+
+// repos_commit is a lightweight commit (+ optional push) with no version or
+// CHANGELOG — the "finish the loop" counterpart to repos_ship. If push is true
+// but the repo has no remote, returns {ok:false, error:"no remote configured"}.
+async fn repos_commit(State(st): State<AppState>, Json(body): Json<CommitBody>) -> Response {
+    let name = body.repo.trim().to_string();
+    let dest = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_err("not found locally", StatusCode::NOT_FOUND),
+    };
+    let message = body.message.trim().to_string();
+    if message.is_empty() {
+        return json_err("message is required", StatusCode::BAD_REQUEST);
+    }
+    if body.push && git_remote_url(&dest).await.is_none() {
+        return json_ok(&serde_json::json!({
+            "ok": false,
+            "head": null,
+            "pushed": false,
+            "error": "no remote configured",
+        }));
+    }
+    let token = token_get().unwrap_or_default();
+    if let Err(e) = git_commit_all(&dest, &message, &token).await {
+        return json_ok(&serde_json::json!({
+            "ok": false,
+            "head": null,
+            "pushed": false,
+            "error": e,
+        }));
+    }
+    let mut pushed = false;
+    let mut push_err: Option<String> = None;
+    if body.push {
+        let branch = git_branch(&dest).await;
+        match git_push(&dest, &branch, &token).await {
+            Ok(_out) => pushed = true,
+            Err(e) => push_err = Some(e),
+        }
+    }
+    let head = git_head(&dest).await;
+    if let Some(e) = push_err {
+        return json_ok(&serde_json::json!({
+            "ok": true,
+            "head": head,
+            "pushed": false,
+            "error": e,
+        }));
+    }
+    json_ok(&serde_json::json!({
+        "ok": true,
+        "head": head,
+        "pushed": pushed,
+        "error": null,
+    }))
+}
+
+#[derive(Deserialize)]
+struct CreatePrBody {
+    repo: String,
+    title: String,
+    body: String,
+    #[serde(default)]
+    head: Option<String>,
+    #[serde(default)]
+    base: Option<String>,
+}
+
+// repos_create_pr opens a GitHub PR for the repo's current (or specified) head
+// branch against the default (or specified) base. Pushes the head branch to
+// origin first. Errors clearly when: not a github.com repo, no stored token,
+// no remote, or the push/PR call fails.
+async fn repos_create_pr(State(st): State<AppState>, Json(body): Json<CreatePrBody>) -> Response {
+    let name = body.repo.trim().to_string();
+    let dest = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_err("not found locally", StatusCode::NOT_FOUND),
+    };
+    let title = body.title.trim().to_string();
+    if title.is_empty() {
+        return json_ok(&serde_json::json!({ "ok": false, "url": null, "error": "title is required" }));
+    }
+    let head = match body.head.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(h) => h.to_string(),
+        None => git_branch(&dest).await,
+    };
+    let base = body
+        .base
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    match create_pr_for_repo(&st.client, &dest, &title, &body.body, &head, base.as_deref()).await {
+        Ok(url) => json_ok(&serde_json::json!({ "ok": true, "url": url })),
+        Err(e) => json_ok(&serde_json::json!({ "ok": false, "url": null, "error": e })),
+    }
+}
+
 // --- router ----------------------------------------------------------------
 
 pub fn router(state: AppState) -> Router {
@@ -1560,6 +2073,10 @@ pub fn router(state: AppState) -> Router {
         .route("/__sidecar/repos/changelog", post(repos_changelog))
         .route("/__sidecar/repos/ship", post(repos_ship))
         .route("/__sidecar/repos/set-folder", post(repos_set_folder))
+        .route("/__sidecar/repos/branch", post(repos_branch))
+        .route("/__sidecar/repos/state", get(repos_state))
+        .route("/__sidecar/repos/commit", post(repos_commit))
+        .route("/__sidecar/repos/create-pr", post(repos_create_pr))
         .with_state(state)
 }
 
