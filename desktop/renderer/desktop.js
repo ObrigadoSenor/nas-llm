@@ -329,7 +329,7 @@ async function runToolExec(convId, d) {
   }
   // Write tools need approval — show a dialog and await the user's decision.
   if (execRes && execRes.needs_approval) {
-    const approved = await showApprovalDialog(execRes.approval_kind || d.tool, execRes.approval_preview || "");
+    const approved = await showApprovalDialog(execRes.approval_kind || d.tool, execRes.approval_preview || "", { repo: d.repo, branch: await branchForRepo(d.repo) });
     if (!approved) {
       // Rejected: tell the agent so it can adjust.
       execRes = { observation: "The user rejected this " + d.tool + " call. Do not retry it; adjust your approach.", preview: "rejected", is_error: true };
@@ -350,12 +350,14 @@ async function runToolExec(convId, d) {
       body: JSON.stringify({ jobId: d.jobId, observation: execRes.observation || "", preview: execRes.preview || "", isError: !!execRes.is_error })
     });
   } catch {}
+  // A write tool may have changed the working tree — refresh the branch rail.
+  refreshRailState();
 }
 
 // showApprovalDialog returns a Promise<boolean> — true if the user clicks
 // Approve, false if Reject. Renders an overlay with the tool kind, a
 // scrollable <pre> preview (diff or command), and the two buttons.
-function showApprovalDialog(kind, preview) {
+function showApprovalDialog(kind, preview, ctx) {
   return new Promise((resolve) => {
     let overlay = $("dsApprovalOverlay");
     if (!overlay) {
@@ -392,7 +394,8 @@ function showApprovalDialog(kind, preview) {
     overlay._kind = kindVal;
       overlay._content = preWrap; // the scrollable container
     }
-    overlay._kind.textContent = kind;
+    const kindText = (ctx && ctx.repo) ? (kind + " → " + ctx.repo + (ctx.branch ? " @ " + ctx.branch : "")) : kind;
+    overlay._kind.textContent = kindText;
     renderApprovalContent(overlay._content, kind, preview);
     overlay.classList.add("open");
   });
@@ -406,12 +409,20 @@ function renderApprovalContent(container, kind, preview) {
   container.innerHTML = "";
   if (kind === "apply_patch" && preview.includes("@@")) {
     container.appendChild(renderDiff(preview));
-  } else {
-    const pre = document.createElement("pre");
-    pre.className = "ds-approval-pre";
-    pre.textContent = preview;
-    container.appendChild(pre);
+    return;
   }
+  const pre = document.createElement("pre");
+  pre.className = "ds-approval-pre";
+  if (kind === "create_pr") {
+    // The sidecar's approval preview for create_pr is the PR title + body.
+    // Best-effort: format {title, body} JSON as "Title\n\nBody"; fall back to raw.
+    let txt = preview;
+    try { const j = JSON.parse(preview); if (j && typeof j === "object") txt = (j.title || "") + "\n\n" + (j.body || ""); } catch {}
+    pre.textContent = txt;
+  } else {
+    pre.textContent = preview;
+  }
+  container.appendChild(pre);
 }
 
 // renderDiff parses a unified diff string and returns a DOM node with
@@ -660,8 +671,134 @@ async function ensureWorkspaceFolder(name) {
   return "";
 }
 
-// Create a repo-bound agent chat, place it in the workspace folder, enable
-// agent mode with file tools, and navigate to it. Reused by "+ New chat".
+// --- Branch rail + no-reload navigation (desktop-only) ---
+// The active conversation's id is owned by app.js (module-private). We detect
+// it from the sidebar DOM: app.js marks the active conv row with `.active` and
+// gives its title element id `ct-<convId>` (renderConv in app.js). A
+// MutationObserver on #convList + the `nasllm:openConv` event tell us when to
+// re-derive it. The rail then polls /__sidecar/repos/state for the bound repo.
+let railRepo = null;       // full_name of the repo the active repo-bound chat is on
+let railState = null;      // last repos/state result for railRepo
+let railTimer = null;      // the ~5s repos/state poll interval
+let railMaps = { convById: new Map(), repoById: new Map(), repoByFullName: new Map() };
+let railSyncTimer = null;  // debounce for syncBranchRail
+
+// Open a conversation without a full location.reload(): dispatch a CustomEvent
+// that app.js listens for and routes through its openConversation path. Falls
+// back to a reload if the listener isn't wired (e.g. older app.js).
+function navigateToConv(convId) {
+  try { window.dispatchEvent(new CustomEvent("nasllm:openConv", { detail: convId })); }
+  catch { try { location.reload(); } catch {} }
+}
+
+// Best-effort fetch of the conversation→repo maps. Cached on railMaps; callers
+// refresh when a conv id isn't found in the cache.
+async function loadWorkspaceMaps() {
+  const convById = new Map(), repoById = new Map(), repoByFullName = new Map();
+  try {
+    const rr = await fetch("/api/repos");
+    if (rr.ok) { const repos = await rr.json(); (repos || []).forEach((rp) => { if (rp && rp.id) { repoById.set(rp.id, rp); if (rp.fullName) repoByFullName.set(rp.fullName, rp); } }); }
+  } catch {}
+  try {
+    const cr = await fetch("/api/conversations");
+    if (cr.ok) { const convs = await cr.json(); (convs || []).forEach((c) => { if (c && c.id) convById.set(c.id, c); }); }
+  } catch {}
+  railMaps = { convById, repoById, repoByFullName };
+  return railMaps;
+}
+
+// Read the active conversation id from the sidebar DOM (set by app.js).
+function activeConvIdFromDOM() {
+  const row = document.querySelector("#convList .conv.active");
+  if (!row) return null;
+  const t = row.querySelector('[id^="ct-"]');
+  if (!t || !t.id) return null;
+  return t.id.slice(3);
+}
+
+// Resolve the branch for a repo: prefer the rail's cached state, else a quick
+// repos/state call. Used to prefix the approval dialog header.
+async function branchForRepo(name) {
+  if (!name) return "";
+  if (railRepo === name && railState && railState.branch) return railState.branch;
+  try { const r = await sid("repos/state?name=" + encodeURIComponent(name)); if (r.ok && r.data && r.data.branch) return r.data.branch; } catch {}
+  return "";
+}
+
+// ensureComposerStatus creates the small repo/branch status line below the
+// composer input (desktop-only) if it isn't already present. Clicking it opens
+// the repo session panel. Lives inside .composer, after .input-wrap.
+function ensureComposerStatus() {
+  let status = $("dsComposerStatus");
+  if (status) return;
+  const wrap = document.querySelector(".composer .input-wrap");
+  if (!wrap || !wrap.parentElement) return;
+  status = el("div", "ds-composer-status");
+  status.id = "dsComposerStatus";
+  status.title = "Open the repo session panel";
+  status.onclick = (e) => { e.stopPropagation(); if (railRepo) openSessionPanel(railRepo); };
+  wrap.parentElement.appendChild(status);
+}
+
+// renderComposerStatus fills the below-input line with the repo + branch + git
+// state. Hidden for non-repo chats / login view.
+function renderComposerStatus() {
+  const status = $("dsComposerStatus");
+  if (!status) return;
+  if (!railRepo) { status.classList.add("hidden"); status.textContent = ""; return; }
+  const s = railState || {};
+  const parts = [railRepo];
+  if (s.branch) parts.push("⎇ " + s.branch);
+  if (s.dirty) parts.push("●" + s.dirty + " dirty");
+  if (s.ahead) parts.push("↑" + s.ahead);
+  if (s.behind) parts.push("↓" + s.behind);
+  if (s.hasRemote === false) parts.push("no remote");
+  status.textContent = parts.join(" · ");
+  status.classList.remove("hidden");
+}
+
+function stopRailPoll() { if (railTimer) { clearInterval(railTimer); railTimer = null; } }
+function startRailPoll() { stopRailPoll(); if (railRepo) railTimer = setInterval(refreshRailState, 5000); }
+
+async function refreshRailState() {
+  if (!railRepo) return;
+  const r = await sid("repos/state?name=" + encodeURIComponent(railRepo));
+  if (r.ok && r.data) { railState = r.data; renderComposerStatus(); }
+}
+
+function hideBranchRail() {
+  railRepo = null; railState = null; stopRailPoll();
+  const status = $("dsComposerStatus");
+  if (status) { status.classList.add("hidden"); status.textContent = ""; }
+}
+
+// Re-bind the rail to the active conversation's repo (or hide it for non-repo
+// / login views). Debounced so a burst of sidebar re-renders coalesces.
+function syncBranchRail() {
+  if (railSyncTimer) clearTimeout(railSyncTimer);
+  railSyncTimer = setTimeout(actualSyncBranchRail, 120);
+}
+async function actualSyncBranchRail() {
+  railSyncTimer = null;
+  const app = $("app");
+  if (!app || app.classList.contains("hidden")) { hideBranchRail(); return; }
+  const convId = activeConvIdFromDOM();
+  if (!convId) { hideBranchRail(); return; }
+  let conv = railMaps.convById.get(convId);
+  if (!conv) { await loadWorkspaceMaps(); conv = railMaps.convById.get(convId); }
+  if (!conv || !conv.repoId) { hideBranchRail(); return; }
+  const repo = railMaps.repoById.get(conv.repoId);
+  if (!repo || !repo.fullName) { hideBranchRail(); return; }
+  const changed = railRepo !== repo.fullName;
+  railRepo = repo.fullName;
+  ensureComposerStatus();
+  if (changed) { await refreshRailState(); startRailPoll(); }
+  renderComposerStatus();
+}
+
+// Create a repo-bound agent chat on its own agent/<slug> branch, place it in
+// the workspace folder, enable agent mode with file + git tools, and navigate
+// to it without a full page reload. Reused by "+ New chat".
 async function createRepoChat(r) {
   const title = r.name + " (agent)";
   const model = localStorage.getItem("nas-llm-model") || "";
@@ -680,8 +817,39 @@ async function createRepoChat(r) {
   if (!repoId) throw new Error("Repo not registered with backend. Re-connect it.");
   // Workspace folder so chats group in the sidebar.
   const folderId = await ensureWorkspaceFolder(r.name);
-  const patchBody = { repoId, agentTools: "read_file,list_files,glob,grep,git_status,apply_patch,run_command,ask_user,get_time" };
+
+  // Create/switch to a dedicated agent branch so edits never land on main.
+  let branch = "";
+  let branchErr = "";
+  try {
+    const br = await sid("repos/branch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: r.name, title }) });
+    const bd = (br && br.data) || {};
+    if (br.ok && bd.ok && bd.branch) branch = bd.branch;
+    else branchErr = bd.error || br.status || "unknown error";
+  } catch (e) { branchErr = String((e && e.message) || e); }
+
+  if (!branch) {
+    // Checkout failed (e.g. dirty tree) — surface the git error and let the
+    // user choose to continue on the current branch instead of silently
+    // landing the agent's edits on main. Never force.
+    flashDsErr("Could not create agent branch: " + branchErr);
+    const cont = await dsConfirm(
+      "Continue on the current branch instead?",
+      "The agent's edits will land on the repo's current branch, not a new agent/<slug> branch."
+    );
+    if (!cont) return; // aborted — do not navigate
+    try {
+      const sr = await sid("repos/state?name=" + encodeURIComponent(r.name));
+      const sd = (sr && sr.data) || {};
+      if (sr.ok && sd.branch) branch = sd.branch;
+    } catch {}
+  }
+
+  // PATCH repoId + agentTools (file + git) + folder + repoBranch in one go.
+  const agentTools = "read_file,list_files,glob,grep,git_status,apply_patch,run_command,ask_user,get_time,git_commit,git_push,create_pr";
+  const patchBody = { repoId, agentTools };
   if (folderId) patchBody.folderId = folderId;
+  if (branch) patchBody.repoBranch = branch;
   try {
     await fetch("/api/conversations/" + encodeURIComponent(convId), { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(patchBody) });
   } catch (e) { throw new Error(String(e && e.message || e)); }
@@ -691,7 +859,9 @@ async function createRepoChat(r) {
     if (!extras.includes("agent")) { extras.push("agent"); localStorage.setItem("nas-llm-extras", JSON.stringify(extras)); }
     localStorage.setItem("nas-llm-conv", convId);
   } catch {}
-  location.reload();
+  // Navigate to the new chat without a full location.reload(): the app.js
+  // listener for `nasllm:openConv` runs the existing openConversation path.
+  navigateToConv(convId);
 }
 
 // --- Repos panel (GitHub connect/browse/clone; local repos live in the sidebar) ---
@@ -729,65 +899,116 @@ function hostOf(remote) {
   return "";
 }
 
-// localRow renders one connected repo as a workspace: the repo row (name,
-// badges, Pull/Ship/+ New chat) plus the list of chats attached to it.
+// Which repos are expanded in the sidebar dropdown (persisted by full_name).
+let expandedRepos = new Set();
+try { expandedRepos = new Set(JSON.parse(localStorage.getItem("nas-llm-repo-expanded") || "[]")); } catch {}
+function saveExpandedRepos() { try { localStorage.setItem("nas-llm-repo-expanded", JSON.stringify([...expandedRepos])); } catch {} }
+
+// pullRepo runs `git pull --ff-only` on a connected repo and refreshes the list.
+async function pullRepo(r) {
+  const res = await sid("repos/refresh", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: r.name }) });
+  const d = (res && res.data) || {};
+  if (!d.ok) flashDsErr(d.error || res.status);
+  refreshLocal();
+}
+
+// repoMenu opens a small popup of per-repo actions anchored under the ⋯ button.
+// Closes on outside click, Esc, or item selection.
+function repoMenu(r, anchor) {
+  closeRepoMenu();
+  const menu = el("div", "ds-repo-menu");
+  menu.id = "dsRepoMenu";
+  const add = (label, title, fn) => {
+    const item = el("button", "ds-repo-menu-item", label);
+    if (title) item.title = title;
+    item.onclick = (e) => { e.stopPropagation(); closeRepoMenu(); fn(); };
+    menu.appendChild(item);
+  };
+  add("Pull", "git pull --ff-only", () => pullRepo(r));
+  add("Session…", "Diff, commit & push, open PR, revert", () => openSessionPanel(r.name));
+  add("Ship…", "Versioned release (changelog + commit/push)", () => openShipChanges(r));
+  document.body.appendChild(menu);
+  const rect = anchor.getBoundingClientRect();
+  menu.style.right = (window.innerWidth - rect.right) + "px";
+  menu.style.top = (rect.bottom + 4) + "px";
+  // Defer the outside-click listener so the same click that opened it doesn't
+  // immediately close it (the click stops propagating, but this is belt+braces).
+  setTimeout(() => {
+    menu._outside = (e) => { if (!menu.contains(e.target)) closeRepoMenu(); };
+    menu._esc = (e) => { if (e.key === "Escape") closeRepoMenu(); };
+    document.addEventListener("click", menu._outside);
+    document.addEventListener("keydown", menu._esc);
+  }, 0);
+}
+function closeRepoMenu() {
+  const menu = $("dsRepoMenu");
+  if (!menu) return;
+  if (menu._outside) document.removeEventListener("click", menu._outside);
+  if (menu._esc) document.removeEventListener("keydown", menu._esc);
+  menu.remove();
+}
+
+// localRow renders one connected repo as a dropdown: a header with the repo
+// name, a ⋯ actions menu, and a + to start a new agent chat. Expanding the
+// header shows the chats attached to it. Branch/dirty state lives in the
+// header rail (in-chat) and the session panel, so the sidebar row stays clean.
 function localRow(r, chats) {
   const wrap = el("div", "ds-repo-wrap");
-  const row = el("div", "ds-repo-row");
-  const main = el("div", "ds-repo-main");
-  const name = el("div", "ds-repo-name", r.name);
-  const dirtyBadge = r.dirty > 0 ? el("span", "ds-badge ds-badge-dirty", r.dirty + " dirty") : el("span", "ds-badge ds-badge-clean", "clean");
-  name.appendChild(dirtyBadge);
-  if (r.linked) name.appendChild(el("span", "ds-badge ds-badge-linked", "linked"));
-  else name.appendChild(el("span", "ds-badge ds-badge-cloned", "cloned"));
-  const host = hostOf(r.remote);
-  if (host) name.appendChild(el("span", "ds-badge ds-badge-remote", host));
-  main.appendChild(name);
-  const meta = el("div", "ds-repo-meta", r.branch);
-  main.appendChild(meta);
-  row.appendChild(main);
+  if (expandedRepos.has(r.name)) wrap.classList.add("expanded");
 
-  const refresh = el("button", "ds-btn ds-btn-ghost ds-btn-sm", "Pull");
-  refresh.onclick = async () => {
-    refresh.disabled = true; refresh.textContent = "Pulling…";
-    const res = await sid("repos/refresh", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: r.name }) });
-    refresh.disabled = false; refresh.textContent = "Pull";
-    const d = (res && res.data) || {};
-    if (!d.ok) flashDsErr(d.error || res.status);
-    refreshLocal();
+  const head = el("div", "ds-repo-head");
+  const chev = el("span", "ds-repo-chev", "▸");
+  head.appendChild(chev);
+  const nameBtn = el("button", "ds-repo-name-btn");
+  nameBtn.title = r.branch ? (r.name + " · on " + r.branch) : r.name;
+  nameBtn.appendChild(el("span", "ds-repo-name", r.name));
+  if (r.dirty > 0) nameBtn.appendChild(el("span", "ds-repo-dirty", "●" + r.dirty));
+  nameBtn.onclick = () => {
+    if (expandedRepos.has(r.name)) expandedRepos.delete(r.name);
+    else expandedRepos.add(r.name);
+    saveExpandedRepos();
+    wrap.classList.toggle("expanded");
   };
-  row.appendChild(refresh);
+  head.appendChild(nameBtn);
 
-  const ship = el("button", "ds-btn ds-btn-ghost ds-btn-sm", "Ship");
-  ship.title = "Review changes, write a changelog, and commit/push a version";
-  ship.onclick = () => openShipChanges(r);
-  row.appendChild(ship);
-
-  const agent = el("button", "ds-btn ds-btn-sm", "+ New chat");
-  agent.onclick = async () => {
-    agent.disabled = true; agent.textContent = "Creating…";
+  const actions = el("div", "ds-repo-actions");
+  const menuBtn = el("button", "ds-btn ds-btn-ghost ds-btn-sm", "⋯");
+  menuBtn.title = "Repo actions"; menuBtn.setAttribute("aria-label", "Repo actions");
+  menuBtn.onclick = (e) => { e.stopPropagation(); repoMenu(r, menuBtn); };
+  actions.appendChild(menuBtn);
+  const addBtn = el("button", "ds-btn ds-btn-sm ds-repo-add", "+");
+  addBtn.title = "New agent chat on a fresh branch"; addBtn.setAttribute("aria-label", "New chat");
+  addBtn.onclick = async (e) => {
+    e.stopPropagation();
+    addBtn.disabled = true; addBtn.textContent = "…";
     try { await createRepoChat(r); }
-    catch (e) { flashDsErr(String(e && e.message || e)); agent.disabled = false; agent.textContent = "+ New chat"; }
+    catch (err) { flashDsErr(String((err && err.message) || err)); }
+    finally { addBtn.disabled = false; addBtn.textContent = "+"; }
   };
-  row.appendChild(agent);
-  wrap.appendChild(row);
+  actions.appendChild(addBtn);
+  head.appendChild(actions);
+  wrap.appendChild(head);
 
-  // Attached chats (the workspace).
+  // Attached chats (the dropdown body).
   const chatsEl = el("div", "ds-repo-chats");
   if (chats && chats.length) {
-    const head = el("div", "ds-repo-chats-head", chats.length + " chat" + (chats.length === 1 ? "" : "s"));
-    chatsEl.appendChild(head);
     chats.forEach((c) => {
       const cr = el("div", "ds-repo-chat");
+      const cmain = el("div", "ds-repo-chat-main");
       const t = el("span", "ds-repo-chat-title", c.title || "New chat");
-      cr.appendChild(t);
+      cmain.appendChild(t);
+      // Each chat's agent branch: the conversation's stored repoBranch, falling
+      // back to the repo's live branch for older chats without one.
+      const br = c.repoBranch || r.branch || "";
+      if (br) cmain.appendChild(el("span", "ds-repo-chat-branch", "⎇ " + br));
+      cr.appendChild(cmain);
       const tm = el("span", "ds-repo-chat-time", dsTime(c.updatedAt));
       cr.appendChild(tm);
-      cr.onclick = () => { try { localStorage.setItem("nas-llm-conv", c.id); } catch {} location.reload(); };
+      cr.onclick = () => { try { localStorage.setItem("nas-llm-conv", c.id); } catch {} navigateToConv(c.id); };
       chatsEl.appendChild(cr);
     });
   } else {
-    chatsEl.appendChild(el("div", "ds-note", "No chats yet. Click + New chat to start one against this repo."));
+    chatsEl.appendChild(el("div", "ds-note", "No chats yet. Click + to start one."));
   }
   wrap.appendChild(chatsEl);
   return wrap;
@@ -1098,6 +1319,170 @@ async function shipCommit(r, push) {
   }
 }
 
+// --- Repo session panel (desktop-only) ---
+// One per-repo view opened from the branch rail / per-repo ⋯ that merges the
+// working-changes review with commit/push/open-PR/ship. Modeled on the Ship
+// overlay: built once and reused; loadSessionPanel refreshes state + diff.
+function openSessionPanel(repoName) {
+  let overlay = $("dsSessionOverlay");
+  if (!overlay) {
+    overlay = el("div", "ds-overlay");
+    overlay.id = "dsSessionOverlay";
+    overlay.setAttribute("role", "dialog");
+    overlay.setAttribute("aria-modal", "true");
+    overlay.setAttribute("aria-label", "Repo session");
+    const card = el("div", "ds-card ds-card-wide");
+    const head = el("div", "ds-head");
+    head.appendChild(el("h2", null, "Repo session"));
+    const x = el("button", "ds-x"); x.textContent = "×"; x.title = "Close"; x.setAttribute("aria-label", "Close");
+    x.onclick = () => overlay.classList.remove("open");
+    head.appendChild(x);
+    card.appendChild(head);
+    const status = el("div", "ds-note"); status.id = "dsSessionStatus";
+    card.appendChild(status);
+    const diffWrap = el("div", "ds-approval-pre-wrap"); diffWrap.id = "dsSessionDiff";
+    card.appendChild(diffWrap);
+    card.appendChild(el("div", "ds-label", "Commit message"));
+    const msgInput = document.createElement("input"); msgInput.id = "dsSessionMsg"; msgInput.type = "text"; msgInput.placeholder = "Describe what changed";
+    card.appendChild(msgInput);
+    const commitRow = el("div", "ds-row ds-approval-row");
+    const commitBtn = el("button", "ds-btn", "Commit");
+    const pushBtn = el("button", "ds-btn ds-btn-approve", "Commit & push");
+    commitRow.appendChild(commitBtn); commitRow.appendChild(pushBtn);
+    card.appendChild(commitRow);
+    const commitOut = el("div", "ds-note"); commitOut.id = "dsSessionCommitOut";
+    card.appendChild(commitOut);
+    card.appendChild(el("div", "ds-label", "Open pull request"));
+    const prTitle = document.createElement("input"); prTitle.id = "dsSessionPrTitle"; prTitle.type = "text"; prTitle.placeholder = "PR title";
+    card.appendChild(prTitle);
+    const prBody = document.createElement("textarea"); prBody.id = "dsSessionPrBody"; prBody.rows = 4; prBody.placeholder = "PR body (markdown)";
+    card.appendChild(prBody);
+    const prRow = el("div", "ds-row ds-approval-row");
+    const prBtn = el("button", "ds-btn ds-btn-approve", "Open PR");
+    prRow.appendChild(prBtn);
+    card.appendChild(prRow);
+    const prOut = el("div", "ds-note"); prOut.id = "dsSessionPrOut";
+    card.appendChild(prOut);
+    const actRow = el("div", "ds-row ds-approval-row");
+    const revertBtn = el("button", "ds-btn ds-btn-ghost", "Revert");
+    const shipBtn = el("button", "ds-btn ds-btn-ghost", "Ship…");
+    actRow.appendChild(revertBtn); actRow.appendChild(shipBtn);
+    card.appendChild(actRow);
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.classList.remove("open"); });
+    overlay._rebind = (name) => {
+      overlay._repo = name;
+      overlay._commit = (push) => sessionCommit(name, push);
+      overlay._createPR = () => sessionCreatePR(name);
+      overlay._revert = () => sessionRevert(name);
+      overlay._ship = () => { overlay.classList.remove("open"); openShipChanges({ name }); };
+    };
+    commitBtn.onclick = () => overlay._commit(false);
+    pushBtn.onclick = () => overlay._commit(true);
+    prBtn.onclick = () => overlay._createPR();
+    revertBtn.onclick = () => overlay._revert();
+    shipBtn.onclick = () => overlay._ship();
+  }
+  const prev = overlay._repo;
+  overlay._rebind(repoName);
+  if (prev !== repoName) {
+    const m = $("dsSessionMsg"); if (m) m.value = "";
+    const pt = $("dsSessionPrTitle"); if (pt) pt.value = "";
+    const pb = $("dsSessionPrBody"); if (pb) pb.value = "";
+  }
+  const co = $("dsSessionCommitOut"); if (co) co.textContent = "";
+  const po = $("dsSessionPrOut"); if (po) po.textContent = "";
+  overlay.classList.add("open");
+  loadSessionPanel(repoName);
+}
+
+async function loadSessionPanel(repoName) {
+  const overlay = $("dsSessionOverlay"); if (!overlay) return;
+  const status = $("dsSessionStatus");
+  const diffWrap = $("dsSessionDiff");
+  if (status) status.textContent = "Loading repo state…";
+  if (diffWrap) diffWrap.innerHTML = "";
+  const sr = await sid("repos/state?name=" + encodeURIComponent(repoName));
+  const sd = (sr && sr.data) || {};
+  const dr = await sid("repos/diff", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: repoName }) });
+  const dd = (dr && dr.data) || {};
+  if (status) {
+    const segs = [repoName];
+    if (sd.branch) segs.push("⎇ " + sd.branch);
+    if (sd.dirty) segs.push("●" + sd.dirty + " dirty");
+    if (sd.ahead) segs.push("↑" + sd.ahead);
+    if (sd.behind) segs.push("↓" + sd.behind);
+    if (sd.hasRemote === false) segs.push("no remote");
+    status.textContent = segs.join(" · ");
+  }
+  if (diffWrap) {
+    if (dr.ok && dd.diff && dd.diff.trim()) renderApprovalContent(diffWrap, "apply_patch", dd.diff);
+    else diffWrap.appendChild(el("div", "ds-note", "No uncommitted changes."));
+  }
+  // Commit & push + Open PR both need a remote.
+  const hasRemote = sd.hasRemote !== false;
+  overlay.querySelectorAll(".ds-btn-approve").forEach((b) => {
+    if (!hasRemote) { b.disabled = true; b.title = "No remote configured for this repo."; }
+    else { b.disabled = false; b.title = ""; }
+  });
+}
+
+async function sessionCommit(repoName, push) {
+  const out = $("dsSessionCommitOut");
+  const msg = ($("dsSessionMsg") && $("dsSessionMsg").value.trim()) || "";
+  if (!msg) { if (out) out.textContent = "Enter a commit message."; return; }
+  if (push) {
+    const ok = await dsConfirm("Push to the remote?", "This commits and pushes " + repoName + " to its origin.");
+    if (!ok) return;
+  }
+  if (out) out.textContent = push ? "Committing and pushing…" : "Committing…";
+  const res = await sid("repos/commit", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repo: repoName, message: msg, push }) });
+  const d = (res && res.data) || {};
+  if (d.ok) {
+    const head = (d.head || "").slice(0, 7);
+    if (out) out.textContent = push ? (d.pushed ? "Pushed ✓ (head " + head + ")" : ("Committed, but push failed: " + (d.error || "unknown"))) : "Committed ✓ (head " + head + ")";
+    loadSessionPanel(repoName);
+    refreshRailState();
+    refreshLocal();
+  } else {
+    if (out) out.textContent = "Failed: " + (d.error || res.status || "unknown");
+  }
+}
+
+async function sessionCreatePR(repoName) {
+  const out = $("dsSessionPrOut");
+  const title = ($("dsSessionPrTitle") && $("dsSessionPrTitle").value.trim()) || "";
+  const body = ($("dsSessionPrBody") && $("dsSessionPrBody").value) || "";
+  if (!title) { if (out) out.textContent = "Enter a PR title."; return; }
+  if (out) out.textContent = "Pushing branch and opening PR…";
+  const res = await sid("repos/create-pr", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repo: repoName, title, body }) });
+  const d = (res && res.data) || {};
+  if (d.ok && d.url) {
+    if (out) {
+      out.innerHTML = "";
+      out.appendChild(document.createTextNode("PR opened ✓ "));
+      const a = document.createElement("a"); a.className = "ds-pr-open"; a.href = d.url; a.target = "_blank"; a.rel = "noopener"; a.textContent = "Open"; a.title = d.url;
+      out.appendChild(a);
+      out.appendChild(el("span", "ds-pr-url", " " + d.url));
+    }
+    refreshRailState();
+  } else {
+    if (out) out.textContent = "Failed: " + (d.error || res.status || "unknown");
+  }
+}
+
+async function sessionRevert(repoName) {
+  const ok = await dsConfirm("Revert all working changes in " + repoName + "?", "This runs git checkout -- . && git clean -fd, discarding all uncommitted edits.");
+  if (!ok) return;
+  const res = await sid("repos/revert", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: repoName }) });
+  const d = (res && res.data) || {};
+  if (!d.ok) flashDsErr(d.error || res.status);
+  loadSessionPanel(repoName);
+  refreshRailState();
+  refreshLocal();
+}
+
 function makeReposBtn() {
   const btn = el("button", "ds-repos-btn");
   btn.title = "GitHub (connect account, browse & clone repos)"; btn.setAttribute("aria-label", "GitHub");
@@ -1304,6 +1689,9 @@ async function bootDesktop() {
       buildSidebarRepos();
       refreshLocal();
       maybeShowRepoWizard();
+      syncBranchRail();
+    } else {
+      hideBranchRail();
     }
   };
   syncAuthedUI();
@@ -1313,6 +1701,12 @@ async function bootDesktop() {
   // boot script runs, so #app may still be hidden the first time above.
   const app = $("app");
   if (app) new MutationObserver(syncAuthedUI).observe(app, { attributes: true, attributeFilter: ["class"] });
+  // Branch rail: re-derive the active repo-bound chat when the sidebar
+  // re-renders (app.js marks the active conv row) or when desktop.js navigates
+  // to a chat via the nasllm:openConv event.
+  const convListEl = $("convList");
+  if (convListEl) new MutationObserver(() => syncBranchRail()).observe(convListEl, { childList: true, subtree: true });
+  window.addEventListener("nasllm:openConv", () => syncBranchRail());
   // Auto-start a local Ollama if installed but not running, so local models are
   // discoverable through the /__ollama proxy by the time the web UI needs them.
   // If the app is already authed and Ollama just came up, reload once so app.js

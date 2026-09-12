@@ -196,11 +196,33 @@
 .ds-badge-remote { background: #2a2330; color: #c39bd3; }
 .ds-repo-wrap {
   border-bottom: 1px solid #1a1d24;
-  padding: 4px 0 8px;
+  padding: 2px 0;
 }
-.ds-repo-wrap .ds-repo-row { border-bottom: 0; padding: 8px 0 4px; }
-.ds-repo-chats { margin: 0 0 4px 14px; }
-.ds-repo-chats-head { font-size: 10px; color: #6b707a; text-transform: uppercase; letter-spacing: .04em; margin: 2px 0 4px; }
+/* Dropdown header: chevron + repo name (flex:1) + actions (⋯ menu, + new chat). */
+.ds-repo-head { display: flex; align-items: center; gap: 6px; padding: 4px 2px; }
+.ds-repo-chev {
+  color: #6b707a; font-size: 10px; display: inline-flex; transition: transform .12s;
+  width: 10px; flex: none;
+}
+.ds-repo-wrap.expanded .ds-repo-chev { transform: rotate(90deg); }
+.ds-repo-name-btn {
+  flex: 1; min-width: 0;
+  display: flex; align-items: center; gap: 6px;
+  background: transparent; border: 0; padding: 2px 4px; margin: 0;
+  color: inherit; font: inherit; text-align: left; cursor: pointer;
+  border-radius: 6px;
+}
+.ds-repo-name-btn:hover { background: #1b1f27; }
+.ds-repo-name { font-size: 13px; color: #e6e6e6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ds-repo-dirty {
+  font-size: 10px; color: #e87060; flex: none;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+.ds-repo-actions { display: flex; align-items: center; gap: 4px; flex: none; }
+.ds-repo-add { padding: 3px 9px; font-size: 13px; line-height: 1; }
+/* Dropdown body: the attached chats. Hidden unless expanded. */
+.ds-repo-chats { margin: 2px 0 6px 16px; display: none; }
+.ds-repo-wrap.expanded .ds-repo-chats { display: block; }
 .ds-repo-chat {
   display: flex; align-items: center; gap: 8px;
   padding: 5px 8px; border-radius: 6px; cursor: pointer;
@@ -213,8 +235,8 @@
 .ds-confirm-sub { color: #6b707a; }
 
 /* --- Sidebar "Repos" section (desktop-only; injected into the shared #sidebar,
-   between #sideHead and #convList). Reuses .ds-repo-row/.ds-badge*/.ds-btn-sm
-   from the repo-row renderer above, adapted here for the narrow sidebar. --- */
+   between #sideHead and #convList). Repo rows are dropdowns (.ds-repo-wrap /
+   .ds-repo-head / .ds-repo-chats) adapted for the narrow sidebar. --- */
 .ds-sidebar-repos { border-top: 1px solid #2a2e37; border-bottom: 1px solid #2a2e37; margin: 2px 0 6px; padding-bottom: 4px; }
 .ds-sidebar-repos-head { display: flex; align-items: center; gap: 6px; padding: 6px 2px; cursor: pointer; user-select: none; }
 .ds-sidebar-repos-chev { color: #6b707a; font-size: 10px; display: inline-flex; transition: transform .12s; }
@@ -230,12 +252,25 @@
 .ds-sidebar-repos.collapsed .ds-sidebar-repos-body { display: none; }
 .ds-sidebar-repos-body .ds-note { font-size: 11px; margin: 2px 0 6px; }
 
-/* Compact repo rows inside the narrow sidebar (vs. the wide GitHub modal card). */
-.ds-sidebar-repos-body .ds-repo-wrap { padding: 2px 0 6px; }
-.ds-sidebar-repos-body .ds-repo-row { flex-wrap: wrap; row-gap: 4px; padding: 4px 0; }
-.ds-sidebar-repos-body .ds-repo-main { width: 100%; }
+/* Compact dropdown rows inside the narrow sidebar (vs. the wide GitHub modal card). */
+.ds-sidebar-repos-body .ds-repo-wrap { padding: 1px 0; }
 .ds-sidebar-repos-body .ds-btn-sm { padding: 3px 7px; font-size: 11px; }
-.ds-sidebar-repos-body .ds-repo-chats { margin-left: 8px; }
+.ds-sidebar-repos-body .ds-repo-chats { margin-left: 10px; }
+
+/* Per-repo ⋯ actions popup (Pull / Session… / Ship…). */
+.ds-repo-menu {
+  position: fixed; z-index: 10002;
+  min-width: 168px;
+  background: #15171c; border: 1px solid #2a2e37; border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.5);
+  padding: 4px; display: flex; flex-direction: column; gap: 2px;
+}
+.ds-repo-menu-item {
+  background: transparent; border: 0; color: #c7ccd4;
+  text-align: left; padding: 7px 10px; font-size: 13px; cursor: pointer;
+  border-radius: 6px;
+}
+.ds-repo-menu-item:hover { background: #1b1f27; color: #e6e6e6; }
 
 /* Connect-picker checklist (folder scan found several git repos). */
 .ds-connect-list { display: flex; flex-direction: column; gap: 6px; max-height: 40vh; overflow-y: auto; margin: 10px 0; }
@@ -276,3 +311,43 @@
   background: #0e1014; border: 1px solid #2a2e37; border-radius: 8px;
   margin-top: 8px;
 }
+
+/* --- Composer status line (below the input, desktop-only) --- */
+/* Small muted text: repo + branch + git state for a repo-bound chat. Click opens
+   the repo session panel. */
+.ds-composer-status {
+  margin: 6px 4px 0;
+  font-size: 11px;
+  color: #6b707a;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  cursor: pointer; user-select: none;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ds-composer-status:hover { color: #9aa0aa; }
+.ds-composer-status.hidden { display: none; }
+
+/* --- Sidebar chat rows: title + branch under it --- */
+.ds-repo-chat-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.ds-repo-chat-branch {
+  font-size: 10px; color: #6b707a;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* --- Repo session panel --- */
+#dsSessionMsg, #dsSessionPrTitle {
+  width: 100%; box-sizing: border-box;
+  background: #0e1014; border: 1px solid #2a2e37; color: #e6e6e6;
+  border-radius: 8px; padding: 8px 10px; font-size: 13px;
+}
+#dsSessionMsg:focus, #dsSessionPrTitle:focus { outline: none; border-color: #3a4150; }
+#dsSessionPrBody {
+  width: 100%; box-sizing: border-box; resize: vertical;
+  background: #0e1014; border: 1px solid #2a2e37; color: #e6e6e6;
+  border-radius: 8px; padding: 8px 10px; font-size: 13px; font-family: inherit;
+  margin-top: 8px;
+}
+#dsSessionPrBody:focus { outline: none; border-color: #3a4150; }
+.ds-pr-open { color: #8ab4f8; text-decoration: none; font-weight: 600; }
+.ds-pr-open:hover { text-decoration: underline; }
+.ds-pr-url { color: #6b707a; font-size: 11px; word-break: break-all; }
