@@ -28,8 +28,6 @@ jobs:
         include:
           - platform: macos-latest
             args: "--bundles dmg,app"
-          - platform: windows-latest
-            args: "--bundles msi,nsis"
     runs-on: ${{ matrix.platform }}
     permissions:
       contents: write
@@ -85,5 +83,4 @@ jobs:
           releaseBody: ${{ steps.notes.outputs.body }}
           releaseDraft: false
           prerelease: false
-          updaterJsonPreferNsis: true
           args: ${{ matrix.args }}
