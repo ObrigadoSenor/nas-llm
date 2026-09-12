@@ -954,9 +954,9 @@ async function actualSyncBranchRail() {
   renderComposerStatus();
 }
 
-// Create a repo-bound agent chat on its own agent/<slug> branch, place it in
-// the workspace folder, enable agent mode with file + git tools, and navigate
-// to it without a full page reload. Reused by "+ New chat".
+// Create a repo-bound agent chat in its own git worktree on its own branch,
+// place it in the workspace folder, enable agent mode with file + git tools,
+// and navigate to it without a full page reload. Reused by "+ New chat".
 //
 // Order matters: we register the repo with the backend and confirm its id
 // BEFORE creating any conversation. If registration fails we surface the real
@@ -1013,24 +1013,39 @@ async function createRepoChat(r) {
   // Workspace folder so chats group in the sidebar.
   const folderId = await ensureWorkspaceFolder(fullName);
 
-  // Create/switch to a dedicated agent branch so edits never land on main.
+  // Give this chat its own branch in its own git worktree.
+  //
+  // Two things matter here. First, the name must be unique per chat: every chat
+  // on a repo is created with the SAME title ("owner/repo (agent)"), so a slug
+  // derived from the title alone put every chat on ONE branch — "a branch per
+  // chat" was really a branch per repo. A short slice of the conversation id
+  // fixes that while keeping the name readable.
+  //
+  // Second, we provision a worktree rather than `git switch`-ing the repo
+  // folder. Switching moved the branch of the checkout the user has open in
+  // their editor, and carried any uncommitted changes there onto the new
+  // branch. A worktree is a separate directory, so the repo folder is left
+  // exactly as it was and two chats can hold two branches at once.
+  const shortName = (fullName.split("/").pop() || fullName);
+  const branchName = "agent/" + slugifyTitle(shortName) + "-" + String(convId).slice(0, 7);
   let branch = "";
   let branchErr = "";
   try {
-    const br = await sid("repos/branch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: fullName, title }) });
-    const bd = (br && br.data) || {};
-    if (br.ok && bd.ok && bd.branch) branch = bd.branch;
-    else branchErr = bd.error || br.status || "unknown error";
+    const wr = await sid("repos/worktree", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: fullName, branch: branchName, create: true }) });
+    const wd = (wr && wr.data) || {};
+    if (wr.ok && wd.ok && wd.branch) branch = wd.branch;
+    else branchErr = wd.error || wr.status || "unknown error";
   } catch (e) { branchErr = String((e && e.message) || e); }
 
   if (!branch) {
-    // Checkout failed (e.g. dirty tree) — surface the git error and let the
-    // user choose to continue on the current branch instead of silently
-    // landing the agent's edits on main. Never force.
-    flashDsErr("Could not create agent branch: " + branchErr);
+    // Provisioning failed (unwritable worktrees dir, a stale directory git no
+    // longer tracks, a repo that moved). Surface the real git error and let the
+    // user fall back to the repo folder's current branch rather than silently
+    // landing the agent's edits somewhere they don't expect. Never force.
+    flashDsErr("Could not create this chat's worktree: " + branchErr);
     const cont = await dsConfirm(
-      "Continue on the current branch instead?",
-      "The agent's edits will land on the repo's current branch, not a new agent/<slug> branch."
+      "Continue on the repo's current branch instead?",
+      "The agent's edits will land in the repo folder on whatever branch it has checked out, shared with anything else using it."
     );
     if (!cont) return; // aborted — do not navigate
     try {

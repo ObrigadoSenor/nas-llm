@@ -185,10 +185,13 @@ connected repo is a workspace with **Pull**, **Ship** (versioned release), and
 
 **+ New chat** starts an agent work session against that repo on its **own
 branch** so `main` is never dirtied:
-- The sidecar runs `git switch -c agent/<slug>` (slug from the chat title;
-idempotent — reuses an existing `agent/<slug>`) and stores `repo_branch` on the
-conversation. If the tree is dirty and the checkout would fail, you get a toast
-and a choice to continue on the current branch instead — nothing is forced.
+- The sidecar provisions a **git worktree** for a fresh `agent/<repo>-<id>`
+branch (cut from the repo's default branch) and stores `repo_branch` on the
+conversation. Your repo folder is left exactly as it is — same branch, same
+uncommitted work — because the chat gets its own directory. The `<id>` suffix is
+a slice of the conversation id, so two chats on one repo never collide. If
+provisioning fails you get the git error and a choice to continue on the repo
+folder's current branch instead — nothing is forced.
 - A small **status line** below the input field shows the repo, branch, and git
 state (`owner/repo · ⎇ branch · ●N dirty · ↑a ↓b`, plus `no remote` when there
 isn't one) while a repo-bound chat is open — polled every few seconds and
@@ -252,12 +255,10 @@ no `node_modules`, no `.env`, no build caches. The first `run_command` on a new
 branch may need an install step. Remove ones you are done with via
 `git worktree remove <path>` (or `git worktree prune` after deleting by hand).
 
-**Known wrinkle:** **+ New chat** still switches the *repo folder* to the new
-`agent/<slug>` branch instead of provisioning a worktree up front. Later tool
-calls self-correct (an older chat's branch simply gets its own worktree on next
-use), but if the repo folder has uncommitted changes when you start a new chat,
-git carries them onto the new branch. Commit or stash before starting a new chat
-on a repo you were mid-edit on.
+**Chats created before this change** share one `agent/<slug-of-title>` branch,
+because the old naming derived from the chat title and every chat on a repo is
+titled `owner/repo (agent)`. They keep working as they always did; re-point any
+of them with the ⎇ chip to give it a branch of its own.
 
 ### Notifications
 

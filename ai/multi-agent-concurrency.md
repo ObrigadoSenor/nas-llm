@@ -35,6 +35,14 @@ Four parallel local child agents, one per layer, each in its own git worktree, c
 - **Worktrees, because git already solves this.** A branch can be checked out in at most one worktree, which is exactly the isolation wanted. `ensure_worktree` prunes, then scans `git worktree list --porcelain` — that single scan covers both "already has a worktree" and "checked out in the main tree", since the main tree appears in that list with its branch.
 - **Known tradeoff:** a fresh worktree has no untracked/ignored files (`node_modules`, `.env`, build caches), so the first `run_command` on a new branch may need an install step. Surfaced in the branch picker rather than hidden.
 
+## Follow-up: per-chat worktree at creation time
+The first integration left `createRepoChat` calling the old `repos/branch` route, which meant new chats still `git switch -c`'d the **shared repo folder**. Fixed afterwards, and worth recording because the investigation turned up a second, larger problem:
+- **"A branch per chat" was really a branch per repo.** The branch name came from `slugify(title)`, but every chat on a repo is created with the same title (`owner/repo (agent)`), so every chat resolved to the same `agent/<slug>` — and `repos/branch` was idempotent, so it happily reused it. The branch this very session started on, `agent/obrigadosenor-nas-llm--agent`, is that shared branch. Two chats on one repo could not hold two branches no matter what the UI showed.
+- **Fix:** `createRepoChat` now calls `repos/worktree {create:true}` with `agent/<repo-short-name>-<first 7 of convId>`. Unique per chat, readable, and provisioned as a worktree so the repo folder's branch and uncommitted work are untouched.
+- **Secondary gain:** the old path carried the user's uncommitted edits onto the new chat's branch (that is what `git switch -c` does with a dirty tree). The worktree path cannot, since the chat gets a separate directory cut from the default branch.
+- Verified with a scratch-git probe contrasting both paths: old → repo folder moved to the new branch *and* the uncommitted edit followed it; new → folder branch unchanged, edit stays put, chat worktree starts from committed state, and two chats hold two branches with isolated edits.
+- `POST /__sidecar/repos/branch` is now unused by the UI. Left in place (it is a working control-plane route and the session panel's semantics may still want it) but it no longer participates in the chat flow.
+
 ## Validation (on `orchestrator/mc-integrate`)
 - Backend: `gofmt -l .` clean, `go vet ./...` clean, `go build ./...` clean, `go test ./...` ok, `go test -race ./...` ok.
 - Sidecar: `cargo check` clean (no warnings).
