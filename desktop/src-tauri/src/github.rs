@@ -1350,6 +1350,58 @@ async fn repos_add_local(State(st): State<AppState>, Json(body): Json<AddLocalBo
     }))
 }
 
+// --- Scan a folder for one or more git repos (sidebar connect wizard) ------
+
+#[derive(Deserialize)]
+struct ScanBody {
+    path: String,
+}
+
+#[derive(Serialize, Clone)]
+struct ScanCandidate {
+    name: String,
+    path: String,
+}
+
+// repos_scan_local resolves what a picked folder should connect as: if the
+// folder itself is (or is inside) a git repo, that single repo is returned
+// (preserves the original one-repo-root behavior). Otherwise its immediate
+// subdirectories are scanned (one level deep) for a `.git` entry so a parent
+// folder containing several repos (e.g. a projects directory) yields a list
+// of candidates the renderer can offer as a checklist, instead of erroring.
+async fn repos_scan_local(Json(body): Json<ScanBody>) -> Response {
+    let raw = body.path.trim().to_string();
+    if raw.is_empty() {
+        return json_err("path is required", StatusCode::BAD_REQUEST);
+    }
+    let p = PathBuf::from(&raw);
+    if !p.is_dir() {
+        return json_err("path is not a directory", StatusCode::BAD_REQUEST);
+    }
+    if let Some(root) = git_toplevel(&p).await {
+        let remote = git_remote_url(&root).await;
+        let name = derive_full_name(remote.as_deref(), &root);
+        return json_ok(&serde_json::json!({
+            "ok": true,
+            "repos": [ScanCandidate { name, path: root.display().to_string() }],
+        }));
+    }
+    let mut candidates: Vec<ScanCandidate> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&p) {
+        for e in entries.flatten() {
+            let child = e.path();
+            if !child.is_dir() || !child.join(".git").exists() {
+                continue;
+            }
+            let remote = git_remote_url(&child).await;
+            let name = derive_full_name(remote.as_deref(), &child);
+            candidates.push(ScanCandidate { name, path: child.display().to_string() });
+        }
+    }
+    candidates.sort_by(|a, b| a.name.cmp(&b.name));
+    json_ok(&serde_json::json!({ "ok": true, "repos": candidates }))
+}
+
 // --- Ship changes: changelog preview + commit/push -------------------------
 
 // repos_changelog returns the repo's push state (remote, ahead/behind, unpushed
@@ -1498,6 +1550,7 @@ pub fn router(state: AppState) -> Router {
         .route("/__sidecar/github/repos", get(gh_repos))
         .route("/__sidecar/repos/local", get(repos_local))
         .route("/__sidecar/repos/add-local", post(repos_add_local))
+        .route("/__sidecar/repos/scan-local", post(repos_scan_local))
         .route("/__sidecar/repos/clone", post(repos_clone))
         .route("/__sidecar/repos/refresh", post(repos_refresh))
         .route("/__sidecar/repos/open", post(repos_open))
