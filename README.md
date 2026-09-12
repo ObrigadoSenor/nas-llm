@@ -203,12 +203,34 @@ overflow 8–16k). Each run's tool-call trace (step, tool, args, result preview,
 duration) is streamed live to a steps drawer above the answer and persisted
 (`agent_steps` table + `jobs.prompt_tokens`/`completion_tokens` for analytics).
 
-Configure the agent from the **Agent settings** entry at the bottom of the +
-menu: a system prompt (blank = the built-in date-injected nudge) and a tool
-allowlist (a small set suits a small model). Settings are global defaults stored
-in SQLite (`settings` table); per-conversation overrides are supported in the
-schema (`PATCH /api/conversations/:id` with `agentSystem`/`agentTools`) but not
-yet exposed in the UI.
+### System prompt
+
+The agent runs with a configurable system prompt, prepended as the first
+(`system`) message of every model round. Resolution order, most-specific first:
+
+1. **Per-conversation override** — `agent_system` on the conversation, set via
+   `PATCH /api/conversations/:id` with `agentSystem`/`agentTools`. Supported in
+   the schema but not yet exposed in the UI.
+2. **Global default** — the `agent_system` row in the SQLite `settings` table,
+   set from the UI or `PUT /api/agent/config`, read back with
+   `GET /api/agent/config` (or `sqlite3 /data/nas-llm.db
+   "SELECT value FROM settings WHERE key='agent_system'"`).
+3. **Built-in nudge** — when nothing is configured, `agentSystemNudge()` in
+   `backend/agent.go` supplies a lean default that injects today's date (so a
+   stale-cutoff model can reason about "today") and steers toward one or two
+   tool calls before answering.
+
+Configure it from the **Agent settings** entry at the bottom of the + menu
+(`/agent-settings` slash command): a system-prompt textarea (blank = the
+built-in nudge) and a tool allowlist (a small set suits a small model). When
+`memory_read` is in the allowlist, a short index of the user's memory-note keys
+is auto-appended to the prompt so the agent knows what it can recall.
+
+**Scope.** The configurable prompt applies to **Agent mode only**. Plain chat
+runs a bare streamed pass with no system message; Web search and Clarify use
+their own fixed, code-compiled nudges (`systemNudge()`, `clarifyNudgeText()`).
+A prompt saved in Agent settings never leaks into a normal chat turn. The
+resolution order and scope are pinned by `backend/agent_test.go`.
 
 ### Guardrails: `fetch_page` and the injection surface
 
