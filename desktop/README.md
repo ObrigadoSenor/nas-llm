@@ -121,6 +121,7 @@ desktop/
   Ollama shows status and Start/Stop. (macOS: app or Homebrew CLI; Windows
   lifecycle is a follow-up.)
 - **Rust is compile- and runtime-validated** (`cargo build` clean; the sidecar was probed headlessly — control plane, static assets, index injection, and the `/api/*` proxy to the NAS all work). A real `tauri dev` launch (which also opens the WebView window) is the remaining manual check; run `npm run desktop`.
-- **Bundling** (signed macOS/Windows installers, app icons) is deferred to
-  Phase 5 (`bundle.active: false` for now). Generate icons later with
-  `npm run tauri -- icon <source.png>`.
+- **macOS bundle built**: `npx tauri build` produces `nas-llm.app` + `nas-llm_0.1.0_aarch64.dmg` (4.9 MB) in `src-tauri/target/release/bundle/`. Unsigned (for local testing); sign + notarize by setting `APPLE_SIGNING_IDENTITY` / `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` secrets in CI.
+- **Windows builds via CI**: a Windows `.msi`/`.exe` can't be cross-compiled from macOS. `.github/workflows/desktop-release.yml` builds both platforms on a tag push (`v*`) or manual trigger — macOS produces `.dmg`+`.app`, Windows produces `.msi`+`.exe` — and uploads them as artifacts.
+- **Icons** are generated: `npx tauri icon src-tauri/icons/icon-source.png` produces `.icns`, `.ico`, and all PNG sizes in `src-tauri/icons/`. Regenerate with a new 1024×1024 source if you want a different look.
+- **Signing/notarization** is not yet wired (unsigned builds for local testing). To enable on macOS, set the `APPLE_*` secrets in the GitHub repo and uncomment the env block in `.github/workflows/desktop-release.yml`. Auto-update (Tauri updater) is a follow-up — needs a signing key pair (`npx tauri signer generate`).

@@ -296,8 +296,6 @@ function showApprovalDialog(kind, preview) {
       const kindVal = el("div", "ds-approval-kind", kind);
       card.appendChild(kindVal);
       const preWrap = el("div", "ds-approval-pre-wrap");
-      const pre = document.createElement("pre"); pre.className = "ds-approval-pre";
-      preWrap.appendChild(pre);
       card.appendChild(preWrap);
       const row = el("div", "ds-row ds-approval-row");
       const approve = el("button", "ds-btn ds-btn-approve", "Approve");
@@ -311,13 +309,60 @@ function showApprovalDialog(kind, preview) {
       approve.onclick = () => closeApproval(true);
       reject.onclick = () => closeApproval(false);
       overlay.addEventListener("click", (e) => { if (e.target === overlay) closeApproval(false); });
-      overlay._pre = pre;
-      overlay._kind = kindVal;
+    overlay._kind = kindVal;
+      overlay._content = preWrap; // the scrollable container
     }
     overlay._kind.textContent = kind;
-    overlay._pre.textContent = preview;
+    renderApprovalContent(overlay._content, kind, preview);
     overlay.classList.add("open");
   });
+}
+
+// renderApprovalContent fills the scrollable container with either a
+// line-by-line colored diff (for apply_patch) or a raw <pre> (for run_command
+// and anything that isn't a unified diff). The diff parser splits on newlines,
+// classifies each line, and builds a DOM fragment with red/green gutters.
+function renderApprovalContent(container, kind, preview) {
+  container.innerHTML = "";
+  if (kind === "apply_patch" && preview.includes("@@")) {
+    container.appendChild(renderDiff(preview));
+  } else {
+    const pre = document.createElement("pre");
+    pre.className = "ds-approval-pre";
+    pre.textContent = preview;
+    container.appendChild(pre);
+  }
+}
+
+// renderDiff parses a unified diff string and returns a DOM node with
+// file-header, hunk-header, added (+), removed (-), and context (space)
+// lines styled individually. Lines it can't classify are shown as plain text.
+function renderDiff(diff) {
+  const wrap = el("div", "ds-diff");
+  const lines = diff.split("\n");
+  for (const line of lines) {
+    if (!line) continue;
+    if (line.startsWith("--- ") || line.startsWith("+++ ")) {
+      const fh = el("div", "ds-diff-file", line);
+      wrap.appendChild(fh);
+    } else if (line.startsWith("@@")) {
+      const hh = el("div", "ds-diff-hunk", line);
+      wrap.appendChild(hh);
+    } else if (line.startsWith("+")) {
+      const ln = el("div", "ds-diff-add", line);
+      wrap.appendChild(ln);
+    } else if (line.startsWith("-")) {
+      const ln = el("div", "ds-diff-del", line);
+      wrap.appendChild(ln);
+    } else if (line.startsWith(" ")) {
+      const ln = el("div", "ds-diff-ctx", line);
+      wrap.appendChild(ln);
+    } else {
+      const ln = el("div", "ds-diff-plain", line);
+      wrap.appendChild(ln);
+    }
+  }
+  return wrap;
 }
 
 // --- Repos panel (GitHub + local clones) ---
@@ -397,7 +442,7 @@ function localRow(r) {
     try {
       await fetch("/api/conversations/" + encodeURIComponent(convId), {
         method: "PATCH", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ repoId, agentTools: "read_file,list_files,glob,grep,git_status,ask_user,get_time" })
+        body: JSON.stringify({ repoId, agentTools: "read_file,list_files,glob,grep,git_status,apply_patch,run_command,ask_user,get_time" })
       });
     } catch (e) { flashDsErr(String(e && e.message || e)); agent.disabled = false; agent.textContent = "New agent"; return; }
     // 3. Enable agent mode and navigate to the new conversation.
@@ -422,11 +467,17 @@ async function refreshGithub() {
     if (out) out.textContent = "Connected as " + (d.login || "?");
     if (connectWrap) connectWrap.classList.add("hidden");
     if (listWrap) listWrap.classList.remove("hidden");
+    body.innerHTML = "";
+    body.appendChild(el("div", "ds-note", "Loading repos…"));
     const rr = await sid("github/repos");
     body.innerHTML = "";
     if (rr.ok && Array.isArray(rr.data)) {
-      if (!rr.data.length) body.appendChild(el("div", "ds-note", "No repositories found."));
-      rr.data.forEach(r => body.appendChild(ghRow(r)));
+      ghReposCache = rr.data;
+      const si = $("dsGhSearch");
+      const q = si ? si.value.trim().toLowerCase() : "";
+      const filtered = !q ? rr.data : rr.data.filter(r => r.full_name.toLowerCase().includes(q));
+      if (!filtered.length) body.appendChild(el("div", "ds-note", "No matching repos."));
+      filtered.forEach(r => body.appendChild(ghRow(r)));
     } else {
       body.appendChild(el("div", "ds-note", "Could not load repos: " + ((rr.data && rr.data.error) || rr.status)));
     }
@@ -486,13 +537,32 @@ function buildReposOverlay() {
   const discBtn = el("button", "ds-btn ds-btn-ghost ds-btn-sm", "Disconnect");
   ghHead.appendChild(discBtn);
   listWrap.appendChild(ghHead);
+  // Search filter
+  const searchRow = el("div", "ds-row");
+  const searchInput = document.createElement("input");
+  searchInput.id = "dsGhSearch"; searchInput.type = "search"; searchInput.placeholder = "Filter repos…";
+  searchRow.appendChild(searchInput);
+  listWrap.appendChild(searchRow);
+  let ghReposCache = [];
+  searchInput.addEventListener("input", () => {
+    const q = searchInput.value.trim().toLowerCase();
+    const body = $("dsGhBody"); if (!body) return;
+    body.innerHTML = "";
+    const filtered = !q ? ghReposCache : ghReposCache.filter(r => r.full_name.toLowerCase().includes(q));
+    if (!filtered.length) { body.appendChild(el("div", "ds-note", "No matching repos.")); return; }
+    filtered.forEach(r => body.appendChild(ghRow(r)));
+  });
   const ghBody = el("div", null); ghBody.id = "dsGhBody";
   listWrap.appendChild(ghBody);
   card.appendChild(listWrap);
-  // Local clones
-  card.appendChild(el("div", "ds-label", "Local clones"));
+  // Local clones + working changes
+  const localHead = el("div", "ds-label", "Local clones");
+  const changesBtn = el("button", "ds-btn ds-btn-ghost ds-btn-sm", "Working changes");
+  localHead.appendChild(changesBtn);
+  card.appendChild(localHead);
   const localBody = el("div", null); localBody.id = "dsLocalBody";
   card.appendChild(localBody);
+  changesBtn.onclick = () => openWorkingChanges();
   // Error line
   const err = el("div", "ds-note hidden"); err.id = "dsReposErr";
   card.appendChild(err);
@@ -510,6 +580,73 @@ function buildReposOverlay() {
     else ghStatus.textContent = "Failed: " + (d.error || r.status);
   };
   discBtn.onclick = async () => { await sid("github/disconnect", { method: "POST" }); refreshGithub(); };
+}
+
+// openWorkingChanges shows a panel with the current `git diff` across all
+// local clones and a Revert button per repo (git checkout -- . + git clean -fd).
+// Lets the user review and undo agent-made edits without a terminal.
+function openWorkingChanges() {
+  let overlay = $("dsChangesOverlay");
+  if (!overlay) {
+    overlay = el("div", "ds-overlay");
+    overlay.id = "dsChangesOverlay";
+    overlay.setAttribute("role", "dialog");
+    overlay.setAttribute("aria-modal", "true");
+    overlay.setAttribute("aria-label", "Working changes");
+    const card = el("div", "ds-card ds-card-wide");
+    const head = el("div", "ds-head");
+    head.appendChild(el("h2", null, "Working changes"));
+    const x = el("button", "ds-x"); x.textContent = "×"; x.title = "Close"; x.setAttribute("aria-label", "Close");
+    x.onclick = () => overlay.classList.remove("open");
+    head.appendChild(x);
+    card.appendChild(head);
+    const note = el("div", "ds-note", "Showing uncommitted changes across all local clones. Revert discards all working-tree changes in a repo (git checkout -- . && git clean -fd).");
+    card.appendChild(note);
+    const body = el("div", null); body.id = "dsChangesBody";
+    card.appendChild(body);
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.classList.remove("open"); });
+  }
+  overlay.classList.add("open");
+  refreshWorkingChanges();
+}
+
+async function refreshWorkingChanges() {
+  const body = $("dsChangesBody"); if (!body) return;
+  body.innerHTML = "";
+  body.appendChild(el("div", "ds-note", "Loading…"));
+  const local = await sid("repos/local");
+  body.innerHTML = "";
+  if (!local.ok || !Array.isArray(local.data)) { body.appendChild(el("div", "ds-note", "Could not load local clones.")); return; }
+  if (!local.data.length) { body.appendChild(el("div", "ds-note", "No local clones yet.")); return; }
+  for (const r of local.data) {
+    const section = el("div", "ds-changes-section");
+    const head = el("div", "ds-changes-head");
+    head.appendChild(el("div", "ds-changes-name", r.name + " (" + r.branch + ")"));
+    const revertBtn = el("button", "ds-btn ds-btn-ghost ds-btn-sm", "Revert");
+    revertBtn.onclick = async () => {
+      revertBtn.disabled = true; revertBtn.textContent = "Reverting…";
+      const res = await sid("repos/revert", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: r.name }) });
+      revertBtn.disabled = false; revertBtn.textContent = "Revert";
+      const d = (res && res.data) || {};
+      if (!d.ok) flashDsErr(d.error || res.status);
+      refreshWorkingChanges();
+    };
+    head.appendChild(revertBtn);
+    section.appendChild(head);
+    const diffWrap = el("div", "ds-approval-pre-wrap");
+    section.appendChild(diffWrap);
+    body.appendChild(section);
+    // Fetch the diff for this repo.
+    const dr = await sid("repos/diff", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: r.name }) });
+    const dd = (dr && dr.data) || {};
+    if (dr.ok && dd.diff && dd.diff.trim()) {
+      renderApprovalContent(diffWrap, "apply_patch", dd.diff);
+    } else {
+      diffWrap.appendChild(el("div", "ds-note", "No uncommitted changes."));
+    }
+  }
 }
 
 function makeReposBtn() {

@@ -151,3 +151,41 @@
   font-size: 12px; line-height: 1.5; color: #c7ccd4;
   white-space: pre-wrap; word-break: break-word;
 }
+
+/* --- Diff renderer (Phase 5: colored line-by-line diff) --- */
+.ds-diff {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px; line-height: 1.6; color: #c7ccd4;
+}
+.ds-diff-file {
+  padding: 6px 12px; margin-top: 8px;
+  font-weight: 600; color: #8ab4f8; background: #1a1d24;
+  border-top: 1px solid #2a2e37; border-bottom: 1px solid #2a2e37;
+}
+.ds-diff-hunk {
+  padding: 4px 12px; color: #6b707a; background: #11141a;
+}
+.ds-diff-add {
+  padding: 1px 12px 1px 24px; background: #15281a; color: #60c890;
+  border-left: 3px solid #2d5a3a; margin-left: 0;
+}
+.ds-diff-del {
+  padding: 1px 12px 1px 24px; background: #2a1614; color: #e87060;
+  border-left: 3px solid #5a2a26; margin-left: 0;
+}
+.ds-diff-ctx {
+  padding: 1px 12px 1px 24px; color: #8b909a;
+}
+.ds-diff-plain {
+  padding: 1px 12px; color: #8b909a;
+}
+
+/* --- Working changes panel (Phase 5: review/undo) --- */
+.ds-changes-section {
+  margin-bottom: 18px; border: 1px solid #2a2e37; border-radius: 8px; overflow: hidden;
+}
+.ds-changes-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 12px; background: #1a1d24; border-bottom: 1px solid #2a2e37;
+}
+.ds-changes-name { flex: 1; font-size: 13px; font-weight: 600; color: #e6e6e6; }

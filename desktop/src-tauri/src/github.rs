@@ -429,6 +429,51 @@ async fn repos_open(State(st): State<AppState>, Json(body): Json<NameBody>) -> R
     json_ok(&serde_json::json!({ "ok": true, "name": name, "path": dest.display().to_string(), "branch": branch }))
 }
 
+// --- Review/undo endpoints (Phase 4: working changes) -----------------------
+
+// repos_diff returns `git diff` (unstaged + staged) for a local clone so the
+// user can review agent-made edits in the Working changes panel.
+async fn repos_diff(State(st): State<AppState>, Json(body): Json<NameBody>) -> Response {
+    let name = body.name.trim().to_string();
+    let dest = workspace_dir(&st.data_dir).join(safe_name(&name));
+    if !dest.is_dir() {
+        return json_err("not cloned locally", StatusCode::NOT_FOUND);
+    }
+    let out = tokio::process::Command::new("git")
+        .arg("-C").arg(&dest)
+        .arg("diff").arg("HEAD")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output().await;
+    match out {
+        Ok(o) => {
+            let diff = String::from_utf8_lossy(&o.stdout).to_string();
+            json_ok(&serde_json::json!({ "ok": true, "diff": diff }))
+        }
+        Err(e) => json_err(&format!("git diff failed: {e}"), StatusCode::BAD_GATEWAY),
+    }
+}
+
+// repos_revert discards all working-tree changes in a local clone
+// (git checkout -- . && git clean -fd) so the user can undo an approved
+// patch without a terminal. Returns the git status after reverting.
+async fn repos_revert(State(st): State<AppState>, Json(body): Json<NameBody>) -> Response {
+    let name = body.name.trim().to_string();
+    let dest = workspace_dir(&st.data_dir).join(safe_name(&name));
+    if !dest.is_dir() {
+        return json_err("not cloned locally", StatusCode::NOT_FOUND);
+    }
+    let _ = tokio::process::Command::new("git")
+        .arg("-C").arg(&dest)
+        .arg("checkout").arg("--").arg(".")
+        .output().await;
+    let _ = tokio::process::Command::new("git")
+        .arg("-C").arg(&dest)
+        .arg("clean").arg("-fd")
+        .output().await;
+    json_ok(&serde_json::json!({ "ok": true }))
+}
+
 // --- File-tool executor (Phase 3: codebase agent) -------------------------
 
 const MAX_OBS_CHARS: usize = 4000;
@@ -866,6 +911,8 @@ pub fn router(state: AppState) -> Router {
         .route("/__sidecar/repos/refresh", post(repos_refresh))
         .route("/__sidecar/repos/open", post(repos_open))
         .route("/__sidecar/repos/exec", post(repos_exec))
+        .route("/__sidecar/repos/diff", post(repos_diff))
+        .route("/__sidecar/repos/revert", post(repos_revert))
         .with_state(state)
 }
 
