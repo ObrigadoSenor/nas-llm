@@ -192,6 +192,10 @@ uncommitted work — because the chat gets its own directory. The `<id>` suffix 
 a slice of the conversation id, so two chats on one repo never collide. If
 provisioning fails you get the git error and a choice to continue on the repo
 folder's current branch instead — nothing is forced.
+- The chat is titled `owner/repo (agent <id>)` with that same `<id>`, so chats on
+one repo are tellable apart in the sidebar — and so the approval dialog and the
+completion notification, which both name the chat, actually identify it. Rename
+it whenever you like; a rename sticks and nothing overwrites it.
 - A small **status line** below the input field shows the repo, branch, and git
 state (`owner/repo · ⎇ branch · ●N dirty · ↑a ↓b`, plus `no remote` when there
 isn't one) while a repo-bound chat is open — polled every few seconds and
@@ -256,9 +260,10 @@ branch may need an install step. Remove ones you are done with via
 `git worktree remove <path>` (or `git worktree prune` after deleting by hand).
 
 **Chats created before this change** share one `agent/<slug-of-title>` branch,
-because the old naming derived from the chat title and every chat on a repo is
-titled `owner/repo (agent)`. They keep working as they always did; re-point any
-of them with the ⎇ chip to give it a branch of its own.
+because the old naming derived from the chat title and every chat on a repo was
+titled exactly `owner/repo (agent)`. They keep working as they always did;
+re-point any with the ⎇ chip to give it a branch of its own, and rename them if
+you want them tellable apart.
 
 ### Notifications
 

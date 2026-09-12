@@ -1003,23 +1003,33 @@ async function createRepoChat(r) {
     return;
   }
 
-  // 5. Repo confirmed — NOW create the conversation.
-  const title = fullName + " (agent)";
+  // 5. Repo confirmed — NOW create the conversation. The id only exists after
+  //    this call, and the id is what makes the chat distinguishable, so the
+  //    real title is applied in the PATCH below rather than here.
   const model = localStorage.getItem("nas-llm-model") || "";
-  const cr = await fetch("/api/conversations", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title, model }) });
+  const cr = await fetch("/api/conversations", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: fullName + " (agent)", model }) });
   const cj = await cr.json().catch(() => ({}));
   const convId = cj && cj.id;
   if (!convId) { flashDsErr("Could not create conversation."); return; }
   // Workspace folder so chats group in the sidebar.
   const folderId = await ensureWorkspaceFolder(fullName);
 
+  // Every chat on a repo used to be titled exactly "owner/repo (agent)", so a
+  // sidebar full of them was unreadable — and now that the approval dialog and
+  // the completion notification both identify a chat by its title, identical
+  // titles actively cost you ("which chat wants to run this command?"). Tag
+  // each chat with a short slice of its conversation id. The branch below uses
+  // the same slice, so a chat, its title, and its worktree all carry one handle
+  // you can match by eye.
+  const shortId = String(convId).slice(0, 7);
+  const title = fullName + " (agent " + shortId + ")";
+
   // Give this chat its own branch in its own git worktree.
   //
-  // Two things matter here. First, the name must be unique per chat: every chat
-  // on a repo is created with the SAME title ("owner/repo (agent)"), so a slug
-  // derived from the title alone put every chat on ONE branch — "a branch per
-  // chat" was really a branch per repo. A short slice of the conversation id
-  // fixes that while keeping the name readable.
+  // Two things matter here. First, the name must be unique per chat. Branch
+  // names used to come from a slug of the chat title, and since every chat on a
+  // repo shared one title, every chat shared ONE branch — "a branch per chat"
+  // was really a branch per repo. The conversation-id slice fixes that.
   //
   // Second, we provision a worktree rather than `git switch`-ing the repo
   // folder. Switching moved the branch of the checkout the user has open in
@@ -1027,7 +1037,7 @@ async function createRepoChat(r) {
   // branch. A worktree is a separate directory, so the repo folder is left
   // exactly as it was and two chats can hold two branches at once.
   const shortName = (fullName.split("/").pop() || fullName);
-  const branchName = "agent/" + slugifyTitle(shortName) + "-" + String(convId).slice(0, 7);
+  const branchName = "agent/" + slugifyTitle(shortName) + "-" + shortId;
   let branch = "";
   let branchErr = "";
   try {
@@ -1055,9 +1065,11 @@ async function createRepoChat(r) {
     } catch {}
   }
 
-  // PATCH repoId + agentTools (file + git) + folder + repoBranch in one go.
+  // PATCH title + repoId + agentTools (file + git) + folder + repoBranch in one
+  // go — no extra round trip for the rename. A title set this way is marked
+  // custom server-side, which is correct: it is deliberate, not auto-derived.
   const agentTools = "read_file,list_files,glob,grep,git_status,apply_patch,run_command,ask_user,get_time,git_commit,git_push,create_pr";
-  const patchBody = { repoId, agentTools };
+  const patchBody = { title, repoId, agentTools };
   if (folderId) patchBody.folderId = folderId;
   if (branch) patchBody.repoBranch = branch;
   try {
