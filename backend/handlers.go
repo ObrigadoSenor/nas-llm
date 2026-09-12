@@ -303,16 +303,17 @@ func (s *server) handlePatchConversation(w http.ResponseWriter, r *http.Request)
 		AgentSystem *string `json:"agentSystem"`
 		AgentTools  *string `json:"agentTools"`
 		RepoID      *string `json:"repoId"`
+		RepoBranch  *string `json:"repoBranch"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, "invalid request", http.StatusBadRequest)
 		return
 	}
-	if body.Title == nil && body.FolderID == nil && body.Model == nil && body.AgentSystem == nil && body.AgentTools == nil && body.RepoID == nil {
+	if body.Title == nil && body.FolderID == nil && body.Model == nil && body.AgentSystem == nil && body.AgentTools == nil && body.RepoID == nil && body.RepoBranch == nil {
 		jsonError(w, "nothing to update", http.StatusBadRequest)
 		return
 	}
-	c, err := s.store.patchConversation(emailFrom(r), r.PathValue("id"), body.Title, body.FolderID, body.Model, body.AgentSystem, body.AgentTools, body.RepoID)
+	c, err := s.store.patchConversation(emailFrom(r), r.PathValue("id"), body.Title, body.FolderID, body.Model, body.AgentSystem, body.AgentTools, body.RepoID, body.RepoBranch)
 	if err != nil {
 		log.Printf("patchConversation: %v", err)
 		jsonError(w, "server error", http.StatusInternalServerError)
@@ -706,11 +707,11 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 				flushTool(ev.text)
 			case "thought":
 				flushThought(ev.text)
-		case "modelCall":
+			case "modelCall":
 				flushModelCall(ev.text)
-		case "toolExec":
+			case "toolExec":
 				flushToolExec(ev.text)
-		case "clear":
+			case "clear":
 				flushClear()
 			case "done":
 				writeSSE("event: done\ndata: \n\n")
@@ -739,11 +740,11 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 						flushTool(ev.text)
 					case "thought":
 						flushThought(ev.text)
-				case "modelCall":
-					flushModelCall(ev.text)
-				case "toolExec":
-					flushToolExec(ev.text)
-				case "clear":
+					case "modelCall":
+						flushModelCall(ev.text)
+					case "toolExec":
+						flushToolExec(ev.text)
+					case "clear":
 						flushClear()
 					case "done":
 						writeSSE("event: done\ndata: \n\n")
@@ -890,7 +891,7 @@ func (s *server) handleToolResponse(w http.ResponseWriter, r *http.Request) {
 	email := emailFrom(r)
 	var body struct {
 		JobID       string `json:"jobId"`
-		Observation  string `json:"observation"`
+		Observation string `json:"observation"`
 		Preview     string `json:"preview"`
 		IsError     bool   `json:"isError"`
 		Error       string `json:"error,omitempty"`

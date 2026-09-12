@@ -266,9 +266,9 @@ func countRecentClarify(msgs []Message) int {
 // normal answer stays prose. Gated by cfg.clarifyProseDetect.
 
 const (
-	clarifyProseMaxChars     = 600 // the whole turn must be this short
-	clarifyProseQuestionMax  = 200 // the question sentence itself
-	clarifyProseOptionMax    = 60  // an option label must be this short
+	clarifyProseMaxChars    = 600 // the whole turn must be this short
+	clarifyProseQuestionMax = 200 // the question sentence itself
+	clarifyProseOptionMax   = 60  // an option label must be this short
 )
 
 var (
