@@ -1,0 +1,71 @@
+/* Desktop bridge styles — served at /__sidecar/desktop.css and injected into
+   the app page. Minimal dark UI to match the app; intentionally self-contained
+   (no dependency on the app's CSS variables). */
+
+.ds-gear {
+  background: transparent;
+  border: 1px solid #2a2e37;
+  color: #c7ccd4;
+  border-radius: 8px;
+  width: 30px; height: 30px;
+  margin-right: 8px;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+.ds-gear:hover { background: #1b1f27; }
+
+.ds-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,.55);
+  display: none;
+  z-index: 10000;
+  align-items: center; justify-content: center;
+}
+.ds-overlay.open { display: flex; }
+
+.ds-card {
+  width: 540px; max-width: 92vw; max-height: 88vh; overflow: auto;
+  background: #15171c; color: #e6e6e6;
+  border: 1px solid #2a2e37; border-radius: 12px;
+  padding: 20px;
+  box-shadow: 0 10px 40px rgba(0,0,0,.5);
+}
+
+.ds-head { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+.ds-head h2 { margin: 0; font-size: 16px; font-weight: 600; flex: 1; }
+.ds-x {
+  background: none; border: 0; color: #9aa0aa;
+  font-size: 20px; line-height: 1; cursor: pointer;
+}
+.ds-x:hover { color: #e6e6e6; }
+
+.ds-label {
+  font-size: 11px; color: #9aa0aa;
+  margin: 16px 0 6px;
+  text-transform: uppercase; letter-spacing: .04em;
+}
+
+.ds-row { display: flex; gap: 8px; }
+.ds-row input {
+  flex: 1; min-width: 0;
+  background: #0e1014; border: 1px solid #2a2e37; color: #e6e6e6;
+  border-radius: 8px; padding: 8px 10px; font-size: 13px;
+}
+.ds-row input:focus { outline: none; border-color: #3a4150; }
+
+.ds-btn {
+  background: #2f6fed; color: #fff; border: 0; border-radius: 8px;
+  padding: 8px 12px; font-size: 13px; cursor: pointer; white-space: nowrap;
+}
+.ds-btn:disabled { opacity: .5; cursor: default; }
+.ds-btn-ghost { background: transparent; color: #c7ccd4; border: 1px solid #2a2e37; }
+
+.ds-note { font-size: 12px; color: #8b909a; margin-top: 8px; min-height: 16px; }
+
+.ds-login-hint {
+  margin-top: 14px; font-size: 12px; color: #8b909a;
+  background: #11141a; border: 1px dashed #2a2e37; border-radius: 8px;
+  padding: 8px 10px;
+}
+.ds-login-hint strong { color: #c7ccd4; }

@@ -1,0 +1,6 @@
+{
+  "identifier": "main",
+  "description": "Capabilities for the main window (created at runtime). The renderer talks to the local sidecar over same-origin HTTP; only core defaults are needed.",
+  "windows": ["main"],
+  "permissions": ["core:default", "core:event:default"]
+}
