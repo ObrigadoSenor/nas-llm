@@ -177,14 +177,14 @@ async fn index_html(State(st): State<AppState>) -> Response {
             if !html.contains("/__sidecar/desktop.css") {
                 html = html.replacen(
                     "</head>",
-                    "<link rel=\"stylesheet\" href=\"/__sidecar/desktop.css?v=2\">\n</head>",
+                    "<link rel=\"stylesheet\" href=\"/__sidecar/desktop.css?v=3\">\n</head>",
                     1,
                 );
             }
             if !html.contains("/__sidecar/desktop.js") {
                 html = html.replacen(
                     "</body>",
-                    "<script type=\"module\" src=\"/__sidecar/desktop.js?v=2\"></script>\n</body>",
+                    "<script type=\"module\" src=\"/__sidecar/desktop.js?v=3\"></script>\n</body>",
                     1,
                 );
             }
@@ -508,31 +508,53 @@ struct VerifyBody {
 struct VerifyResponse {
     ok: bool,
     email: Option<String>,
+    backend_url: Option<String>,
     error: Option<String>,
 }
 
-// The user pastes the magic-link URL from their email. The sidecar fetches it
-// (SSRF-guarded: the host must match the configured backend), captures the
-// session cookie into the jar, then confirms via /api/auth/me.
+fn verify_err(msg: &str) -> Response {
+    json_ok(&VerifyResponse {
+        ok: false,
+        email: None,
+        backend_url: None,
+        error: Some(msg.into()),
+    })
+}
+
+// The user pastes the magic-link URL from their email. The link is
+// self-describing — its origin IS the backend to talk to — so we derive the
+// backend from it instead of requiring a separately-configured host to match
+// (that was too rigid: it broke legitimate setups where the NAS's
+// APP_BASE_URL host differs from the desktop's configured backend, e.g. a LAN
+// IP vs the public domain). We only guard that it's an http(s) magic-link-
+// shaped URL (path starts with /api/auth/verify), fetch it with redirects off
+// (the backend 303s to / after Set-Cookie; we capture the cookie from the 303),
+// set the derived origin as the backend, capture the session cookie into the
+// jar, and confirm via /api/auth/me on that same origin.
 async fn sidecar_verify(State(st): State<AppState>, Json(body): Json<VerifyBody>) -> Response {
     let url = body.url.trim().to_string();
-    let backend = st.backend().await;
-    if !same_host(&url, &backend) {
-        return json_ok(&VerifyResponse {
-            ok: false,
-            email: None,
-            error: Some("link host does not match the configured backend".into()),
-        });
+    let parsed = match url::Url::parse(&url) {
+        Ok(u) => u,
+        Err(_) => return verify_err("invalid URL"),
+    };
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return verify_err("link must be an http(s) URL");
     }
+    if !parsed.path().starts_with("/api/auth/verify") {
+        return verify_err("not a magic-link URL — expected /api/auth/verify?token=…");
+    }
+    let host = match parsed.host_str() {
+        Some(h) if !h.is_empty() => h,
+        _ => return verify_err("link has no host"),
+    };
+    let origin = match parsed.port() {
+        Some(p) => format!("{}://{}:{}", parsed.scheme(), host, p),
+        None => format!("{}://{}", parsed.scheme(), host),
+    };
+
     let resp = match st.client.get(&url).timeout(std::time::Duration::from_secs(8)).send().await {
         Ok(r) => r,
-        Err(e) => {
-            return json_ok(&VerifyResponse {
-                ok: false,
-                email: None,
-                error: Some(e.to_string()),
-            })
-        }
+        Err(e) => return verify_err(&e.to_string()),
     };
     let mut captured: Option<String> = None;
     for v in resp.headers().get_all(reqwest::header::SET_COOKIE).iter() {
@@ -543,9 +565,15 @@ async fn sidecar_verify(State(st): State<AppState>, Json(body): Json<VerifyBody>
         }
     }
     let to_store = captured.and_then(|v| if v.is_empty() { None } else { Some(v) });
+    // The cookie is scoped to the link's origin, so all subsequent /api/* calls
+    // must go there too. Persist it so a relaunch keeps talking to the same host.
+    {
+        *st.backend_url.write().await = origin.clone();
+    }
+    persist_backend(&st.data_dir, &origin);
     st.set_cookie(to_store.clone()).await;
     let email = if to_store.is_some() {
-        probe_email(&st.client, &backend, to_store.as_deref()).await
+        probe_email(&st.client, &origin, to_store.as_deref()).await
     } else {
         None
     };
@@ -553,6 +581,7 @@ async fn sidecar_verify(State(st): State<AppState>, Json(body): Json<VerifyBody>
     json_ok(&VerifyResponse {
         ok,
         email,
+        backend_url: Some(origin),
         error: if ok { None } else { Some("no session cookie in the response".into()) },
     })
 }
@@ -590,14 +619,6 @@ async fn probe_email(
     }
     let v: serde_json::Value = resp.json().await.ok()?;
     v.get("email")?.as_str().map(|s| s.to_string())
-}
-
-fn same_host(a: &str, b: &str) -> bool {
-    match (url::Url::parse(a), url::Url::parse(b)) {
-        (Ok(ua), Ok(ub)) => ua.host_str() == ub.host_str()
-            && ua.port_or_known_default() == ub.port_or_known_default(),
-        _ => false,
-    }
 }
 
 fn json_ok<T: Serialize>(v: &T) -> Response {

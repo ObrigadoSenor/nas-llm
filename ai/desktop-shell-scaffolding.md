@@ -4,9 +4,14 @@ Source plan: `7cdbb501-88f9-4537-aab3-ae0c73186050` ("Desktop app — Copilot-st
 
 Goal: a Tauri 2 shell that embeds the existing `www/` chat UI and bridges it to the NAS backend (`chat.selected.systems`) via a local Rust sidecar — "the web app as a desktop app," validating WebView + session + `/api/*` proxying before anything new is built.
 
-## Status: implemented; `cargo build` clean; runtime verified
+## Status: merged to main (PR #14); release binary built; login surface verified
 
-## Runtime verification
+## Merge & final build
+- PR #14 (`feat/desktop-tauri-shell` → `main`) merged as `81a1d3b` (merge commit, branch deleted).
+- Release binary: `desktop/src-tauri/target/release/nas-llm-desktop` (15 MB, optimized, `cargo build --release`).
+- Re-verified the login surface on the release binary: sidecar up on 17543 (`authed:false`); login page injects `?v=2` assets; `desktop.js` contains the paste-link field (`dsLoginBox`/`dsLoginUrl`); `/api/auth/request` via the proxy returns 400 on an invalid email (proxy reaches the NAS auth endpoint); `/__sidecar/verify` SSRF-guards a mismatched host. App left running for the manual GUI paste-click.
+
+## Runtime verification (initial)
 Launched the built binary headlessly and probed the sidecar HTTP surface — all green, no panics:
 - Sidecar starts: `nas-llm sidecar listening at http://127.0.0.1:17543`.
 - `/__sidecar/health` → `{"ok":true}`; `/__sidecar/state` → `{backend_url, origin, authed:false, email:null}`.

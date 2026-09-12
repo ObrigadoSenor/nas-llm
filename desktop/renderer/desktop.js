@@ -113,7 +113,7 @@ function buildOverlay() {
     const r = await sid("verify", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url }) });
     signInBtn.disabled = false;
     const d = r.data || {};
-    if (d.ok) { authOut.textContent = "Signed in as " + (d.email || "?") + ". Reloading…"; setTimeout(() => location.reload(), 600); }
+  if (d.ok) { authOut.textContent = "Signed in as " + (d.email || "?") + (d.backend_url ? " (backend " + d.backend_url + ")" : "") + ". Reloading…"; setTimeout(() => location.reload(), 600); }
     else authOut.textContent = "Failed: " + (d.error || r.status);
   };
 
@@ -198,7 +198,7 @@ function hookLogin() {
           const r = await sid("verify", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url }) });
           signInBtn.disabled = false;
           const d = r.data || {};
-          if (d.ok) { out.textContent = "Signed in as " + (d.email || "?") + ". Reloading…"; setTimeout(() => location.reload(), 600); }
+          if (d.ok) { out.textContent = "Signed in as " + (d.email || "?") + (d.backend_url ? " (backend " + d.backend_url + ")" : "") + ". Reloading…"; setTimeout(() => location.reload(), 600); }
           else out.textContent = "Failed: " + (d.error || r.status);
         };
       }
