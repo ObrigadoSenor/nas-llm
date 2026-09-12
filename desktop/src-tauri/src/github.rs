@@ -385,11 +385,19 @@ async fn repos_clone(State(st): State<AppState>, Json(body): Json<CloneBody>) ->
         return json_err(&e, StatusCode::BAD_GATEWAY);
     }
     let branch = git_branch(&dest).await;
+    let head = git_head(&dest).await;
+    let tree = top_level_tree(&dest);
+    // Push repo context to the backend so the agent loop can inject it into
+    // the system prompt for repo-bound conversations. Best-effort: a failure
+    // here (e.g. not signed in yet) doesn't fail the clone.
+    let _ = push_repo_context(&st, &full_name, &dest, &branch, &head, &tree).await;
     json_ok(&serde_json::json!({
         "ok": true,
         "name": full_name,
         "path": dest.display().to_string(),
         "branch": branch,
+        "head": head,
+        "tree": tree,
     }))
 }
 
@@ -421,6 +429,312 @@ async fn repos_open(State(st): State<AppState>, Json(body): Json<NameBody>) -> R
     json_ok(&serde_json::json!({ "ok": true, "name": name, "path": dest.display().to_string(), "branch": branch }))
 }
 
+// --- File-tool executor (Phase 3: codebase agent) -------------------------
+
+const MAX_OBS_CHARS: usize = 4000;
+
+#[derive(Deserialize)]
+struct ExecBody {
+    repo: String,
+    tool: String,
+    args: String,
+}
+
+#[derive(Serialize)]
+struct ExecResult {
+    observation: String,
+    preview: String,
+    is_error: bool,
+}
+
+// repos_exec receives a file-tool call from the renderer (which got it from the
+// toolExec SSE event), runs the tool against the local clone, and returns the
+// observation. All tools are scoped to the repo root with path-traversal guards.
+async fn repos_exec(State(st): State<AppState>, Json(body): Json<ExecBody>) -> Response {
+    let repo_name = body.repo.trim().to_string();
+    let dest = workspace_dir(&st.data_dir).join(safe_name(&repo_name));
+    if !dest.is_dir() {
+        return json_ok(&ExecResult {
+            observation: format!("Repository {repo_name} is not cloned locally."),
+            preview: "repo not found".into(),
+            is_error: true,
+        });
+    }
+    let root = match std::fs::canonicalize(&dest) {
+        Ok(r) => r,
+        Err(e) => return json_ok(&ExecResult { observation: format!("repo dir: {e}"), preview: "error".into(), is_error: true }),
+    };
+    let result = match body.tool.as_str() {
+        "read_file" => exec_read_file(&root, &body.args),
+        "list_files" => exec_list_files(&root, &body.args),
+        "glob" => exec_glob(&root, &body.args),
+        "grep" => exec_grep(&root, &body.args),
+        "git_status" => exec_git_status(&root).await,
+        other => ExecResult { observation: format!("Unknown tool: {other}"), preview: "unknown tool".into(), is_error: true },
+    };
+    json_ok(&result)
+}
+
+// safe_path resolves a repo-relative path and guards against traversal outside
+// the repo root. Returns the canonicalized absolute path, or an error.
+fn safe_path(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    let cleaned = rel.trim_start_matches(['/', '.']);
+    let candidate = root.join(cleaned);
+    let canon = std::fs::canonicalize(&candidate).map_err(|e| format!("path not found: {e}"))?;
+    if !canon.starts_with(root) {
+        return Err("path is outside the repository root".into());
+    }
+    Ok(canon)
+}
+
+fn cap(s: &str) -> String {
+    if s.len() <= MAX_OBS_CHARS {
+        s.to_string()
+    } else {
+        format!("{}\n...[truncated, {} more chars]", &s[..MAX_OBS_CHARS], s.len() - MAX_OBS_CHARS)
+    }
+}
+
+fn exec_read_file(root: &Path, args: &str) -> ExecResult {
+    let p = match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(v) => v.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string(),
+        Err(_) => return ExecResult { observation: "Invalid args for read_file.".into(), preview: "bad args".into(), is_error: true },
+    };
+    if p.is_empty() {
+        return ExecResult { observation: "No path provided.".into(), preview: "no path".into(), is_error: true };
+    }
+    let path = match safe_path(root, &p) {
+        Ok(p) => p,
+        Err(e) => return ExecResult { observation: e.clone(), preview: e, is_error: true },
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(content) => ExecResult { observation: cap(&content), preview: format!("read {} ({} bytes)", p, content.len()), is_error: false },
+        Err(e) => ExecResult { observation: format!("Could not read {p}: {e}"), preview: format!("read error: {p}"), is_error: true },
+    }
+}
+
+fn exec_list_files(root: &Path, args: &str) -> ExecResult {
+    let subdir = serde_json::from_str::<serde_json::Value>(args)
+        .ok()
+        .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(String::from))
+        .unwrap_or_default();
+    let dir = if subdir.trim().is_empty() || subdir == "." {
+        root.to_path_buf()
+    } else {
+        match safe_path(root, &subdir) {
+            Ok(p) => p,
+            Err(e) => return ExecResult { observation: e.clone(), preview: e, is_error: true },
+        }
+    };
+    if !dir.is_dir() {
+        return ExecResult { observation: format!("{subdir} is not a directory."), preview: "not a dir".into(), is_error: true };
+    }
+    let mut entries: Vec<String> = std::fs::read_dir(&dir)
+        .map(|rd| rd.filter_map(|e| e.ok())
+            .map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) { format!("{name}/") } else { name }
+            })
+            .collect())
+        .unwrap_or_default();
+    entries.sort();
+    let listing = entries.join("\n");
+    ExecResult { observation: cap(&listing), preview: format!("{} entries", entries.len()), is_error: false }
+}
+
+fn exec_glob(root: &Path, args: &str) -> ExecResult {
+    let pattern = match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(v) => v.get("pattern").and_then(|p| p.as_str()).unwrap_or("").to_string(),
+        Err(_) => return ExecResult { observation: "Invalid args for glob.".into(), preview: "bad args".into(), is_error: true },
+    };
+    if pattern.is_empty() {
+        return ExecResult { observation: "No pattern provided.".into(), preview: "no pattern".into(), is_error: true };
+    }
+    let matches = glob_walk(root, root, &pattern, 0, 1000);
+    let result = matches.join("\n");
+    ExecResult { observation: cap(&result), preview: format!("{} matches", matches.len()), is_error: false }
+}
+
+// glob_walk recursively walks the tree and collects paths matching a simple
+// glob pattern (supports ** and * wildcards). Capped at max_results.
+fn glob_walk(root: &Path, dir: &Path, pattern: &str, depth: usize, max: usize) -> Vec<String> {
+    if depth > 15 {
+        return vec![];
+    }
+    let mut out = Vec::new();
+    let skip = |name: &str| name.starts_with('.') || name == "node_modules" || name == "target" || name == ".git";
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if out.len() >= max {
+                break;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            if skip(&name) {
+                continue;
+            }
+            let path = e.path();
+            let rel = path.strip_prefix(root).unwrap_or(&path).display().to_string();
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                out.extend(glob_walk(root, &path, pattern, depth + 1, max - out.len()));
+            } else if glob_match(&pattern, &rel) {
+                out.push(rel);
+            }
+        }
+    }
+    out
+}
+
+// glob_match checks if a path matches a simple glob pattern with ** and *.
+fn glob_match(pattern: &str, path: &str) -> bool {
+    glob_match_segments(pattern.split('/').collect::<Vec<_>>().as_slice(), path.split('/').collect::<Vec<_>>().as_slice())
+}
+
+fn glob_match_segments(pat: &[&str], path: &[&str]) -> bool {
+    if pat.is_empty() {
+        return path.is_empty();
+    }
+    if pat[0] == "**" {
+        if pat.len() == 1 {
+            return true; // ** matches everything (including dirs)
+        }
+        for i in 0..=path.len() {
+            if glob_match_segments(&pat[1..], &path[i..]) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if path.is_empty() {
+        return false;
+    }
+    if pat[0] == "*" || pat[0] == path[0] {
+        glob_match_segments(&pat[1..], &path[1..])
+    } else {
+        false
+    }
+}
+
+fn exec_grep(root: &Path, args: &str) -> ExecResult {
+    let v = match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(v) => v,
+        Err(_) => return ExecResult { observation: "Invalid args for grep.".into(), preview: "bad args".into(), is_error: true },
+    };
+    let pattern = v.get("pattern").and_then(|p| p.as_str()).unwrap_or("").to_string();
+    if pattern.is_empty() {
+        return ExecResult { observation: "No pattern provided.".into(), preview: "no pattern".into(), is_error: true };
+    }
+    let subdir = v.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
+    let search_root = if subdir.is_empty() { root.to_path_buf() } else { match safe_path(root, &subdir) { Ok(p) => p, Err(e) => return ExecResult { observation: e.clone(), preview: e, is_error: true } } };
+    let mut matches = Vec::new();
+    grep_walk(root, &search_root, &pattern, &mut matches, 0, 200);
+    let result = matches.join("\n");
+    ExecResult { observation: cap(&result), preview: format!("{} matches", matches.len()), is_error: false }
+}
+
+fn grep_walk(root: &Path, dir: &Path, pattern: &str, out: &mut Vec<String>, depth: usize, max: usize) {
+    if depth > 15 || out.len() >= max {
+        return;
+    }
+    let skip = |name: &str| name.starts_with('.') || name == "node_modules" || name == "target" || name == ".git";
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if out.len() >= max {
+                break;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            if skip(&name) {
+                continue;
+            }
+            let path = e.path();
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                grep_walk(root, &path, pattern, out, depth + 1, max);
+            } else if let Ok(content) = std::fs::read_to_string(&path) {
+                let rel = path.strip_prefix(root).unwrap_or(&path).display().to_string();
+                for (i, line) in content.lines().enumerate() {
+                    if line.contains(pattern) {
+                        let snippet = if line.len() > 200 { format!("{}...", &line[..200]) } else { line.to_string() };
+                        out.push(format!("{rel}:{}: {snippet}", i + 1));
+                        if out.len() >= max {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn exec_git_status(root: &Path) -> ExecResult {
+    // Note: this is async to match the signature, but git status is sync.
+    let out = tokio::process::Command::new("git")
+        .arg("-C").arg(root)
+        .arg("status").arg("--porcelain")
+        .output().await;
+    match out {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout).to_string();
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                ExecResult { observation: "Working tree clean.".into(), preview: "clean".into(), is_error: false }
+            } else {
+                ExecResult { observation: cap(trimmed), preview: format!("{} changes", trimmed.lines().count()), is_error: false }
+            }
+        }
+        _ => ExecResult { observation: "git status failed.".into(), preview: "git error".into(), is_error: true },
+    }
+}
+
+// --- Repo context helpers ---
+
+async fn git_head(path: &Path) -> String {
+    let out = tokio::process::Command::new("git")
+        .arg("-C").arg(path)
+        .arg("rev-parse").arg("HEAD")
+        .output().await;
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => String::new(),
+    }
+}
+
+fn top_level_tree(root: &Path) -> Vec<String> {
+    std::fs::read_dir(root)
+        .map(|rd| rd.filter_map(|e| e.ok())
+            .map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') { return None; }
+                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) { Some(format!("{name}/")) } else { Some(name) }
+            })
+            .flatten()
+            .collect())
+        .unwrap_or_default()
+}
+
+// push_repo_context POSTs the repo context to the backend's /api/repos so the
+// agent loop can inject it into the system prompt. Uses the session cookie from
+// the sidecar's jar. Best-effort: failures are logged but not surfaced.
+async fn push_repo_context(st: &AppState, full_name: &str, dest: &Path, branch: &str, head: &str, tree: &[String]) -> Result<(), String> {
+    let backend = st.backend().await;
+    let cookie = st.cookie_value().await;
+    let url = format!("{}/api/repos", backend.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "fullName": full_name,
+        "localPath": dest.display().to_string(),
+        "branch": branch,
+        "head": head,
+        "tree": tree,
+    });
+    let mut req = st.client.post(&url).json(&body).timeout(std::time::Duration::from_secs(8));
+    if let Some(cv) = cookie {
+        req = req.header(reqwest::header::COOKIE, format!("{}={}", crate::sidecar::SESSION_COOKIE, cv));
+    }
+    match req.send().await {
+        Ok(r) if r.status().is_success() => Ok(()),
+        Ok(r) => Err(format!("backend returned {}", r.status())),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 // --- router ----------------------------------------------------------------
 
 pub fn router(state: AppState) -> Router {
@@ -433,6 +747,7 @@ pub fn router(state: AppState) -> Router {
         .route("/__sidecar/repos/clone", post(repos_clone))
         .route("/__sidecar/repos/refresh", post(repos_refresh))
         .route("/__sidecar/repos/open", post(repos_open))
+        .route("/__sidecar/repos/exec", post(repos_exec))
         .with_state(state)
 }
 

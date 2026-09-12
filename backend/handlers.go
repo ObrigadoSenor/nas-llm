@@ -302,16 +302,17 @@ func (s *server) handlePatchConversation(w http.ResponseWriter, r *http.Request)
 		Model       *string `json:"model"`
 		AgentSystem *string `json:"agentSystem"`
 		AgentTools  *string `json:"agentTools"`
+		RepoID      *string `json:"repoId"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, "invalid request", http.StatusBadRequest)
 		return
 	}
-	if body.Title == nil && body.FolderID == nil && body.Model == nil && body.AgentSystem == nil && body.AgentTools == nil {
+	if body.Title == nil && body.FolderID == nil && body.Model == nil && body.AgentSystem == nil && body.AgentTools == nil && body.RepoID == nil {
 		jsonError(w, "nothing to update", http.StatusBadRequest)
 		return
 	}
-	c, err := s.store.patchConversation(emailFrom(r), r.PathValue("id"), body.Title, body.FolderID, body.Model, body.AgentSystem, body.AgentTools)
+	c, err := s.store.patchConversation(emailFrom(r), r.PathValue("id"), body.Title, body.FolderID, body.Model, body.AgentSystem, body.AgentTools, body.RepoID)
 	if err != nil {
 		log.Printf("patchConversation: %v", err)
 		jsonError(w, "server error", http.StatusInternalServerError)
@@ -617,6 +618,12 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		mcdata, _ := json.Marshal(mc)
 		writeSSE("event: modelCall\ndata: " + string(mcdata) + "\n\n")
 	}
+	// Replay a pending file-tool exec request so a browser that attaches after
+	// the toolExec cue fired still runs the tool via the sidecar and POSTs back.
+	if te := j.toolExecSnapshot(); te != nil {
+		tedata, _ := json.Marshal(te)
+		writeSSE("event: toolExec\ndata: " + string(tedata) + "\n\n")
+	}
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -664,6 +671,9 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	flushModelCall := func(text string) {
 		writeSSE("event: modelCall\ndata: " + text + "\n\n")
 	}
+	flushToolExec := func(text string) {
+		writeSSE("event: toolExec\ndata: " + text + "\n\n")
+	}
 	flushError := func(text string) {
 		d, _ := json.Marshal(text)
 		writeSSE("event: joberror\ndata: " + string(d) + "\n\n")
@@ -696,9 +706,11 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 				flushTool(ev.text)
 			case "thought":
 				flushThought(ev.text)
-			case "modelCall":
+		case "modelCall":
 				flushModelCall(ev.text)
-			case "clear":
+		case "toolExec":
+				flushToolExec(ev.text)
+		case "clear":
 				flushClear()
 			case "done":
 				writeSSE("event: done\ndata: \n\n")
@@ -727,9 +739,11 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 						flushTool(ev.text)
 					case "thought":
 						flushThought(ev.text)
-					case "modelCall":
-						flushModelCall(ev.text)
-					case "clear":
+				case "modelCall":
+					flushModelCall(ev.text)
+				case "toolExec":
+					flushToolExec(ev.text)
+				case "clear":
 						flushClear()
 					case "done":
 						writeSSE("event: done\ndata: \n\n")
@@ -861,4 +875,101 @@ func (s *server) handleAgentConfigPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"system": body.System, "tools": valid, "available": availableTools(s.cfg.fetchPageEnabled)})
+}
+
+// --- File-tool relay (desktop sidecar → backend) ---
+
+// handleToolResponse receives the browser's assembled file-tool result for one
+// local tool-execution round (parallel to handleModelResponse for inference).
+// The browser dials the desktop sidecar's /__sidecar/repos/exec when it sees a
+// `toolExec` SSE event, then POSTs the observation here. Correlates to the job's
+// pendingToolExec channel: the first POST claims and delivers (200); a
+// duplicate/late POST, or one with no pending call, gets 409.
+func (s *server) handleToolResponse(w http.ResponseWriter, r *http.Request) {
+	convID := r.PathValue("id")
+	email := emailFrom(r)
+	var body struct {
+		JobID       string `json:"jobId"`
+		Observation  string `json:"observation"`
+		Preview     string `json:"preview"`
+		IsError     bool   `json:"isError"`
+		Error       string `json:"error,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		jsonError(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	j := s.jobs.get(convID)
+	if j == nil || j.email != email {
+		jsonError(w, "no active generation for this conversation", http.StatusNotFound)
+		return
+	}
+	if body.JobID != "" && j.id != body.JobID {
+		jsonError(w, "job id does not match the active generation", http.StatusConflict)
+		return
+	}
+	j.mu.Lock()
+	ch := j.pendingToolExec
+	if ch != nil {
+		j.pendingToolExec = nil
+	}
+	j.mu.Unlock()
+	if ch == nil {
+		jsonError(w, "no pending tool call for this job", http.StatusConflict)
+		return
+	}
+	ch <- toolExecResponse{Observation: body.Observation, Preview: body.Preview, IsError: body.IsError, Error: body.Error}
+	writeJSON(w, map[string]string{"status": "ok"})
+}
+
+// --- Repos (codebase registration) ---
+
+// handleRepoUpsert registers or updates a repo's context. The desktop sidecar
+// pushes this on clone/open so the agent loop can inject repo context into the
+// system prompt for repo-bound conversations.
+func (s *server) handleRepoUpsert(w http.ResponseWriter, r *http.Request) {
+	email := emailFrom(r)
+	var body struct {
+		FullName  string   `json:"fullName"`
+		LocalPath string   `json:"localPath"`
+		Branch    string   `json:"branch"`
+		Head      string   `json:"head"`
+		Tree      []string `json:"tree"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		jsonError(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(body.FullName) == "" {
+		jsonError(w, "fullName is required", http.StatusBadRequest)
+		return
+	}
+	repo := &Repo{
+		FullName:  body.FullName,
+		LocalPath: body.LocalPath,
+		Branch:    body.Branch,
+		Head:      body.Head,
+		Tree:      body.Tree,
+	}
+	saved, err := s.store.upsertRepo(email, repo)
+	if err != nil {
+		log.Printf("upsertRepo: %v", err)
+		jsonError(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, saved)
+}
+
+// handleListRepos returns the user's registered repos.
+func (s *server) handleListRepos(w http.ResponseWriter, r *http.Request) {
+	list, err := s.store.listRepos(emailFrom(r))
+	if err != nil {
+		log.Printf("listRepos: %v", err)
+		jsonError(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	if list == nil {
+		list = []Repo{}
+	}
+	writeJSON(w, list)
 }

@@ -55,6 +55,49 @@ function el(tag, cls, text) {
   };
 })();
 
+// --- toolExec SSE shim (intercepts the app's EventSource to handle file-tool relay) ---
+// The backend's agent loop emits a `toolExec` SSE event when it hits a local
+// file tool (read_file, grep, …). app.js's tailJob owns the EventSource but
+// doesn't know about toolExec. This shim wraps window.EventSource so every
+// EventSource created also gets a toolExec listener: on receipt, it POSTs the
+// tool call to the sidecar's /__sidecar/repos/exec, gets the observation, and
+// POSTs it back to /api/conversations/:id/tool-response — parallel to how
+// app.js handles modelCall. www/app.js stays unmodified.
+(function installToolExecShim() {
+  const OrigES = window.EventSource;
+  if (!OrigES) return;
+  function patched(url) {
+    const es = new OrigES(url);
+    // Extract the conversation ID from the /api/conversations/:id/events URL.
+    let convId = null;
+    try { const m = String(url).match(/\/api\/conversations\/([^/]+)\/events/); if (m) convId = decodeURIComponent(m[1]); } catch {}
+    es.addEventListener("toolExec", async (e) => {
+      let d = {}; try { d = JSON.parse(e.data); } catch { return; }
+      if (!d.jobId || !d.tool) return;
+      // Run the tool via the sidecar.
+      let execRes;
+      try {
+        const r = await fetch("/__sidecar/repos/exec", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repo: d.repo, tool: d.tool, args: d.args || "" }) });
+        execRes = await r.json();
+      } catch (err) {
+        execRes = { observation: String(err && err.message || err), preview: "exec error", is_error: true };
+      }
+      // Post the observation back to the backend so the agent loop continues.
+      try {
+        await fetch("/api/conversations/" + encodeURIComponent(convId) + "/tool-response", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ jobId: d.jobId, observation: execRes.observation || "", preview: execRes.preview || "", isError: !!execRes.is_error })
+        });
+      } catch {}
+    });
+    return es;
+  }
+  // Preserve static props and prototype so instanceof checks still work.
+  patched.prototype = OrigES.prototype;
+  Object.defineProperty(patched, "name", { value: "EventSource" });
+  window.EventSource = patched;
+})();
+
 let state = null;
 
 async function refreshState() {
@@ -249,6 +292,50 @@ function localRow(r) {
     refreshLocal();
   };
   row.appendChild(refresh);
+  // "New agent for this repo": create a conversation, bind the repo, enable
+  // agent mode with file tools, and reload into it. Phase 3 wires this to the
+  // backend's toolExec relay so the agent can read/grep the codebase.
+  const agent = el("button", "ds-btn ds-btn-sm", "New agent");
+  agent.onclick = async () => {
+    agent.disabled = true; agent.textContent = "Creating…";
+    // 1. Create the conversation.
+    let convId = null;
+    try {
+      const title = r.name + " (agent)";
+      const model = localStorage.getItem("nas-llm-model") || "";
+      const cr = await fetch("/api/conversations", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title, model }) });
+      const cj = await cr.json();
+      convId = cj.id;
+    } catch (e) { flashDsErr(String(e && e.message || e)); agent.disabled = false; agent.textContent = "New agent"; return; }
+    if (!convId) { flashDsErr("Could not create conversation."); agent.disabled = false; agent.textContent = "New agent"; return; }
+    // 2. Bind the repo (PATCH repoId) and set agent tools to include file tools.
+    //    The repo must be registered with the backend (POST /api/repos, done on
+    //    clone by the sidecar). Re-push here in case the push failed earlier.
+    try {
+      await sid("repos/open", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: r.name }) });
+    } catch {}
+    // Find the repo ID from the backend's repo list.
+    let repoId = "";
+    try {
+      const rr = await fetch("/api/repos");
+      if (rr.ok) { const repos = await rr.json(); const found = (repos || []).find(x => x.fullName === r.name); if (found) repoId = found.id; }
+    } catch {}
+    if (!repoId) { flashDsErr("Repo not registered with backend. Try re-cloning."); agent.disabled = false; agent.textContent = "New agent"; return; }
+    try {
+      await fetch("/api/conversations/" + encodeURIComponent(convId), {
+        method: "PATCH", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repoId, agentTools: "read_file,list_files,glob,grep,git_status,ask_user,get_time" })
+      });
+    } catch (e) { flashDsErr(String(e && e.message || e)); agent.disabled = false; agent.textContent = "New agent"; return; }
+    // 3. Enable agent mode and navigate to the new conversation.
+    try {
+      let extras = []; try { extras = JSON.parse(localStorage.getItem("nas-llm-extras") || "[]") || []; } catch {}
+      if (!extras.includes("agent")) { extras.push("agent"); localStorage.setItem("nas-llm-extras", JSON.stringify(extras)); }
+      localStorage.setItem("nas-llm-conv", convId);
+    } catch {}
+    location.reload();
+  };
+  row.appendChild(agent);
   return row;
 }
 

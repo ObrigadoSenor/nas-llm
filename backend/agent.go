@@ -67,9 +67,13 @@ type toolOutcome struct {
 }
 
 // agentTool is one tool the agent may call: an OpenAI tool schema + an executor.
+// For server-side tools (web_search, calculator, …) execute runs the tool
+// locally. For local file tools (read_file, grep, …) local is true and execute
+// is nil — the loop relays execution to the browser via a toolExec SSE event
 type agentTool struct {
 	schema  oaiTool
 	execute func(ctx context.Context, args string) toolOutcome
+	local   bool
 }
 
 // defaultAgentTools is the tool allowlist used when agent mode is on and no
@@ -268,7 +272,102 @@ func (s *server) toolRegistry(email string) map[string]agentTool {
 			},
 		}
 	}
+	// File tools are local: executed by the desktop sidecar via the toolExec
+	// relay, not server-side. execute is nil — runAgentLoop routes local tools
+	// through the relay when a repo is bound.
+	for name, schema := range map[string]oaiTool{
+		"read_file":  readFileTool(),
+		"list_files": listFilesTool(),
+		"glob":      globTool(),
+		"grep":      grepTool(),
+		"git_status": gitStatusTool(),
+	} {
+		reg[name] = agentTool{schema: schema, local: true}
+	}
 	return reg
+}
+
+// --- File tools (local: executed by the desktop sidecar via toolExec relay) ---
+
+func readFileTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "read_file",
+		Description: "Read the contents of a file in the repository. Use this to examine source code, configs, or documentation.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"path": map[string]any{"type": "string", "description": "Repository-relative path to the file, e.g. src/main.go"},
+		}, "required": []string{"path"}},
+	}}
+}
+
+func listFilesTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "list_files",
+		Description: "List files and subdirectories in a repository directory. Use this to explore the project structure.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"path": map[string]any{"type": "string", "description": "Repository-relative directory path (empty or \".\" for the root)"},
+		}},
+	}}
+}
+
+func globTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "glob",
+		Description: "Find files matching a glob pattern (e.g. **/*.go, src/**/*.test.ts). Use this to locate files by name pattern.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"pattern": map[string]any{"type": "string", "description": "Glob pattern, e.g. **/*.go or src/**/*.ts"},
+		}, "required": []string{"pattern"}},
+	}}
+}
+
+func grepTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "grep",
+		Description: "Search for a text pattern in the repository's files. Returns matching lines with file:line prefixes. Use this to find where a symbol, function, or string is used.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"pattern": map[string]any{"type": "string", "description": "The text pattern to search for"},
+			"path":    map[string]any{"type": "string", "description": "Repository-relative directory to search in (optional, default root)"},
+		}, "required": []string{"pattern"}},
+	}}
+}
+
+func gitStatusTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "git_status",
+		Description: "Show the working tree status (modified, staged, untracked files). Use this to see what changes exist in the repository.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{}},
+	}}
+}
+
+// injectRepoContext prepends a repo context block to the agent system prompt
+// so the model knows which repository it's working against: the repo name,
+// current branch, HEAD, and the top-level file tree. This is injected only for
+// repo-bound agent runs.
+func injectRepoContext(sys string, r *Repo) string {
+	var b strings.Builder
+	b.WriteString("You are working against a cloned codebase: ")
+	b.WriteString(r.FullName)
+	b.WriteString(" (branch: ")
+	b.WriteString(r.Branch)
+	if r.Head != "" {
+		b.WriteString(", HEAD: ")
+		b.WriteString(r.Head[:min(12, len(r.Head))])
+	}
+	b.WriteString("). Top-level files/dirs: ")
+	if len(r.Tree) > 0 {
+		b.WriteString(strings.Join(r.Tree, ", "))
+	} else {
+		b.WriteString("(empty)")
+	}
+	b.WriteString(". Use the read_file, list_files, glob, grep, and git_status tools to explore the codebase and answer questions about it. Paths are repository-relative. Keep answers grounded in what you read — do not guess at file contents.\n\n")
+	b.WriteString(sys)
+	return b.String()
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // agentSystemNudge is the default system prompt for agent mode. It injects the
@@ -295,7 +394,8 @@ func agentSystemNudge() string {
 // the tools removed so the model must synthesize.
 func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email string, msgs []oaiMessage, allow []string, systemPrompt string,
 	emit func(string), emitPhase func(string), emitTool func(agentStep), emitQuestions func(clarifyMeta),
-	emitThought func(string), emitClear func(), addUsage func(int, int)) error {
+	emitThought func(string), emitClear func(), addUsage func(int, int),
+	repoID string, toolExecRelay func(ctx context.Context, step int, tool, args string) toolOutcome) error {
 	emitPhase("agent")
 	reg := s.toolRegistry(email)
 	tools := make([]oaiTool, 0, len(allow))
@@ -391,7 +491,14 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 				continue
 			}
 			start := time.Now()
-			out := tool.execute(ctx, tc.Function.Arguments)
+			var out toolOutcome
+			if tool.local && toolExecRelay != nil {
+				out = toolExecRelay(ctx, step+1, tc.Function.Name, tc.Function.Arguments)
+			} else if !tool.local {
+				out = tool.execute(ctx, tc.Function.Arguments)
+			} else {
+				out = toolOutcome{observation: "Local tool " + tc.Function.Name + " has no executor and no relay is configured.", preview: "no executor", isError: true}
+			}
 			dur := time.Since(start).Milliseconds()
 			st := agentStep{Step: step + 1, Tool: tc.Function.Name, Args: tc.Function.Arguments, Preview: out.preview, IsError: out.isError, DurationMs: dur}
 			if out.search != nil {
@@ -555,6 +662,13 @@ func availableTools(fetchPage bool) []toolMeta {
 	if fetchPage {
 		out = append(out, toolMeta{Name: "fetch_page", Label: "Fetch page", Description: "Download a web page and read its text. Off by default (injection risk)."})
 	}
+	out = append(out,
+		toolMeta{Name: "read_file", Label: "Read file", Description: "Read a file in the repository (desktop only)."},
+		toolMeta{Name: "list_files", Label: "List files", Description: "List a directory in the repository (desktop only)."},
+		toolMeta{Name: "glob", Label: "Glob", Description: "Find files by name pattern (desktop only)."},
+		toolMeta{Name: "grep", Label: "Grep", Description: "Search file contents in the repository (desktop only)."},
+		toolMeta{Name: "git_status", Label: "Git status", Description: "Show the working tree status (desktop only)."},
+	)
 	return out
 }
 

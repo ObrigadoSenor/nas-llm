@@ -46,6 +46,7 @@ type Conversation struct {
 	Title       string    `json:"title"`
 	Model       string    `json:"model"`
 	FolderID    string    `json:"folderId,omitempty"`
+	RepoID      string    `json:"repoId,omitempty"`
 	TitleCustom bool      `json:"titleCustom"`
 	CreatedAt   int64     `json:"createdAt"`
 	UpdatedAt   int64     `json:"updatedAt"`
@@ -57,6 +58,20 @@ type Folder struct {
 	Name      string `json:"name"`
 	Position  int    `json:"position"`
 	CreatedAt int64  `json:"createdAt"`
+}
+
+// Repo is a locally-cloned repository registered with the backend. The desktop
+// sidecar pushes this context (branch, HEAD, top-level tree) on clone/open so
+// the agent loop can inject it into the system prompt for repo-bound chats.
+type Repo struct {
+	ID        string `json:"id"`
+	Email     string `json:"-"`
+	FullName  string `json:"fullName"`
+	LocalPath string `json:"localPath"`
+	Branch    string `json:"branch"`
+	Head      string `json:"head"`
+	Tree      []string `json:"tree"`
+	CreatedAt int64     `json:"createdAt"`
 }
 
 type store struct {
@@ -155,6 +170,18 @@ CREATE TABLE IF NOT EXISTS model_benchmarks (
 	load_ms INTEGER NOT NULL DEFAULT 0,
 	evaluated_at INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS repos (
+	id TEXT PRIMARY KEY,
+	email TEXT NOT NULL,
+	full_name TEXT NOT NULL,
+	local_path TEXT NOT NULL DEFAULT '',
+	branch TEXT NOT NULL DEFAULT '',
+	head TEXT NOT NULL DEFAULT '',
+	tree TEXT NOT NULL DEFAULT '[]',
+	created_at INTEGER NOT NULL,
+	UNIQUE(email, full_name)
+);
+CREATE INDEX IF NOT EXISTS idx_repos_email ON repos(email);
 `
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("schema: %w", err)
@@ -237,6 +264,11 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 	}
+	if !cols["repo_id"] {
+		if _, err := db.Exec(`ALTER TABLE conversations ADD COLUMN repo_id TEXT`); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -316,7 +348,7 @@ func (s *store) newConversationID() string {
 }
 
 func (s *store) listConversations(email string) ([]Conversation, error) {
-	rows, err := s.db.Query(`SELECT id, title, model, folder_id, title_custom, created_at, updated_at FROM conversations WHERE email = ? ORDER BY updated_at DESC`, email)
+	rows, err := s.db.Query(`SELECT id, title, model, folder_id, repo_id, title_custom, created_at, updated_at FROM conversations WHERE email = ? ORDER BY updated_at DESC`, email)
 	if err != nil {
 		return nil, err
 	}
@@ -324,12 +356,13 @@ func (s *store) listConversations(email string) ([]Conversation, error) {
 	var out []Conversation
 	for rows.Next() {
 		var c Conversation
-		var folderID sql.NullString
+		var folderID, repoID sql.NullString
 		var titleCustom int
-		if err := rows.Scan(&c.ID, &c.Title, &c.Model, &folderID, &titleCustom, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.Title, &c.Model, &folderID, &repoID, &titleCustom, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		c.FolderID = folderID.String
+		c.RepoID = repoID.String
 		c.TitleCustom = titleCustom != 0
 		out = append(out, c)
 	}
@@ -339,10 +372,10 @@ func (s *store) listConversations(email string) ([]Conversation, error) {
 func (s *store) getConversation(email, id string) (*Conversation, error) {
 	var c Conversation
 	var msgs string
-	var folderID sql.NullString
+	var folderID, repoID sql.NullString
 	var titleCustom int
-	err := s.db.QueryRow(`SELECT id, title, model, folder_id, title_custom, created_at, updated_at, messages FROM conversations WHERE id = ? AND email = ?`, id, email).
-		Scan(&c.ID, &c.Title, &c.Model, &folderID, &titleCustom, &c.CreatedAt, &c.UpdatedAt, &msgs)
+	err := s.db.QueryRow(`SELECT id, title, model, folder_id, repo_id, title_custom, created_at, updated_at, messages FROM conversations WHERE id = ? AND email = ?`, id, email).
+		Scan(&c.ID, &c.Title, &c.Model, &folderID, &repoID, &titleCustom, &c.CreatedAt, &c.UpdatedAt, &msgs)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -350,6 +383,7 @@ func (s *store) getConversation(email, id string) (*Conversation, error) {
 		return nil, err
 	}
 	c.FolderID = folderID.String
+	c.RepoID = repoID.String
 	c.TitleCustom = titleCustom != 0
 	if err := json.Unmarshal([]byte(msgs), &c.Messages); err != nil {
 		return nil, err
@@ -487,7 +521,7 @@ func (s *store) deleteFolder(email, id string) (bool, error) {
 // An empty folderID clears the folder (sets it to NULL). A non-empty title marks
 // the conversation as having a custom title (title_custom = 1) so later saves
 // won't overwrite it with the auto-derived first-message title.
-func (s *store) patchConversation(email, id string, title, folderID, model, agentSystem, agentTools *string) (*Conversation, error) {
+func (s *store) patchConversation(email, id string, title, folderID, model, agentSystem, agentTools, repoID *string) (*Conversation, error) {
 	now := time.Now().UnixMilli()
 	sets := []string{"updated_at = ?"}
 	args := []any{now}
@@ -514,6 +548,14 @@ func (s *store) patchConversation(email, id string, title, folderID, model, agen
 	if agentTools != nil {
 		sets = append(sets, "agent_tools = ?")
 		args = append(args, *agentTools)
+	}
+	if repoID != nil {
+		if *repoID == "" {
+			sets = append(sets, "repo_id = NULL")
+		} else {
+			sets = append(sets, "repo_id = ?")
+			args = append(args, *repoID)
+		}
 	}
 	args = append(args, id, email)
 	res, err := s.db.Exec(`UPDATE conversations SET `+strings.Join(sets, ", ")+` WHERE id = ? AND email = ?`, args...)
@@ -716,4 +758,86 @@ func (s *store) getConvAgentConfig(email, id string) (system, tools string, err 
 		return "", "", err
 	}
 	return sys.String, t.String, nil
+}
+
+// getConvRepoID returns the repo_id bound to a conversation ("" if none).
+func (s *store) getConvRepoID(email, id string) (string, error) {
+	var repoID sql.NullString
+	err := s.db.QueryRow(`SELECT repo_id FROM conversations WHERE id = ? AND email = ?`, id, email).Scan(&repoID)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return repoID.String, nil
+}
+
+// --- Repos (locally-cloned codebases) --------------------------------------
+
+// upsertRepo registers or updates a repo for a user. The desktop sidecar pushes
+// this on clone/open so the agent loop can inject repo context into the system
+// prompt. Keyed by (email, full_name) so re-pushing refreshes branch/head/tree.
+func (s *store) upsertRepo(email string, r *Repo) (*Repo, error) {
+	id := s.newFolderID() // reuse the random-ID helper
+	now := time.Now().UnixMilli()
+	treeJSON, _ := json.Marshal(r.Tree)
+	// Try insert; on conflict (email, full_name), update in place and keep the id.
+	res, err := s.db.Exec(`INSERT INTO repos(id, email, full_name, local_path, branch, head, tree, created_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(email, full_name) DO UPDATE SET local_path=excluded.local_path,
+			branch=excluded.branch, head=excluded.head, tree=excluded.tree`,
+		id, email, r.FullName, r.LocalPath, r.Branch, r.Head, string(treeJSON), now)
+	if err != nil {
+		return nil, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		// ON CONFLICT DO UPDATE still reports 1 row affected in SQLite, so this is
+		// just a safety net. Fetch the existing id by (email, full_name).
+	}
+	var existingID string
+	if err := s.db.QueryRow(`SELECT id FROM repos WHERE email = ? AND full_name = ?`, email, r.FullName).Scan(&existingID); err != nil {
+		return nil, err
+	}
+	r.ID = existingID
+	r.Email = email
+	r.CreatedAt = now
+	return r, nil
+}
+
+// listRepos returns all repos registered by a user.
+func (s *store) listRepos(email string) ([]Repo, error) {
+	rows, err := s.db.Query(`SELECT id, full_name, local_path, branch, head, tree, created_at FROM repos WHERE email = ? ORDER BY created_at DESC`, email)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Repo
+	for rows.Next() {
+		var r Repo
+		var treeJSON string
+		if err := rows.Scan(&r.ID, &r.FullName, &r.LocalPath, &r.Branch, &r.Head, &treeJSON, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal([]byte(treeJSON), &r.Tree)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// getRepo returns a single repo by id, or nil if not found / not owned by email.
+func (s *store) getRepo(email, id string) (*Repo, error) {
+	var r Repo
+	var treeJSON string
+	err := s.db.QueryRow(`SELECT id, full_name, local_path, branch, head, tree, created_at FROM repos WHERE id = ? AND email = ?`, id, email).
+		Scan(&r.ID, &r.FullName, &r.LocalPath, &r.Branch, &r.Head, &treeJSON, &r.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	_ = json.Unmarshal([]byte(treeJSON), &r.Tree)
+	r.Email = email
+	return &r, nil
 }

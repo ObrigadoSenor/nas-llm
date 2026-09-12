@@ -134,11 +134,11 @@ impl AppState {
         }
     }
 
-    async fn backend(&self) -> String {
+    pub async fn backend(&self) -> String {
         self.backend_url.read().await.clone()
     }
 
-    async fn cookie_value(&self) -> Option<String> {
+    pub async fn cookie_value(&self) -> Option<String> {
         self.cookie.read().await.clone()
     }
 
@@ -314,14 +314,14 @@ async fn index_html(State(st): State<AppState>) -> Response {
             if !html.contains("/__sidecar/desktop.css") {
                 html = html.replacen(
                     "</head>",
-                    "<link rel=\"stylesheet\" href=\"/__sidecar/desktop.css?v=5\">\n</head>",
+                    "<link rel=\"stylesheet\" href=\"/__sidecar/desktop.css?v=6\">\n</head>",
                     1,
                 );
             }
             if !html.contains("/__sidecar/desktop.js") {
                 html = html.replacen(
                     "</body>",
-                    "<script type=\"module\" src=\"/__sidecar/desktop.js?v=5\"></script>\n</body>",
+                    "<script type=\"module\" src=\"/__sidecar/desktop.js?v=6\"></script>\n</body>",
                     1,
                 );
             }

@@ -32,9 +32,10 @@ var errJobActive = errors.New("a generation is already running for this conversa
 // subEvent is a single event pushed to an SSE subscriber.
 type subEvent struct {
 	// kind is one of: chunk, phase, search, questions, tool, thought, clear,
-	// modelCall, done, error. "modelCall" is the browser-relay cue: it carries a
-	// modelCallPayload telling the browser to run inference on its own Ollama and
-	// POST the result back to /model-response.
+	// modelCall, toolExec, done, error. "modelCall" is the browser-relay cue for
+	// local-model inference; "toolExec" is the browser-relay cue for local file
+	// tools (the browser runs the tool via the sidecar and POSTs the observation
+	// back to /tool-response). Both carry a JSON payload in text.
 	kind string
 	text string
 }
@@ -94,6 +95,15 @@ type job struct {
 	// replayed as an SSE event on (re)connect so a browser that attaches after
 	// the cue fired still runs the round. Cleared once the response arrives.
 	pendingModelCall *modelCallPayload
+	// pendingToolExec is set by the agent loop while it awaits the browser's POST
+	// /tool-response for a local file-tool call. handleToolResponse claims it
+	// under mu (one deliverer wins) and sends the observation. Nil when no
+	// file-tool relay round is in flight. Used for repo-bound agent runs.
+	pendingToolExec chan toolExecResponse
+	// pendingToolExecPayload is the last toolExec cue awaiting a browser response.
+	// Replayed on (re)connect so a browser that attaches after the cue fired still
+	// runs the tool. Cleared once the response arrives.
+	pendingToolExecPayload *toolExecPayload
 }
 
 // relayResponse is the browser's assembled inference result for one local-model
@@ -118,6 +128,30 @@ type modelCallPayload struct {
 	Model    string       `json:"model"`
 	Messages []oaiMessage `json:"messages"`
 	Tools    []oaiTool    `json:"tools,omitempty"`
+}
+
+// toolExecPayload is the SSE `toolExec` event body: the browser's cue to run a
+// local file tool (read_file, list_files, glob, grep, git_status) via the
+// desktop sidecar against the bound repo, then POST the observation back to
+// /tool-response. Mirrors modelCallPayload for the tool-execution relay.
+type toolExecPayload struct {
+	JobID string `json:"jobId"`
+	Step  int    `json:"step"`
+	Tool  string `json:"tool"`
+	Args  string `json:"args"`
+	Repo  string `json:"repo"`
+}
+
+// toolExecResponse is the browser's assembled file-tool result, delivered
+// through the job's pendingToolExec channel. Observation is the tool output fed
+// back to the model; Preview is a short summary for the trace; IsError marks a
+// failure. Error, when non-empty, signals the relay couldn't run the tool at
+// all (sidecar down, repo not found) — surfaced as an error observation.
+type toolExecResponse struct {
+	Observation string `json:"observation"`
+	Preview    string `json:"preview"`
+	IsError    bool   `json:"isError"`
+	Error      string `json:"error,omitempty"`
 }
 
 func newJobID() string {
@@ -199,6 +233,49 @@ func (j *job) modelCallSnapshot() *modelCallPayload {
 func (j *job) clearPendingModelCall() {
 	j.mu.Lock()
 	j.pendingModelCall = nil
+	j.mu.Unlock()
+}
+
+// emitToolExec stashes the current file-tool call on the job (so a browser that
+// attaches after the cue fired gets it replayed on subscribe) and broadcasts a
+// "toolExec" event to every live subscriber. Called by the agent loop when it
+// hits a local file tool, parallel to emitModelCall for local-model inference.
+func (j *job) emitToolExec(step int, tool, args, repo string) {
+	payload := toolExecPayload{JobID: j.id, Step: step, Tool: tool, Args: args, Repo: repo}
+	b, _ := json.Marshal(payload)
+	j.mu.Lock()
+	j.pendingToolExecPayload = &payload
+	subs := make([]chan subEvent, 0, len(j.subs))
+	for ch := range j.subs {
+		subs = append(subs, ch)
+	}
+	j.mu.Unlock()
+	ev := subEvent{kind: "toolExec", text: string(b)}
+	for _, ch := range subs {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
+}
+
+// toolExecSnapshot returns a copy of the pending toolExec for SSE replay on
+// (re)connect, or nil if no file-tool round is awaiting a browser response.
+func (j *job) toolExecSnapshot() *toolExecPayload {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.pendingToolExecPayload == nil {
+		return nil
+	}
+	cp := *j.pendingToolExecPayload
+	return &cp
+}
+
+// clearPendingToolExec drops the stashed toolExec once the browser's response
+// has arrived, so a later reconnect does not replay a round already completed.
+func (j *job) clearPendingToolExec() {
+	j.mu.Lock()
+	j.pendingToolExecPayload = nil
 	j.mu.Unlock()
 }
 
@@ -808,7 +885,47 @@ func (s *server) runGeneration(j *job) error {
 
 	if j.agent {
 		allow, sys := s.agentConfig(j)
-		return s.runAgentLoop(ctx, mb, j.model, j.email, msgs, allow, sys, j.emitChunk, j.emitPhase, j.emitTool, j.emitQuestions, j.emitThought, j.emitClear, j.addUsage)
+		repoID, _ := s.store.getConvRepoID(j.email, j.convID)
+		var toolExecRelay func(context.Context, int, string, string) toolOutcome
+		if repoID != "" {
+			if repo, err := s.store.getRepo(j.email, repoID); err == nil && repo != nil {
+				allow = append(allow, "read_file", "list_files", "glob", "grep", "git_status")
+				sys = injectRepoContext(sys, repo)
+				toolExecRelay = func(ctx context.Context, step int, tool, args string) toolOutcome {
+					respCh := make(chan toolExecResponse, 1)
+					j.mu.Lock()
+					j.pendingToolExec = respCh
+					j.mu.Unlock()
+					defer func() {
+						j.mu.Lock()
+						if j.pendingToolExec == respCh {
+							j.pendingToolExec = nil
+						}
+						j.mu.Unlock()
+					}()
+					j.emitToolExec(step, tool, args, repo.FullName)
+					timer := time.NewTimer(genTimeout)
+					defer timer.Stop()
+					select {
+					case resp, ok := <-respCh:
+						if !ok {
+							return toolOutcome{observation: "tool execution cancelled", preview: "cancelled", isError: true}
+						}
+						if resp.Error != "" {
+							j.clearPendingToolExec()
+							return toolOutcome{observation: resp.Error, preview: trimPreview(resp.Error), isError: true}
+						}
+						j.clearPendingToolExec()
+						return toolOutcome{observation: capObservation(resp.Observation, agentObsMaxChars), preview: resp.Preview, isError: resp.IsError}
+					case <-timer.C:
+						return toolOutcome{observation: "tool execution timed out", preview: "timeout", isError: true}
+					case <-ctx.Done():
+						return toolOutcome{observation: "tool execution cancelled", preview: "cancelled", isError: true}
+					}
+				}
+			}
+		}
+		return s.runAgentLoop(ctx, mb, j.model, j.email, msgs, allow, sys, j.emitChunk, j.emitPhase, j.emitTool, j.emitQuestions, j.emitThought, j.emitClear, j.addUsage, repoID, toolExecRelay)
 	}
 	if j.clarify {
 		// Cap back-to-back clarifying questions at MAX_CLARIFY_ROUNDS: once the

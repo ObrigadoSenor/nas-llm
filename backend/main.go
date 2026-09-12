@@ -234,6 +234,9 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("DELETE /api/folders/{id}", s.requireAuth(s.handleDeleteFolder))
 	mux.HandleFunc("GET /api/agent/config", s.requireAuth(s.handleAgentConfigGet))
 	mux.HandleFunc("PUT /api/agent/config", s.requireAuth(s.handleAgentConfigPut))
+	mux.HandleFunc("POST /api/conversations/{id}/tool-response", s.requireAuth(s.handleToolResponse))
+	mux.HandleFunc("GET /api/repos", s.requireAuth(s.handleListRepos))
+	mux.HandleFunc("POST /api/repos", s.requireAuth(s.handleRepoUpsert))
 	return mux
 }
 
