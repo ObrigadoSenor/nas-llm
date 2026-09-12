@@ -24,6 +24,12 @@ const (
 	genTimeout     = 5 * time.Minute
 	subBufferSize  = 512 // ~50s of tokens at 10 tok/s on the N100; live clients read far faster
 	keepaliveEvery = 5 * time.Second
+	// defaultAgentJobTimeout/defaultToolExecTimeout back-stop a zero-value
+	// s.cfg.agentJobTimeout/toolExecTimeout (e.g. a *server built directly in a
+	// test without going through main's envDuration defaulting). Mirrors the
+	// AGENT_JOB_TIMEOUT/TOOL_EXEC_TIMEOUT defaults in main.go/.env.example.
+	defaultAgentJobTimeout = 30 * time.Minute
+	defaultToolExecTimeout = 15 * time.Minute
 )
 
 // errJobActive means a generation job is already running for a conversation.
@@ -65,12 +71,26 @@ type job struct {
 
 	// local marks a browser-relay (local-model) job: inference runs on the
 	// visitor's Ollama via the browser, so the backend emits modelCall events and
-	// awaits POST /model-response instead of dialing a server host. A local job
-	// is also connection-bound: when the SSE /events tail disconnects (tab closed
-	// or navigated), handleEvents cancels it so the pending relay wait aborts and
-	// the worker finalizes the partial reply as cancelled. Server-model jobs stay
-	// detached and survive a disconnect.
+	// awaits POST /model-response instead of dialing a server host.
 	local bool
+	// needsBrowser is true for any job that is connection-bound: a local
+	// (browser-relay) job by definition, and also a repo-bound agent run even on
+	// a server model, because its file tools (apply_patch, run_command, …) are
+	// relayed through the browser via toolExec. Set once at creation (before the
+	// job is enqueued) and never mutated afterward, so it is safe to read without
+	// j.mu. Jobs that don't need the browser stay detached and survive any SSE
+	// disconnect, exactly as before; jobs that do get a grace period instead of
+	// an instant cancel — see scheduleGraceCancel.
+	needsBrowser bool
+	// hub is this job's owner's multiplexed /api/events stream. Every emit*/
+	// notify* call also publishes to it (tagged with convId+jobId) so a
+	// backgrounded chat's browser relay and the sidebar/notification UI keep
+	// working without a dedicated per-conversation tail. Set at creation; nil in
+	// tests that construct a job directly, which is treated as "no hub".
+	hub *eventHub
+	// graceTimer is armed by scheduleGraceCancel when a browser-bound job's
+	// connection-of-record drops. Guarded by mu.
+	graceTimer *time.Timer
 
 	mu              sync.Mutex
 	status          string // queued, generating, done, error, cancelled
@@ -124,6 +144,7 @@ type relayResponse struct {
 // one inference round on its own Ollama. tools is omitted for a plain-chat
 // round (the frontend treats a missing tools field as "no tools").
 type modelCallPayload struct {
+	ConvID   string       `json:"convId"`
 	JobID    string       `json:"jobId"`
 	Model    string       `json:"model"`
 	Messages []oaiMessage `json:"messages"`
@@ -135,11 +156,17 @@ type modelCallPayload struct {
 // desktop sidecar against the bound repo, then POST the observation back to
 // /tool-response. Mirrors modelCallPayload for the tool-execution relay.
 type toolExecPayload struct {
-	JobID string `json:"jobId"`
-	Step  int    `json:"step"`
-	Tool  string `json:"tool"`
-	Args  string `json:"args"`
-	Repo  string `json:"repo"`
+	ConvID string `json:"convId"`
+	JobID  string `json:"jobId"`
+	Step   int    `json:"step"`
+	Tool   string `json:"tool"`
+	Args   string `json:"args"`
+	Repo   string `json:"repo"`
+	// Branch is the conversation's bound branch (conversations.repo_branch),
+	// sourced fresh per call so a mid-run branch switch is reflected. Empty
+	// means "use the repo's main working tree" — the sidecar/renderer treat a
+	// missing branch exactly like an old client that never sent one.
+	Branch string `json:"branch"`
 }
 
 // toolExecResponse is the browser's assembled file-tool result, delivered
@@ -195,10 +222,12 @@ func (j *job) appendContent(text string) {
 
 // emitModelCall stashes the current inference request on the job (so a browser
 // that attaches after the cue fired gets it replayed on subscribe) and
-// broadcasts a "modelCall" event to every live subscriber. Called by
-// browserRelay.Call at the start of each local-model round.
+// broadcasts a "modelCall" event to every live subscriber, plus this job's
+// owner's /api/events hub (contract: every hub event carries convId+jobId, and
+// this payload already does). Called by browserRelay.Call at the start of each
+// local-model round.
 func (j *job) emitModelCall(model string, messages []oaiMessage, tools []oaiTool) {
-	payload := modelCallPayload{JobID: j.id, Model: model, Messages: messages, Tools: tools}
+	payload := modelCallPayload{ConvID: j.convID, JobID: j.id, Model: model, Messages: messages, Tools: tools}
 	b, _ := json.Marshal(payload)
 	j.mu.Lock()
 	j.pendingModelCall = &payload
@@ -214,6 +243,7 @@ func (j *job) emitModelCall(model string, messages []oaiMessage, tools []oaiTool
 		default:
 		}
 	}
+	j.publishHub(ev)
 }
 
 // modelCallSnapshot returns a copy of the pending modelCall for SSE replay on
@@ -238,10 +268,12 @@ func (j *job) clearPendingModelCall() {
 
 // emitToolExec stashes the current file-tool call on the job (so a browser that
 // attaches after the cue fired gets it replayed on subscribe) and broadcasts a
-// "toolExec" event to every live subscriber. Called by the agent loop when it
-// hits a local file tool, parallel to emitModelCall for local-model inference.
-func (j *job) emitToolExec(step int, tool, args, repo string) {
-	payload := toolExecPayload{JobID: j.id, Step: step, Tool: tool, Args: args, Repo: repo}
+// "toolExec" event to every live subscriber plus the owner's /api/events hub.
+// Called by the agent loop when it hits a local file tool, parallel to
+// emitModelCall for local-model inference. branch is the conversation's bound
+// branch ("" for the repo's main working tree; see toolExecPayload).
+func (j *job) emitToolExec(step int, tool, args, repo, branch string) {
+	payload := toolExecPayload{ConvID: j.convID, JobID: j.id, Step: step, Tool: tool, Args: args, Repo: repo, Branch: branch}
 	b, _ := json.Marshal(payload)
 	j.mu.Lock()
 	j.pendingToolExecPayload = &payload
@@ -257,6 +289,7 @@ func (j *job) emitToolExec(step int, tool, args, repo string) {
 		default:
 		}
 	}
+	j.publishHub(ev)
 }
 
 // toolExecSnapshot returns a copy of the pending toolExec for SSE replay on
@@ -305,7 +338,9 @@ func (j *job) emitChunk(delta string) {
 // emitPhase broadcasts a phase hint (e.g. "searching", "answering") so the UI
 // can show an appropriate waiting state. The latest phase is also stored so a
 // client that connects after the hint fired (a common race: runSearchLoop emits
-// "searching" before the SSE stream opens) gets it replayed on subscribe.
+// "searching" before the SSE stream opens) gets it replayed on subscribe. Also
+// published to the owner's /api/events hub so a backgrounded chat's sidebar
+// status stays current.
 func (j *job) emitPhase(phase string) {
 	j.mu.Lock()
 	j.phase = phase
@@ -321,6 +356,8 @@ func (j *job) emitPhase(phase string) {
 		default:
 		}
 	}
+	b, _ := json.Marshal(hubPhasePayload{ConvID: j.convID, JobID: j.id, Phase: phase})
+	j.publishHub(subEvent{kind: "phase", text: string(b)})
 }
 
 // emitSearch records a web-search event (a real query + its sources, or a
@@ -575,6 +612,7 @@ func (j *job) notifyDone() {
 		default:
 		}
 	}
+	j.publishHubDone("done")
 }
 
 // notifyCancelled marks the job cancelled and broadcasts a terminal "done".
@@ -599,6 +637,7 @@ func (j *job) notifyCancelled() {
 		default:
 		}
 	}
+	j.publishHubDone("cancelled")
 }
 
 // notifyError marks the job errored and broadcasts the terminal event.
@@ -622,6 +661,148 @@ func (j *job) notifyError(msg string) {
 		default:
 		}
 	}
+	b, _ := json.Marshal(hubErrorPayload{ConvID: j.convID, JobID: j.id, Error: msg})
+	j.publishHub(subEvent{kind: "error", text: string(b)})
+}
+
+// publishHub forwards an event to this job's owner's /api/events hub, if any
+// (nil in tests that build a job directly with newJob). Mirrors the
+// non-blocking discipline of the per-job subs broadcast above: a slow /api/
+// events subscriber must never block a generation.
+func (j *job) publishHub(ev subEvent) {
+	if j.hub == nil {
+		return
+	}
+	j.hub.publish(j.email, ev)
+}
+
+// publishHubDone marshals and publishes a terminal "done" hub event carrying
+// the job's final status ("done" or "cancelled"); notifyError publishes
+// "error" directly since it also carries a message.
+func (j *job) publishHubDone(status string) {
+	b, _ := json.Marshal(hubDonePayload{ConvID: j.convID, JobID: j.id, Status: status})
+	j.publishHub(subEvent{kind: "done", text: string(b)})
+}
+
+// scheduleGraceCancel starts (or restarts) a countdown after a browser-bound
+// job's connection-of-record drops: its per-conversation tail (handleEvents)
+// or the owning user's multiplexed stream (handleUserEvents). If neither has
+// reattached by the time the timer fires, the job is cancelled — this is what
+// lets a chat switch or a page reload survive (either channel reattaching
+// within the grace period simply means the check below finds a live
+// subscriber and does nothing) while a genuinely closed app still cleans the
+// job up. hub may be nil (no /api/events stream configured), in which case
+// only the per-conversation tail is checked.
+func (j *job) scheduleGraceCancel(grace time.Duration, hub *eventHub) {
+	j.mu.Lock()
+	if j.graceTimer != nil {
+		j.graceTimer.Stop()
+	}
+	email := j.email
+	j.graceTimer = time.AfterFunc(grace, func() {
+		j.mu.Lock()
+		hasTail := len(j.subs) > 0
+		j.mu.Unlock()
+		if hasTail || (hub != nil && hub.connected(email)) {
+			return
+		}
+		j.cancel()
+	})
+	j.mu.Unlock()
+}
+
+// --- Event hub: the per-user multiplexed stream (GET /api/events) ---------
+//
+// eventHub fans modelCall/toolExec/phase/done/joberror events out to every one
+// of a user's live /api/events connections. In practice a user has at most one
+// such connection open (one browser tab), but the hub supports more so a
+// second tab/window isn't starved. This is the second (and last) long-lived
+// connection the desktop sidecar's HTTP/1.1 127.0.0.1 origin has to carry
+// alongside the one foreground per-conversation tail — bounded regardless of
+// how many chats are actually running, which matters because the webview caps
+// roughly 6 connections per origin.
+type eventHub struct {
+	mu   sync.Mutex
+	subs map[string]map[chan subEvent]struct{} // email -> subscriber channels
+}
+
+func newEventHub() *eventHub {
+	return &eventHub{subs: map[string]map[chan subEvent]struct{}{}}
+}
+
+// subscribe registers a new /api/events connection for a user.
+func (h *eventHub) subscribe(email string) chan subEvent {
+	ch := make(chan subEvent, subBufferSize)
+	h.mu.Lock()
+	if h.subs[email] == nil {
+		h.subs[email] = map[chan subEvent]struct{}{}
+	}
+	h.subs[email][ch] = struct{}{}
+	h.mu.Unlock()
+	return ch
+}
+
+func (h *eventHub) unsubscribe(email string, ch chan subEvent) {
+	h.mu.Lock()
+	if m := h.subs[email]; m != nil {
+		delete(m, ch)
+		if len(m) == 0 {
+			delete(h.subs, email)
+		}
+	}
+	h.mu.Unlock()
+}
+
+// connected reports whether a user currently has a live /api/events
+// subscriber. Used by the grace-period cancel: a browser-bound job is not
+// cancelled while this stream is still attached, even if its own
+// per-conversation tail has dropped (a backgrounded chat).
+func (h *eventHub) connected(email string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.subs[email]) > 0
+}
+
+// publish sends a non-blocking event to every one of a user's /api/events
+// subscribers. A slow subscriber's channel is skipped rather than blocking a
+// generation, matching the per-job broadcast discipline.
+func (h *eventHub) publish(email string, ev subEvent) {
+	h.mu.Lock()
+	subs := make([]chan subEvent, 0, len(h.subs[email]))
+	for ch := range h.subs[email] {
+		subs = append(subs, ch)
+	}
+	h.mu.Unlock()
+	for _, ch := range subs {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
+}
+
+// hubPhasePayload/hubDonePayload/hubErrorPayload are the JSON bodies for the
+// phase/done/joberror events on GET /api/events. modelCall and toolExec reuse
+// their existing per-conversation payload structs (already carrying convId +
+// jobId), but phase/done/error have no JSON payload on the per-conversation
+// stream (bare text), so the hub needs its own small envelopes to satisfy
+// contract 1: every event's payload includes convId and jobId.
+type hubPhasePayload struct {
+	ConvID string `json:"convId"`
+	JobID  string `json:"jobId"`
+	Phase  string `json:"phase"`
+}
+
+type hubDonePayload struct {
+	ConvID string `json:"convId"`
+	JobID  string `json:"jobId"`
+	Status string `json:"status"` // done, cancelled
+}
+
+type hubErrorPayload struct {
+	ConvID string `json:"convId"`
+	JobID  string `json:"jobId"`
+	Error  string `json:"error"`
 }
 
 // --- Job manager ---
@@ -632,17 +813,81 @@ type jobManager struct {
 	queue  chan *job
 	store  *store
 	srv    *server
+	// hostSem serializes server-side inference per host: the NAS/Mac run Ollama
+	// with OLLAMA_NUM_PARALLEL=1, so two workers dialing the same host at once
+	// would just queue inside Ollama anyway. Keyed by host.name and seeded once
+	// from the host registry at construction, so it's safe to read without a
+	// lock afterward. Browser-relay jobs (j.local) never touch this — they run
+	// on the visitor's own machine, which is what actually parallelizes.
+	hostSem map[string]chan struct{}
 }
 
+// newJobManager starts a pool of workers draining one shared queue.
+// MAX_CONCURRENT_JOBS (via srv.cfg.maxConcurrentJobs) sizes the pool; a
+// browser-relay job blocks its worker while it awaits the user's browser
+// (POST /model-response), so with a single worker one local-model chat used to
+// stall every other chat. Multiple workers let those coexist; server-side
+// inference itself stays serialized per host via hostSem.
 func newJobManager(store *store, srv *server) *jobManager {
-	jm := &jobManager{
-		active: map[string]*job{},
-		queue:  make(chan *job, 64),
-		store:  store,
-		srv:    srv,
+	hostSem := map[string]chan struct{}{}
+	if srv != nil && srv.hosts != nil {
+		for _, h := range srv.hosts.all() {
+			hostSem[h.name] = make(chan struct{}, 1)
+		}
 	}
-	go jm.worker()
+	jm := &jobManager{
+		active:  map[string]*job{},
+		queue:   make(chan *job, 64),
+		store:   store,
+		srv:     srv,
+		hostSem: hostSem,
+	}
+	workers := 1
+	if srv != nil && srv.cfg.maxConcurrentJobs > 0 {
+		workers = srv.cfg.maxConcurrentJobs
+	}
+	for i := 0; i < workers; i++ {
+		go jm.worker()
+	}
 	return jm
+}
+
+// acquireHost blocks until the named host's single server-side inference slot
+// is free (or ctx is done), matching OLLAMA_NUM_PARALLEL=1 on the NAS/Mac.
+// Returns a release func to defer. An unrecognized host name (shouldn't happen
+// since hostSem is seeded from the same registry callers resolve hosts
+// through) is treated as unguarded.
+func (jm *jobManager) acquireHost(ctx context.Context, name string) (func(), error) {
+	sem, ok := jm.hostSem[name]
+	if !ok {
+		return func() {}, nil
+	}
+	select {
+	case sem <- struct{}{}:
+		return func() { <-sem }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// scheduleGraceForUser starts a grace-period check (see job.scheduleGraceCancel)
+// for every one of a user's active jobs that needs the browser. Called when
+// that user's /api/events hub connection drops, mirroring the per-job grace
+// scheduled in handleEvents when a foreground per-conversation tail drops. A
+// job whose per-conversation tail is still open is scheduled too, but its
+// grace check will simply find that tail live and do nothing.
+func (jm *jobManager) scheduleGraceForUser(email string, grace time.Duration, hub *eventHub) {
+	jm.mu.Lock()
+	jobs := make([]*job, 0, len(jm.active))
+	for _, j := range jm.active {
+		if j.email == email && j.needsBrowser {
+			jobs = append(jobs, j)
+		}
+	}
+	jm.mu.Unlock()
+	for _, j := range jobs {
+		j.scheduleGraceCancel(grace, hub)
+	}
 }
 
 func (jm *jobManager) enqueue(j *job) error {
@@ -698,11 +943,16 @@ func (jm *jobManager) activeByUser(email string) map[string]string {
 	return out
 }
 
-// worker is the single generation slot, matching OLLAMA_NUM_PARALLEL=1: jobs
-// run one at a time; others wait queued. It drives Ollama on
-// context.Background() (plus a timeout) so a browser disconnect never cancels
-// generation. After the assistant message is persisted, it notifies
-// subscribers.
+// worker is one of MAX_CONCURRENT_JOBS generation slots. It drives Ollama on
+// context.Background() (plus a timeout) so an SSE disconnect never outright
+// kills a job — the grace-period cancel (job.scheduleGraceCancel) governs
+// browser-bound jobs instead. A browser-relay job blocks its worker while it
+// awaits the user's browser (POST /model-response); with only one worker, one
+// local-model chat used to stall every other chat in the queue, which is why
+// there are now several of these running concurrently. Server-side inference
+// itself stays serialized per host via jm.acquireHost, matching
+// OLLAMA_NUM_PARALLEL=1 on the NAS/Mac. After the assistant message is
+// persisted, it notifies subscribers.
 func (jm *jobManager) worker() {
 	for j := range jm.queue {
 		j.mu.Lock()
@@ -824,7 +1074,17 @@ func messageContent(m Message) json.RawMessage {
 // model runs on the NAS, a Mac model on the Mac). Returns nil on a clean
 // finish, an error otherwise.
 func (s *server) runGeneration(j *job) error {
-	ctx, cancel := context.WithTimeout(context.Background(), genTimeout)
+	// Agent-mode runs need a longer leash than plain chat: apply_patch,
+	// run_command, git_commit, git_push, and create_pr all block on a user
+	// approval dialog, which genTimeout's 5m was never meant to cover.
+	timeout := genTimeout
+	if j.agent {
+		timeout = s.cfg.agentJobTimeout
+		if timeout <= 0 {
+			timeout = defaultAgentJobTimeout
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	j.mu.Lock()
 	j.cancelFn = cancel // let handleCancel / handleEvents abort the in-flight request
@@ -843,6 +1103,17 @@ func (s *server) runGeneration(j *job) error {
 		if h == nil {
 			return fmt.Errorf("model %q is unavailable — its backend may be offline. Try a smaller model or reconnect the host.", j.model)
 		}
+		// Serialize server-side inference per host: the NAS/Mac run Ollama with
+		// OLLAMA_NUM_PARALLEL=1, so two workers dialing the same host at once
+		// would just queue inside Ollama anyway. A browser-relay job never reaches
+		// this branch — it executes on the visitor's own machine — so only
+		// server-model jobs contend for this slot, which is what lets any number
+		// of concurrent browser-relay chats coexist with them.
+		release, err := s.jobs.acquireHost(ctx, h.name)
+		if err != nil {
+			return err
+		}
+		defer release()
 		mb = &directOllama{chatURL: h.chatURL(), emit: j.emitChunk}
 	}
 
@@ -890,7 +1161,7 @@ func (s *server) runGeneration(j *job) error {
 		if repoID != "" {
 			if repo, err := s.store.getRepo(j.email, repoID); err == nil && repo != nil {
 				allow = append(allow, "read_file", "list_files", "glob", "grep", "git_status", "apply_patch", "run_command", "git_commit", "git_push", "create_pr")
-				sys = injectRepoContext(sys, repo)
+				sys = injectRepoContext(sys, repo, conv.RepoBranch)
 				toolExecRelay = func(ctx context.Context, step int, tool, args string) toolOutcome {
 					respCh := make(chan toolExecResponse, 1)
 					j.mu.Lock()
@@ -903,8 +1174,15 @@ func (s *server) runGeneration(j *job) error {
 						}
 						j.mu.Unlock()
 					}()
-					j.emitToolExec(step, tool, args, repo.FullName)
-					timer := time.NewTimer(genTimeout)
+					j.emitToolExec(step, tool, args, repo.FullName, conv.RepoBranch)
+					// apply_patch/run_command/git_* block on a user approval dialog, which
+					// can take far longer than a plain tool call — give it its own budget
+					// (TOOL_EXEC_TIMEOUT) rather than the whole-job timeout.
+					toolTimeout := s.cfg.toolExecTimeout
+					if toolTimeout <= 0 {
+						toolTimeout = defaultToolExecTimeout
+					}
+					timer := time.NewTimer(toolTimeout)
 					defer timer.Stop()
 					select {
 					case resp, ok := <-respCh:
