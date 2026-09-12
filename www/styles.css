@@ -35,6 +35,10 @@ textarea{padding:8px 12px}
 
 /* Icons */
 .icon{display:inline-block;vertical-align:middle;flex:0 0 auto}
+/* Icon-only buttons: no boxed chrome — just the glyph, with a soft tint on hover.
+   The model dropdown (.model-btn) keeps its border; every other icon is borderless. */
+#menuBtn,#newFolder,#closeSide,#manageModels,#closeModels,#closeAgent,#send{background:transparent;border:none}
+#menuBtn:hover:not(:disabled),#newFolder:hover:not(:disabled),#closeSide:hover:not(:disabled),#manageModels:hover:not(:disabled),#closeModels:hover:not(:disabled),#closeAgent:hover:not(:disabled),#send:hover:not(:disabled){background:var(--hover)}
 
 /* --- Login --- */
 #login{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
@@ -87,7 +91,7 @@ header h1{font-size:var(--fs-l);font-weight:600;margin:0}
 #chatMeta{font-size:var(--fs-s);color:var(--muted);white-space:nowrap}
 #menuBtn{display:none;width:var(--h);padding:0}
 
-#chat{flex:1;overflow-y:auto;padding:16px 20%;display:flex;flex-direction:column;gap:18px}
+#chat{flex:1;overflow-y:auto;padding:16px 20%;display:flex;flex-direction:column;gap:24px}
 .msg{width:100%;max-width:none}
 .msg.user{margin-left:auto;margin-right:0}
 .msg.assistant{margin-left:0;margin-right:auto}
@@ -469,3 +473,9 @@ header h1{font-size:var(--fs-l);font-weight:600;margin:0}
 /* Local RAM budget input next to the Download-to chooser. */
 .local-ram-wrap{display:inline-flex;align-items:center;gap:6px;margin-left:auto}
 .local-ram{width:60px;height:28px;padding:0 6px;font-size:var(--fs-s)}
+/* iOS auto-zooms on focus when text inputs are <16px; pinning 16px keeps the
+   top nav in view. Declared last so it wins source-order ties over per-input
+   font-size rules above (e.g. #agentSystem). */
+@media (max-width:680px){
+  #input,#loginEmail,#agentSystem,.clarify-input,.browse-search{font-size:16px}
+}
