@@ -1,6 +1,16 @@
 {
   "identifier": "main",
-  "description": "Capabilities for the main window (created at runtime). The renderer talks to the local sidecar over same-origin HTTP; only core defaults are needed.",
+  "description": "Capabilities for the main window (created at runtime). The renderer is loaded from the sidecar origin (http://127.0.0.1:*), so remote URLs must be allowed for plugin commands such as the dialog folder picker.",
   "windows": ["main"],
-  "permissions": ["core:default", "core:event:default", "dialog:default"]
+  "remote": {
+    "urls": ["http://127.0.0.1:*"]
+  },
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "dialog:default",
+    "allow-app-version",
+    "allow-check-for-updates",
+    "allow-download-and-install-update"
+  ]
 }
