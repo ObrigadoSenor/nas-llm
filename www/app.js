@@ -943,6 +943,15 @@ async function openConversation(id){
   await resumeIfGenerating(id);
 }
 
+// --- Desktop bridge hook: no-reload chat navigation ---
+// desktop.js dispatches `nasllm:openConv` (detail = conversation id) to open a
+// chat without a full location.reload(), routed through openConversation so
+// the normal state/sidebar/header updates all run.
+window.addEventListener("nasllm:openConv", (e) => {
+  const id = e && e.detail ? String(e.detail) : "";
+  if (id) openConversation(id);
+});
+
 // --- Background generation ---
 
 // Load the set of conversations with active jobs (for sidebar indicators).
