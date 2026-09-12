@@ -276,3 +276,47 @@
   background: #0e1014; border: 1px solid #2a2e37; border-radius: 8px;
   margin-top: 8px;
 }
+
+/* --- Branch rail (header, desktop-only) --- */
+.ds-branch-rail {
+  background: transparent;
+  border: 1px solid #2a2e37;
+  color: #c7ccd4;
+  border-radius: 8px;
+  height: 28px;
+  margin-left: 8px;
+  padding: 0 10px;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+.ds-branch-rail:hover { background: #1b1f27; color: #e6e6e6; }
+.ds-branch-rail.hidden { display: none; }
+
+/* --- Sidebar chat rows: title + branch under it --- */
+.ds-repo-chat-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.ds-repo-chat-branch {
+  font-size: 10px; color: #6b707a;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* --- Repo session panel --- */
+#dsSessionMsg, #dsSessionPrTitle {
+  width: 100%; box-sizing: border-box;
+  background: #0e1014; border: 1px solid #2a2e37; color: #e6e6e6;
+  border-radius: 8px; padding: 8px 10px; font-size: 13px;
+}
+#dsSessionMsg:focus, #dsSessionPrTitle:focus { outline: none; border-color: #3a4150; }
+#dsSessionPrBody {
+  width: 100%; box-sizing: border-box; resize: vertical;
+  background: #0e1014; border: 1px solid #2a2e37; color: #e6e6e6;
+  border-radius: 8px; padding: 8px 10px; font-size: 13px; font-family: inherit;
+  margin-top: 8px;
+}
+#dsSessionPrBody:focus { outline: none; border-color: #3a4150; }
+.ds-pr-open { color: #8ab4f8; text-decoration: none; font-weight: 600; }
+.ds-pr-open:hover { text-decoration: underline; }
+.ds-pr-url { color: #6b707a; font-size: 11px; word-break: break-all; }
