@@ -222,6 +222,347 @@ async fn git_dirty_count(path: &Path) -> usize {
     }
 }
 
+// --- repo registry (linked + cloned repos) --------------------------------
+//
+// A persisted list of repos the desktop app knows about. Cloned (GitHub) repos
+// live under workspace_dir; linked repos are existing folders on disk the user
+// picked via the folder-picker wizard. Both are resolved by full_name so the
+// agent toolExec relay (keyed by repo.FullName) and the file-tool executor
+// share one lookup path.
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct RepoRecord {
+    full_name: String,
+    path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote: Option<String>,
+    #[serde(default)]
+    branch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    folder_id: Option<String>,
+    #[serde(default)]
+    linked: bool,
+}
+
+fn registry_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("repos.json")
+}
+
+fn load_registry(data_dir: &Path) -> Vec<RepoRecord> {
+    std::fs::read_to_string(registry_path(data_dir))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("repos").cloned())
+        .and_then(|r| serde_json::from_value::<Vec<RepoRecord>>(r).ok())
+        .unwrap_or_default()
+}
+
+fn save_registry(data_dir: &Path, repos: &[RepoRecord]) {
+    let _ = std::fs::write(
+        registry_path(data_dir),
+        serde_json::json!({ "repos": repos }).to_string(),
+    );
+}
+
+// upsert_registry inserts or updates a record by full_name, preserving an
+// existing folder_id when the record already exists.
+fn upsert_registry(data_dir: &Path, rec: &RepoRecord) {
+    let mut repos = load_registry(data_dir);
+    if let Some(existing) = repos.iter_mut().find(|r| r.full_name == rec.full_name) {
+        existing.path = rec.path.clone();
+        existing.remote = rec.remote.clone();
+        existing.branch = rec.branch.clone();
+        existing.linked = rec.linked;
+        if rec.folder_id.is_some() {
+            existing.folder_id = rec.folder_id.clone();
+        }
+    } else {
+        repos.push(rec.clone());
+    }
+    save_registry(data_dir, &repos);
+}
+
+// resolve_repo finds a repo's local root by full_name: linked/registered repos
+// first, then a cloned workspace dir. Returns None if neither exists on disk.
+fn resolve_repo(data_dir: &Path, name: &str) -> Option<PathBuf> {
+    let trimmed = name.trim();
+    for r in load_registry(data_dir) {
+        if r.full_name == trimmed && !r.path.is_empty() {
+            let p = PathBuf::from(&r.path);
+            if p.is_dir() {
+                return Some(p);
+            }
+        }
+    }
+    let ws = workspace_dir(data_dir).join(safe_name(trimmed));
+    if ws.is_dir() {
+        return Some(ws);
+    }
+    None
+}
+
+// --- git helpers: remote, ahead/behind, commit, push ----------------------
+
+async fn git_toplevel(path: &Path) -> Option<PathBuf> {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() { None } else { Some(PathBuf::from(s)) }
+        }
+        _ => None,
+    }
+}
+
+async fn git_remote_url(path: &Path) -> Option<String> {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("remote")
+        .arg("get-url")
+        .arg("origin")
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() { None } else { Some(s) }
+        }
+        _ => None,
+    }
+}
+
+async fn git_has_ref(path: &Path, reff: &str) -> bool {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("rev-parse")
+        .arg("--verify")
+        .arg(reff)
+        .output()
+        .await;
+    matches!(out, Ok(o) if o.status.success())
+}
+
+// git_rev_count returns the commit count for a rev-list range (e.g. "A..B"),
+// or 0 if git errors (e.g. the range ref does not exist).
+async fn git_rev_count(path: &Path, range: &str) -> usize {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("rev-list")
+        .arg("--count")
+        .arg(range)
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).trim().parse::<usize>().unwrap_or(0)
+        }
+        _ => 0,
+    }
+}
+
+// git_log_subjects returns up to 20 commit subjects for a rev-list range.
+async fn git_log_subjects(path: &Path, range: &str) -> Vec<String> {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("log")
+        .arg("--pretty=format:%s")
+        .arg(range)
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .take(20)
+            .map(|l| l.to_string())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+// git_commit_all stages all changes and commits with the given message.
+// token is only used to scrub any captured output. Returns an error string
+// (e.g. "nothing to commit") when the commit does not succeed.
+async fn git_commit_all(path: &Path, message: &str, token: &str) -> Result<(), String> {
+    let add = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("add")
+        .arg("-A")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("git add: {e}"))?;
+    if !add.status.success() {
+        return Err(scrub(String::from_utf8_lossy(&add.stderr).trim().to_string(), token));
+    }
+    let commit = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("commit")
+        .arg("-m")
+        .arg(message)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("git commit: {e}"))?;
+    if !commit.status.success() {
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&commit.stdout),
+            String::from_utf8_lossy(&commit.stderr)
+        );
+        return Err(scrub(combined.trim().to_string(), token));
+    }
+    Ok(())
+}
+
+// git_push pushes HEAD to origin/<branch>. For a github.com https remote, if a
+// token is available, push to a token-injected URL so a linked repo without a
+// configured credential helper still works; otherwise push via the configured
+// origin (SSH keys / credential helper). token is scrubbed from any output.
+async fn git_push(path: &Path, branch: &str, token: &str) -> Result<String, String> {
+    let remote = git_remote_url(path).await.unwrap_or_default();
+    let push_ref = format!("HEAD:{}", branch);
+    let out = if !token.is_empty() && is_github_https(&remote) {
+        match authed_clone_url(&remote, token) {
+            Ok(url) => tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .arg("push")
+                .arg(&url)
+                .arg(&push_ref)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+                .await,
+            Err(_) => tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .arg("push")
+                .arg("origin")
+                .arg(&push_ref)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+                .await,
+        }
+    } else {
+        tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .arg("push")
+            .arg("origin")
+            .arg(&push_ref)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await
+    };
+    match out {
+        Ok(o) => {
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            if o.status.success() {
+                Ok(scrub(combined.trim().to_string(), token))
+            } else {
+                Err(scrub(combined.trim().to_string(), token))
+            }
+        }
+        Err(e) => Err(format!("git push: {e}")),
+    }
+}
+
+// --- naming + changelog helpers -------------------------------------------
+
+fn is_github_https(url: &str) -> bool {
+    url.starts_with("https://") && url.contains("github.com")
+}
+
+// derive_full_name picks a backend key for a linked repo: owner/repo for a
+// github.com origin (https or SSH), else the repo root's folder basename.
+fn derive_full_name(remote: Option<&str>, root: &Path) -> String {
+    if let Some(r) = remote {
+        if let Ok(u) = url::Url::parse(r) {
+            if u.host_str() == Some("github.com") {
+                let path = u.path().trim_start_matches('/');
+                let path = path.strip_suffix(".git").unwrap_or(path).trim_end_matches('/');
+                if !path.is_empty() {
+                    return path.to_string();
+                }
+            }
+        }
+        if let Some(rest) = r.strip_prefix("git@github.com:") {
+            let path = rest.strip_suffix(".git").unwrap_or(rest).trim_end_matches('/');
+            if !path.is_empty() {
+                return path.to_string();
+            }
+        }
+    }
+    root.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "repo".to_string())
+}
+
+// today_ymd returns the current UTC date as YYYY-MM-DD, computed from the Unix
+// epoch without a calendar dependency (Howard Hinnant's civil_from_days).
+fn today_ymd() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86400);
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + if m <= 2 { 1 } else { 0 };
+    format!("{:04}-{:02}-{:02}", year, m, d)
+}
+
+// write_changelog_entry inserts a Keep-a-Changelog `## [version] - date` section
+// with the given (already-bulleted) body above the first existing version
+// section, or creates CHANGELOG.md with the standard header if absent.
+fn write_changelog_entry(root: &Path, version: &str, date: &str, body: &str) -> Result<(), String> {
+    let path = root.join("CHANGELOG.md");
+    let section = format!("## [{}] - {}\n\n{}\n\n", version, date, body);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let new_content = if let Some(idx) = existing.find("## [") {
+        let mut s = String::with_capacity(existing.len() + section.len());
+        s.push_str(&existing[..idx]);
+        s.push_str(&section);
+        s.push_str(&existing[idx..]);
+        s
+    } else if existing.trim().is_empty() {
+        format!(
+            "# Changelog\n\nAll notable changes to this project are documented in this file.\n\n{}\n",
+            section
+        )
+    } else {
+        format!("{}\n{}", existing.trim_end(), section)
+    };
+    std::fs::write(&path, new_content).map_err(|e| format!("write CHANGELOG.md: {e}"))
+}
+
 // --- response types --------------------------------------------------------
 
 #[derive(Serialize)]
@@ -251,6 +592,12 @@ struct LocalRepo {
     path: String,
     branch: String,
     dirty: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    full_name: Option<String>,
+    #[serde(default)]
+    linked: bool,
 }
 
 #[derive(Deserialize)]
@@ -338,8 +685,35 @@ async fn gh_repos(State(st): State<AppState>) -> Response {
 }
 
 async fn repos_local(State(st): State<AppState>) -> Response {
-    let ws = workspace_dir(&st.data_dir);
     let mut out: Vec<LocalRepo> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Linked/registered repos first (existing folders + cloned repos that have
+    // been recorded in the registry).
+    for r in load_registry(&st.data_dir) {
+        let path = PathBuf::from(&r.path);
+        if !path.is_dir() {
+            continue;
+        }
+        let branch = if r.branch.is_empty() {
+            git_branch(&path).await
+        } else {
+            r.branch.clone()
+        };
+        let dirty = git_dirty_count(&path).await;
+        seen.insert(r.full_name.clone());
+        out.push(LocalRepo {
+            name: r.full_name.clone(),
+            path: path.display().to_string(),
+            branch,
+            dirty,
+            remote: r.remote.clone(),
+            full_name: Some(r.full_name.clone()),
+            linked: r.linked,
+        });
+    }
+    // Cloned workspace repos not yet in the registry (e.g. cloned before this
+    // change). Scanning the workspace dir keeps backward compatibility.
+    let ws = workspace_dir(&st.data_dir);
     if let Ok(entries) = std::fs::read_dir(&ws) {
         for e in entries.flatten() {
             let path = e.path();
@@ -347,13 +721,19 @@ async fn repos_local(State(st): State<AppState>) -> Response {
                 continue;
             }
             let name = e.file_name().to_string_lossy().replace("--", "/");
+            if seen.contains(&name) {
+                continue;
+            }
             let branch = git_branch(&path).await;
             let dirty = git_dirty_count(&path).await;
             out.push(LocalRepo {
-                name,
+                name: name.clone(),
                 path: path.display().to_string(),
                 branch,
                 dirty,
+                remote: None,
+                full_name: Some(name),
+                linked: false,
             });
         }
     }
@@ -387,9 +767,21 @@ async fn repos_clone(State(st): State<AppState>, Json(body): Json<CloneBody>) ->
     let branch = git_branch(&dest).await;
     let head = git_head(&dest).await;
     let tree = top_level_tree(&dest);
-    // Push repo context to the backend so the agent loop can inject it into
-    // the system prompt for repo-bound conversations. Best-effort: a failure
-    // here (e.g. not signed in yet) doesn't fail the clone.
+    // Record the clone in the sidecar registry and push repo context to the
+    // backend so the agent loop can inject it into the system prompt for
+    // repo-bound conversations. Best-effort: a failure here (e.g. not signed
+    // in yet) doesn't fail the clone.
+    upsert_registry(
+        &st.data_dir,
+        &RepoRecord {
+            full_name: full_name.clone(),
+            path: dest.display().to_string(),
+            remote: Some(clone_url.clone()),
+            branch: branch.clone(),
+            folder_id: None,
+            linked: false,
+        },
+    );
     let _ = push_repo_context(&st, &full_name, &dest, &branch, &head, &tree).await;
     json_ok(&serde_json::json!({
         "ok": true,
@@ -402,15 +794,15 @@ async fn repos_clone(State(st): State<AppState>, Json(body): Json<CloneBody>) ->
 }
 
 async fn repos_refresh(State(st): State<AppState>, Json(body): Json<NameBody>) -> Response {
-    let token = match token_get() {
-        Some(t) => t,
-        None => return json_err("not connected to github", StatusCode::UNAUTHORIZED),
-    };
     let name = body.name.trim().to_string();
-    let dest = workspace_dir(&st.data_dir).join(safe_name(&name));
-    if !dest.is_dir() {
-        return json_err("not cloned locally", StatusCode::NOT_FOUND);
-    }
+    let dest = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_err("not found locally", StatusCode::NOT_FOUND),
+    };
+    // The token is only used to scrub captured output; pull uses the repo's
+    // configured origin (a cloned repo's origin carries the token; a linked
+    // repo uses the user's SSH keys / credential helper).
+    let token = token_get().unwrap_or_default();
     match git_pull(&dest, &token).await {
         Ok(msg) => json_ok(&serde_json::json!({ "ok": true, "output": msg })),
         Err(e) => json_err(&e, StatusCode::BAD_GATEWAY),
@@ -418,13 +810,13 @@ async fn repos_refresh(State(st): State<AppState>, Json(body): Json<NameBody>) -
 }
 
 async fn repos_open(State(st): State<AppState>, Json(body): Json<NameBody>) -> Response {
-    // Phase 2: return the local path (Phase 3 binds the repo to a conversation
-    // via the backend's repos table + conversations.repo_id).
+    // Returns the local path; the renderer binds the repo to a conversation
+    // via the backend's repos table + conversations.repo_id.
     let name = body.name.trim().to_string();
-    let dest = workspace_dir(&st.data_dir).join(safe_name(&name));
-    if !dest.is_dir() {
-        return json_err("not cloned locally", StatusCode::NOT_FOUND);
-    }
+    let dest = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_err("not found locally", StatusCode::NOT_FOUND),
+    };
     let branch = git_branch(&dest).await;
     json_ok(&serde_json::json!({ "ok": true, "name": name, "path": dest.display().to_string(), "branch": branch }))
 }
@@ -435,10 +827,10 @@ async fn repos_open(State(st): State<AppState>, Json(body): Json<NameBody>) -> R
 // user can review agent-made edits in the Working changes panel.
 async fn repos_diff(State(st): State<AppState>, Json(body): Json<NameBody>) -> Response {
     let name = body.name.trim().to_string();
-    let dest = workspace_dir(&st.data_dir).join(safe_name(&name));
-    if !dest.is_dir() {
-        return json_err("not cloned locally", StatusCode::NOT_FOUND);
-    }
+    let dest = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_err("not found locally", StatusCode::NOT_FOUND),
+    };
     let out = tokio::process::Command::new("git")
         .arg("-C").arg(&dest)
         .arg("diff").arg("HEAD")
@@ -459,10 +851,10 @@ async fn repos_diff(State(st): State<AppState>, Json(body): Json<NameBody>) -> R
 // patch without a terminal. Returns the git status after reverting.
 async fn repos_revert(State(st): State<AppState>, Json(body): Json<NameBody>) -> Response {
     let name = body.name.trim().to_string();
-    let dest = workspace_dir(&st.data_dir).join(safe_name(&name));
-    if !dest.is_dir() {
-        return json_err("not cloned locally", StatusCode::NOT_FOUND);
-    }
+    let dest = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_err("not found locally", StatusCode::NOT_FOUND),
+    };
     let _ = tokio::process::Command::new("git")
         .arg("-C").arg(&dest)
         .arg("checkout").arg("--").arg(".")
@@ -505,15 +897,15 @@ struct ExecResult {
 // observation. All tools are scoped to the repo root with path-traversal guards.
 async fn repos_exec(State(st): State<AppState>, Json(body): Json<ExecBody>) -> Response {
     let repo_name = body.repo.trim().to_string();
-    let dest = workspace_dir(&st.data_dir).join(safe_name(&repo_name));
-    if !dest.is_dir() {
-        return json_ok(&ExecResult {
-            observation: format!("Repository {repo_name} is not cloned locally."),
+    let dest = match resolve_repo(&st.data_dir, &repo_name) {
+        Some(p) => p,
+        None => return json_ok(&ExecResult {
+            observation: format!("Repository {repo_name} is not available locally."),
             preview: "repo not found".into(),
             is_error: true,
             ..Default::default()
-        });
-    }
+        }),
+    };
     let root = match std::fs::canonicalize(&dest) {
         Ok(r) => r,
         Err(e) => return json_ok(&ExecResult { observation: format!("repo dir: {e}"), preview: "error".into(), is_error: true, ..Default::default() }),
@@ -898,6 +1290,204 @@ async fn push_repo_context(st: &AppState, full_name: &str, dest: &Path, branch: 
     }
 }
 
+// --- Connect an existing local folder (folder-picker wizard) ----------------
+
+#[derive(Deserialize)]
+struct AddLocalBody {
+    path: String,
+}
+
+// repos_add_local connects an existing on-disk git repo (picked via the native
+// folder dialog) as a workspace. It resolves the repo root so a sub-folder
+// selection still works, derives a full_name from the origin remote (owner/repo
+// for github.com, else the folder basename), records it in the sidecar registry,
+// and pushes repo context to the backend so agent runs can inject it.
+async fn repos_add_local(State(st): State<AppState>, Json(body): Json<AddLocalBody>) -> Response {
+    let raw = body.path.trim().to_string();
+    if raw.is_empty() {
+        return json_err("path is required", StatusCode::BAD_REQUEST);
+    }
+    let p = PathBuf::from(&raw);
+    if !p.is_dir() {
+        return json_err("path is not a directory", StatusCode::BAD_REQUEST);
+    }
+    let root = match git_toplevel(&p).await {
+        Some(r) => r,
+        None => {
+            return json_err(
+                "not a git repository (run `git init` first, or pick the repo root)",
+                StatusCode::BAD_REQUEST,
+            )
+        }
+    };
+    let remote = git_remote_url(&root).await;
+    let full_name = derive_full_name(remote.as_deref(), &root);
+    let branch = git_branch(&root).await;
+    let head = git_head(&root).await;
+    let tree = top_level_tree(&root);
+    upsert_registry(
+        &st.data_dir,
+        &RepoRecord {
+            full_name: full_name.clone(),
+            path: root.display().to_string(),
+            remote: remote.clone(),
+            branch: branch.clone(),
+            folder_id: None,
+            linked: true,
+        },
+    );
+    // Best-effort: a failure here (e.g. not signed in yet) doesn't fail add.
+    let _ = push_repo_context(&st, &full_name, &root, &branch, &head, &tree).await;
+    json_ok(&serde_json::json!({
+        "ok": true,
+        "name": full_name,
+        "fullName": full_name,
+        "path": root.display().to_string(),
+        "branch": branch,
+        "head": head,
+        "remote": remote,
+        "tree": tree,
+    }))
+}
+
+// --- Ship changes: changelog preview + commit/push -------------------------
+
+// repos_changelog returns the repo's push state (remote, ahead/behind, unpushed
+// commit subjects) and the existing CHANGELOG.md text, so the ship wizard can
+// pre-fill and gate the Push button (Push only makes sense with a remote).
+async fn repos_changelog(State(st): State<AppState>, Json(body): Json<NameBody>) -> Response {
+    let name = body.name.trim().to_string();
+    let dest = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_err("not found locally", StatusCode::NOT_FOUND),
+    };
+    let remote = git_remote_url(&dest).await;
+    let branch = git_branch(&dest).await;
+    let upstream = format!("origin/{}", branch);
+    let (ahead, behind, unpushed) = if git_has_ref(&dest, &upstream).await {
+        (
+            git_rev_count(&dest, &format!("{}..HEAD", upstream)).await,
+            git_rev_count(&dest, &format!("HEAD..{}", upstream)).await,
+            git_log_subjects(&dest, &format!("{}..HEAD", upstream)).await,
+        )
+    } else {
+        // No upstream ref: every commit on the branch is "unpushed".
+        (
+            git_rev_count(&dest, "HEAD").await,
+            0,
+            git_log_subjects(&dest, "HEAD").await,
+        )
+    };
+    let changelog = std::fs::read_to_string(dest.join("CHANGELOG.md")).unwrap_or_default();
+    json_ok(&serde_json::json!({
+        "ok": true,
+        "remote": remote,
+        "branch": branch,
+        "ahead": ahead,
+        "behind": behind,
+        "unpushed": unpushed,
+        "changelog": changelog,
+    }))
+}
+
+#[derive(Deserialize)]
+struct ShipBody {
+    repo: String,
+    version: String,
+    changelog: String,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    push: bool,
+}
+
+// repos_ship is the "final version" action: append a Keep-a-Changelog entry to
+// CHANGELOG.md, stage all changes, commit, and optionally push. For a github.com
+// https remote with a stored token, push uses a token-injected URL so a linked
+// repo without a credential helper still works; otherwise it pushes via the
+// configured origin. The token is scrubbed from any captured output.
+async fn repos_ship(State(st): State<AppState>, Json(body): Json<ShipBody>) -> Response {
+    let name = body.repo.trim().to_string();
+    let dest = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_err("not found locally", StatusCode::NOT_FOUND),
+    };
+    let version = body.version.trim().to_string();
+    if version.is_empty() {
+        return json_err("version is required", StatusCode::BAD_REQUEST);
+    }
+    let bullets: Vec<String> = body
+        .changelog
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(|l| if l.starts_with("- ") { l.to_string() } else { format!("- {}", l) })
+        .collect();
+    if let Err(e) = write_changelog_entry(&dest, &version, &today_ymd(), &bullets.join("\n")) {
+        return json_err(&e, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    let token = token_get().unwrap_or_default();
+    let message = if body.message.trim().is_empty() {
+        format!("Release {}", version)
+    } else {
+        body.message.trim().to_string()
+    };
+    if let Err(e) = git_commit_all(&dest, &message, &token).await {
+        return json_err(&e, StatusCode::BAD_GATEWAY);
+    }
+    let mut pushed = false;
+    let mut push_err: Option<String> = None;
+    if body.push {
+        let branch = git_branch(&dest).await;
+        match git_push(&dest, &branch, &token).await {
+            Ok(_out) => pushed = true,
+            Err(e) => push_err = Some(e),
+        }
+    }
+    let head = git_head(&dest).await;
+    if let Some(e) = push_err {
+        return json_ok(&serde_json::json!({
+            "ok": true,
+            "head": head,
+            "pushed": false,
+            "remote": git_remote_url(&dest).await,
+            "error": e,
+        }));
+    }
+    json_ok(&serde_json::json!({
+        "ok": true,
+        "head": head,
+        "pushed": pushed,
+        "remote": git_remote_url(&dest).await,
+        "error": null,
+    }))
+}
+
+// --- Persist the workspace folder id for a repo ----------------------------
+
+#[derive(Deserialize)]
+struct SetFolderBody {
+    repo: String,
+    folder_id: String,
+}
+
+// repos_set_folder records the backend folder id bound to a repo's workspace,
+// so the renderer can place new chats into the workspace folder reliably.
+async fn repos_set_folder(State(st): State<AppState>, Json(body): Json<SetFolderBody>) -> Response {
+    let name = body.repo.trim().to_string();
+    if name.is_empty() {
+        return json_err("repo is required", StatusCode::BAD_REQUEST);
+    }
+    let mut repos = load_registry(&st.data_dir);
+    if let Some(r) = repos.iter_mut().find(|r| r.full_name == name) {
+        r.folder_id = if body.folder_id.is_empty() { None } else { Some(body.folder_id.clone()) };
+        save_registry(&st.data_dir, &repos);
+        json_ok(&serde_json::json!({ "ok": true }))
+    } else {
+        json_err("repo not found in registry", StatusCode::NOT_FOUND)
+    }
+}
+
 // --- router ----------------------------------------------------------------
 
 pub fn router(state: AppState) -> Router {
@@ -907,12 +1497,16 @@ pub fn router(state: AppState) -> Router {
         .route("/__sidecar/github/disconnect", post(gh_disconnect))
         .route("/__sidecar/github/repos", get(gh_repos))
         .route("/__sidecar/repos/local", get(repos_local))
+        .route("/__sidecar/repos/add-local", post(repos_add_local))
         .route("/__sidecar/repos/clone", post(repos_clone))
         .route("/__sidecar/repos/refresh", post(repos_refresh))
         .route("/__sidecar/repos/open", post(repos_open))
         .route("/__sidecar/repos/exec", post(repos_exec))
         .route("/__sidecar/repos/diff", post(repos_diff))
         .route("/__sidecar/repos/revert", post(repos_revert))
+        .route("/__sidecar/repos/changelog", post(repos_changelog))
+        .route("/__sidecar/repos/ship", post(repos_ship))
+        .route("/__sidecar/repos/set-folder", post(repos_set_folder))
         .with_state(state)
 }
 

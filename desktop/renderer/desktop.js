@@ -365,6 +365,144 @@ function renderDiff(diff) {
   return wrap;
 }
 
+// --- Tauri IPC (native folder picker) -------------------------------------
+// The only Tauri IPC in the app; everything else is same-origin HTTP to the
+// sidecar. withGlobalTauri is on, so window.__TAURI__.core.invoke is available.
+// Fall back to __TAURI_INTERNALS__.invoke (always present) just in case.
+function tauriInvoke(cmd, args) {
+  const g = (typeof window !== "undefined") ? window : null;
+  const inv = g && ((g.__TAURI__ && g.__TAURI__.core && g.__TAURI__.core.invoke) || (g.__TAURI_INTERNALS__ && g.__TAURI_INTERNALS__.invoke));
+  if (!inv) return Promise.reject(new Error("Tauri IPC is not available (running outside the desktop app?)"));
+  return inv(cmd, args || {});
+}
+
+// Open the native directory picker; returns a single absolute path or null.
+function pickFolder(title) {
+  return tauriInvoke("plugin:dialog|open", { options: { directory: true, multiple: false, title: title || "Select repository folder" } })
+    .then((res) => (Array.isArray(res) ? (res[0] || null) : (res || null)))
+    .catch(() => null);
+}
+
+// Small confirm dialog (replaces native confirm(), which the browser can block).
+function dsConfirm(message, sub) {
+  return new Promise((resolve) => {
+    let overlay = $("dsConfirmOverlay");
+    if (!overlay) {
+      overlay = el("div", "ds-overlay");
+      overlay.id = "dsConfirmOverlay";
+      overlay.setAttribute("role", "dialog");
+      overlay.setAttribute("aria-modal", "true");
+      overlay.setAttribute("aria-label", "Confirm");
+      const card = el("div", "ds-card");
+      const msg = el("div", "ds-note"); msg.id = "dsConfirmMsg";
+      card.appendChild(msg);
+      const subEl = el("div", "ds-note ds-confirm-sub"); subEl.id = "dsConfirmSub";
+      card.appendChild(subEl);
+      const row = el("div", "ds-row ds-approval-row");
+      const ok = el("button", "ds-btn ds-btn-approve", "Yes");
+      const cancel = el("button", "ds-btn ds-btn-ghost", "Cancel");
+      row.appendChild(cancel); row.appendChild(ok);
+      card.appendChild(row);
+      overlay.appendChild(card);
+      document.body.appendChild(overlay);
+      overlay._close = (v) => { overlay.classList.remove("open"); resolve(v); };
+      ok.onclick = () => overlay._close(true);
+      cancel.onclick = () => overlay._close(false);
+      overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay._close(false); });
+    }
+    $("dsConfirmMsg").textContent = message || "";
+    $("dsConfirmSub").textContent = sub || "";
+    overlay.classList.add("open");
+  });
+}
+
+// Compact date for the workspace chat list (desktop.js is its own module and
+// cannot see app.js's absTime).
+function dsTime(ts) {
+  if (!ts) return "";
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return "";
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+// Workspace data: backend repo id (by full_name) + chats attached per repo.
+// Best-effort: returns empty maps when not signed in or the backend is down.
+async function loadWorkspaceData() {
+  const repoByFullName = new Map();
+  const chatsByRepoId = new Map();
+  try {
+    const rr = await fetch("/api/repos");
+    if (rr.ok) {
+      const repos = await rr.json();
+      (repos || []).forEach((rp) => { if (rp && rp.fullName) repoByFullName.set(rp.fullName, rp); });
+    }
+  } catch {}
+  try {
+    const cr = await fetch("/api/conversations");
+    if (cr.ok) {
+      const convs = await cr.json();
+      (convs || []).forEach((c) => {
+        if (c && c.repoId) {
+          if (!chatsByRepoId.has(c.repoId)) chatsByRepoId.set(c.repoId, []);
+          chatsByRepoId.get(c.repoId).push(c);
+        }
+      });
+    }
+  } catch {}
+  return { repoByFullName, chatsByRepoId };
+}
+
+// Ensure a backend folder named `name` exists for the workspace; return its id.
+async function ensureWorkspaceFolder(name) {
+  try {
+    const fr = await fetch("/api/folders");
+    if (fr.ok) {
+      const folders = await fr.json();
+      const found = (folders || []).find((f) => f && f.name === name);
+      if (found) return found.id;
+    }
+  } catch {}
+  try {
+    const cr = await fetch("/api/folders", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
+    if (cr.ok) { const f = await cr.json(); if (f && f.id) return f.id; }
+  } catch {}
+  return "";
+}
+
+// Create a repo-bound agent chat, place it in the workspace folder, enable
+// agent mode with file tools, and navigate to it. Reused by "+ New chat".
+async function createRepoChat(r) {
+  const title = r.name + " (agent)";
+  const model = localStorage.getItem("nas-llm-model") || "";
+  const cr = await fetch("/api/conversations", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title, model }) });
+  const cj = await cr.json();
+  const convId = cj && cj.id;
+  if (!convId) throw new Error("Could not create conversation.");
+  // Re-push repo context in case the earlier push failed.
+  try { await sid("repos/open", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: r.name }) }); } catch {}
+  // Resolve the backend repo id (re-fetch so a just-connected repo is found).
+  let repoId = "";
+  try {
+    const rr = await fetch("/api/repos");
+    if (rr.ok) { const repos = await rr.json(); const found = (repos || []).find((x) => x.fullName === r.name); if (found) repoId = found.id; }
+  } catch {}
+  if (!repoId) throw new Error("Repo not registered with backend. Re-connect it.");
+  // Workspace folder so chats group in the sidebar.
+  const folderId = await ensureWorkspaceFolder(r.name);
+  const patchBody = { repoId, agentTools: "read_file,list_files,glob,grep,git_status,apply_patch,run_command,ask_user,get_time" };
+  if (folderId) patchBody.folderId = folderId;
+  try {
+    await fetch("/api/conversations/" + encodeURIComponent(convId), { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(patchBody) });
+  } catch (e) { throw new Error(String(e && e.message || e)); }
+  if (folderId) { try { await sid("repos/set-folder", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repo: r.name, folder_id: folderId }) }); } catch {} }
+  try {
+    let extras = []; try { extras = JSON.parse(localStorage.getItem("nas-llm-extras") || "[]") || []; } catch {}
+    if (!extras.includes("agent")) { extras.push("agent"); localStorage.setItem("nas-llm-extras", JSON.stringify(extras)); }
+    localStorage.setItem("nas-llm-conv", convId);
+  } catch {}
+  location.reload();
+}
+
 // --- Repos panel (GitHub + local clones) ---
 function openRepos() { $("dsReposOverlay")?.classList.add("open"); refreshGithub(); refreshLocal(); }
 function closeRepos() { $("dsReposOverlay")?.classList.remove("open"); }
@@ -390,16 +528,34 @@ function ghRow(r) {
   return row;
 }
 
-function localRow(r) {
+// hostOf returns a short badge label for a remote URL (github / gitlab / ssh / https).
+function hostOf(remote) {
+  if (!remote) return "";
+  if (/github\.com/.test(remote)) return "github";
+  if (/gitlab\.com/.test(remote)) return "gitlab";
+  if (remote.startsWith("git@") || remote.startsWith("ssh://")) return "ssh";
+  if (remote.startsWith("https://")) return "https";
+  return "";
+}
+
+// localRow renders one connected repo as a workspace: the repo row (name,
+// badges, Pull/Ship/+ New chat) plus the list of chats attached to it.
+function localRow(r, chats) {
+  const wrap = el("div", "ds-repo-wrap");
   const row = el("div", "ds-repo-row");
   const main = el("div", "ds-repo-main");
   const name = el("div", "ds-repo-name", r.name);
   const dirtyBadge = r.dirty > 0 ? el("span", "ds-badge ds-badge-dirty", r.dirty + " dirty") : el("span", "ds-badge ds-badge-clean", "clean");
   name.appendChild(dirtyBadge);
+  if (r.linked) name.appendChild(el("span", "ds-badge ds-badge-linked", "linked"));
+  else name.appendChild(el("span", "ds-badge ds-badge-cloned", "cloned"));
+  const host = hostOf(r.remote);
+  if (host) name.appendChild(el("span", "ds-badge ds-badge-remote", host));
   main.appendChild(name);
   const meta = el("div", "ds-repo-meta", r.branch);
   main.appendChild(meta);
   row.appendChild(main);
+
   const refresh = el("button", "ds-btn ds-btn-ghost ds-btn-sm", "Pull");
   refresh.onclick = async () => {
     refresh.disabled = true; refresh.textContent = "Pulling…";
@@ -410,51 +566,40 @@ function localRow(r) {
     refreshLocal();
   };
   row.appendChild(refresh);
-  // "New agent for this repo": create a conversation, bind the repo, enable
-  // agent mode with file tools, and reload into it. Phase 3 wires this to the
-  // backend's toolExec relay so the agent can read/grep the codebase.
-  const agent = el("button", "ds-btn ds-btn-sm", "New agent");
+
+  const ship = el("button", "ds-btn ds-btn-ghost ds-btn-sm", "Ship");
+  ship.title = "Review changes, write a changelog, and commit/push a version";
+  ship.onclick = () => openShipChanges(r);
+  row.appendChild(ship);
+
+  const agent = el("button", "ds-btn ds-btn-sm", "+ New chat");
   agent.onclick = async () => {
     agent.disabled = true; agent.textContent = "Creating…";
-    // 1. Create the conversation.
-    let convId = null;
-    try {
-      const title = r.name + " (agent)";
-      const model = localStorage.getItem("nas-llm-model") || "";
-      const cr = await fetch("/api/conversations", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title, model }) });
-      const cj = await cr.json();
-      convId = cj.id;
-    } catch (e) { flashDsErr(String(e && e.message || e)); agent.disabled = false; agent.textContent = "New agent"; return; }
-    if (!convId) { flashDsErr("Could not create conversation."); agent.disabled = false; agent.textContent = "New agent"; return; }
-    // 2. Bind the repo (PATCH repoId) and set agent tools to include file tools.
-    //    The repo must be registered with the backend (POST /api/repos, done on
-    //    clone by the sidecar). Re-push here in case the push failed earlier.
-    try {
-      await sid("repos/open", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: r.name }) });
-    } catch {}
-    // Find the repo ID from the backend's repo list.
-    let repoId = "";
-    try {
-      const rr = await fetch("/api/repos");
-      if (rr.ok) { const repos = await rr.json(); const found = (repos || []).find(x => x.fullName === r.name); if (found) repoId = found.id; }
-    } catch {}
-    if (!repoId) { flashDsErr("Repo not registered with backend. Try re-cloning."); agent.disabled = false; agent.textContent = "New agent"; return; }
-    try {
-      await fetch("/api/conversations/" + encodeURIComponent(convId), {
-        method: "PATCH", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ repoId, agentTools: "read_file,list_files,glob,grep,git_status,apply_patch,run_command,ask_user,get_time" })
-      });
-    } catch (e) { flashDsErr(String(e && e.message || e)); agent.disabled = false; agent.textContent = "New agent"; return; }
-    // 3. Enable agent mode and navigate to the new conversation.
-    try {
-      let extras = []; try { extras = JSON.parse(localStorage.getItem("nas-llm-extras") || "[]") || []; } catch {}
-      if (!extras.includes("agent")) { extras.push("agent"); localStorage.setItem("nas-llm-extras", JSON.stringify(extras)); }
-      localStorage.setItem("nas-llm-conv", convId);
-    } catch {}
-    location.reload();
+    try { await createRepoChat(r); }
+    catch (e) { flashDsErr(String(e && e.message || e)); agent.disabled = false; agent.textContent = "+ New chat"; }
   };
   row.appendChild(agent);
-  return row;
+  wrap.appendChild(row);
+
+  // Attached chats (the workspace).
+  const chatsEl = el("div", "ds-repo-chats");
+  if (chats && chats.length) {
+    const head = el("div", "ds-repo-chats-head", chats.length + " chat" + (chats.length === 1 ? "" : "s"));
+    chatsEl.appendChild(head);
+    chats.forEach((c) => {
+      const cr = el("div", "ds-repo-chat");
+      const t = el("span", "ds-repo-chat-title", c.title || "New chat");
+      cr.appendChild(t);
+      const tm = el("span", "ds-repo-chat-time", dsTime(c.updatedAt));
+      cr.appendChild(tm);
+      cr.onclick = () => { try { localStorage.setItem("nas-llm-conv", c.id); } catch {} location.reload(); };
+      chatsEl.appendChild(cr);
+    });
+  } else {
+    chatsEl.appendChild(el("div", "ds-note", "No chats yet. Click + New chat to start one against this repo."));
+  }
+  wrap.appendChild(chatsEl);
+  return wrap;
 }
 
 async function refreshGithub() {
@@ -490,11 +635,18 @@ async function refreshGithub() {
 
 async function refreshLocal() {
   const body = $("dsLocalBody"); if (!body) return;
+  body.innerHTML = "";
+  body.appendChild(el("div", "ds-note", "Loading…"));
   const res = await sid("repos/local");
+  const { repoByFullName, chatsByRepoId } = await loadWorkspaceData();
   body.innerHTML = "";
   if (res.ok && Array.isArray(res.data)) {
-    if (!res.data.length) { body.appendChild(el("div", "ds-note", "No local clones yet. Connect GitHub and clone a repo above.")); return; }
-    res.data.forEach(r => body.appendChild(localRow(r)));
+    if (!res.data.length) { body.appendChild(el("div", "ds-note", "No local repos yet. Click “Connect folder” to add an existing repo, or connect GitHub and clone one above.")); return; }
+    res.data.forEach((r) => {
+      const rp = repoByFullName.get(r.name || (r.full_name || ""));
+      const chats = rp ? (chatsByRepoId.get(rp.id) || []) : [];
+      body.appendChild(localRow(r, chats));
+    });
   } else {
     body.appendChild(el("div", "ds-note", "Could not load local repos."));
   }
@@ -555,14 +707,28 @@ function buildReposOverlay() {
   const ghBody = el("div", null); ghBody.id = "dsGhBody";
   listWrap.appendChild(ghBody);
   card.appendChild(listWrap);
-  // Local clones + working changes
+  // Local clones + working changes + connect-folder wizard
   const localHead = el("div", "ds-label", "Local clones");
+  const connectFolderBtn = el("button", "ds-btn ds-btn-sm", "Connect folder");
+  connectFolderBtn.title = "Connect an existing folder on this computer as a repo";
   const changesBtn = el("button", "ds-btn ds-btn-ghost ds-btn-sm", "Working changes");
+  localHead.appendChild(connectFolderBtn);
   localHead.appendChild(changesBtn);
   card.appendChild(localHead);
   const localBody = el("div", null); localBody.id = "dsLocalBody";
   card.appendChild(localBody);
   changesBtn.onclick = () => openWorkingChanges();
+  connectFolderBtn.onclick = async () => {
+    connectFolderBtn.disabled = true;
+    const path = await pickFolder("Select a repository folder");
+    if (!path) { connectFolderBtn.disabled = false; return; }
+    connectFolderBtn.disabled = true; connectFolderBtn.textContent = "Adding…";
+    const r = await sid("repos/add-local", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path }) });
+    connectFolderBtn.disabled = false; connectFolderBtn.textContent = "Connect folder";
+    const d = (r && r.data) || {};
+    if (d.ok) refreshLocal();
+    else flashDsErr(d.error || r.status || "Could not connect folder");
+  };
   // Error line
   const err = el("div", "ds-note hidden"); err.id = "dsReposErr";
   card.appendChild(err);
@@ -646,6 +812,110 @@ async function refreshWorkingChanges() {
     } else {
       diffWrap.appendChild(el("div", "ds-note", "No uncommitted changes."));
     }
+  }
+}
+
+// --- Ship changes wizard (review diff, write changelog, commit/push) -------
+// openShipChanges builds the dialog once and reuses it; loadShipChanges fills
+// it with the repo's push state, the current diff, and a changelog pre-fill.
+function openShipChanges(r) {
+  let overlay = $("dsShipOverlay");
+  if (!overlay) {
+    overlay = el("div", "ds-overlay");
+    overlay.id = "dsShipOverlay";
+    overlay.setAttribute("role", "dialog");
+    overlay.setAttribute("aria-modal", "true");
+    overlay.setAttribute("aria-label", "Ship changes");
+    const card = el("div", "ds-card ds-card-wide");
+    const head = el("div", "ds-head");
+    head.appendChild(el("h2", null, "Ship changes"));
+    const x = el("button", "ds-x"); x.textContent = "×"; x.title = "Close"; x.setAttribute("aria-label", "Close");
+    x.onclick = () => overlay.classList.remove("open");
+    head.appendChild(x);
+    card.appendChild(head);
+    const status = el("div", "ds-note"); status.id = "dsShipStatus";
+    card.appendChild(status);
+    const diffWrap = el("div", "ds-approval-pre-wrap"); diffWrap.id = "dsShipDiff";
+    card.appendChild(diffWrap);
+    card.appendChild(el("div", "ds-label", "Version"));
+    const versionInput = document.createElement("input"); versionInput.id = "dsShipVersion"; versionInput.type = "text"; versionInput.placeholder = "0.2.0";
+    card.appendChild(versionInput);
+    card.appendChild(el("div", "ds-label", "Changelog"));
+    const clArea = document.createElement("textarea"); clArea.id = "dsShipChangelog"; clArea.rows = 5; clArea.placeholder = "What changed in this version (one bullet per line).";
+    card.appendChild(clArea);
+    card.appendChild(el("div", "ds-label", "Commit message"));
+    const msgInput = document.createElement("input"); msgInput.id = "dsShipMessage"; msgInput.type = "text"; msgInput.placeholder = "Release 0.2.0";
+    card.appendChild(msgInput);
+    const row = el("div", "ds-row ds-approval-row");
+    const commitBtn = el("button", "ds-btn", "Commit");
+    const pushBtn = el("button", "ds-btn ds-btn-approve", "Commit & push");
+    row.appendChild(commitBtn); row.appendChild(pushBtn);
+    card.appendChild(row);
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.classList.remove("open"); });
+    overlay._commit = (push) => shipCommit(r, push);
+    commitBtn.onclick = () => overlay._commit(false);
+    pushBtn.onclick = () => overlay._commit(true);
+  } else {
+    overlay._commit = (push) => shipCommit(r, push);
+  }
+  overlay.classList.add("open");
+  loadShipChanges(r);
+}
+
+async function loadShipChanges(r) {
+  const status = $("dsShipStatus");
+  const diffWrap = $("dsShipDiff");
+  if (status) status.textContent = "Loading repo state…";
+  if (diffWrap) diffWrap.innerHTML = "";
+  const cl = await sid("repos/changelog", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: r.name }) });
+  const cd = (cl && cl.data) || {};
+  const dr = await sid("repos/diff", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: r.name }) });
+  const dd = (dr && dr.data) || {};
+  if (status) {
+    const remoteTxt = cd.remote ? cd.remote : "no remote";
+    status.textContent = "branch " + (cd.branch || r.branch || "?") + " · " + (cd.ahead || 0) + " ahead · " + (cd.behind || 0) + " behind · remote: " + remoteTxt;
+  }
+  if (diffWrap) {
+    if (dd.diff && dd.diff.trim()) renderApprovalContent(diffWrap, "apply_patch", dd.diff);
+    else diffWrap.appendChild(el("div", "ds-note", "No uncommitted changes to ship."));
+  }
+  const clArea = $("dsShipChangelog");
+  if (clArea && clArea._prefilled !== true) {
+    let prefill = "";
+    if (cd.changelog && cd.changelog.trim()) prefill = cd.changelog.trim();
+    else if (Array.isArray(cd.unpushed) && cd.unpushed.length) prefill = cd.unpushed.map((s) => "- " + s).join("\n");
+    clArea.value = prefill;
+    clArea._prefilled = true;
+  }
+  const overlay = $("dsShipOverlay");
+  const pBtn = overlay && overlay.querySelector(".ds-btn-approve");
+  if (pBtn) {
+    if (!cd.remote) { pBtn.disabled = true; pBtn.title = "No remote configured for this repo."; }
+    else { pBtn.disabled = false; pBtn.title = ""; }
+  }
+}
+
+async function shipCommit(r, push) {
+  const status = $("dsShipStatus");
+  const version = ($("dsShipVersion") && $("dsShipVersion").value.trim()) || "";
+  const changelog = ($("dsShipChangelog") && $("dsShipChangelog").value) || "";
+  const message = ($("dsShipMessage") && $("dsShipMessage").value.trim()) || "";
+  if (!version) { if (status) status.textContent = "Enter a version (e.g. 0.2.0)."; return; }
+  if (push) {
+    const ok = await dsConfirm("Push to the remote?", "This commits the staged changes and pushes " + r.name + " to its origin.");
+    if (!ok) return;
+  }
+  if (status) status.textContent = push ? "Committing and pushing…" : "Committing…";
+  const res = await sid("repos/ship", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repo: r.name, version, changelog, message, push }) });
+  const d = (res && res.data) || {};
+  if (d.ok) {
+    const head = (d.head || "").slice(0, 7);
+    if (status) status.textContent = push ? (d.pushed ? "Pushed ✓ (head " + head + ")" : ("Committed, but push failed: " + (d.error || "unknown"))) : "Committed ✓ (head " + head + ")";
+    refreshLocal();
+  } else {
+    if (status) status.textContent = "Failed: " + (d.error || res.status || "unknown");
   }
 }
 
