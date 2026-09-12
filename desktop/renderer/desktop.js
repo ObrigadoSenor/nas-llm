@@ -204,6 +204,162 @@ function fillOverlay() {
   if (a) a.textContent = state.authed ? ("Signed in as " + (state.email || "?")) : "Not signed in.";
 }
 
+// --- Repos panel (GitHub + local clones) ---
+function openRepos() { $("dsReposOverlay")?.classList.add("open"); refreshGithub(); refreshLocal(); }
+function closeRepos() { $("dsReposOverlay")?.classList.remove("open"); }
+
+function ghRow(r) {
+  const row = el("div", "ds-repo-row");
+  const main = el("div", "ds-repo-main");
+  const name = el("div", "ds-repo-name", r.full_name);
+  if (r.private) { const badge = el("span", "ds-badge ds-badge-priv", "private"); name.appendChild(badge); }
+  main.appendChild(name);
+  const meta = el("div", "ds-repo-meta", (r.default_branch || "main") + " · updated " + (r.updated_at || "?").slice(0, 10));
+  main.appendChild(meta);
+  row.appendChild(main);
+  const clone = el("button", "ds-btn ds-btn-sm", "Clone");
+  clone.onclick = async () => {
+    clone.disabled = true; clone.textContent = "Cloning…";
+    const res = await sid("repos/clone", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ full_name: r.full_name, clone_url: r.clone_url }) });
+    const d = (res && res.data) || {};
+    if (d.ok) { clone.textContent = "Cloned ✓"; refreshLocal(); }
+    else { clone.disabled = false; clone.textContent = "Clone"; flashDsErr(d.error || res.status); }
+  };
+  row.appendChild(clone);
+  return row;
+}
+
+function localRow(r) {
+  const row = el("div", "ds-repo-row");
+  const main = el("div", "ds-repo-main");
+  const name = el("div", "ds-repo-name", r.name);
+  const dirtyBadge = r.dirty > 0 ? el("span", "ds-badge ds-badge-dirty", r.dirty + " dirty") : el("span", "ds-badge ds-badge-clean", "clean");
+  name.appendChild(dirtyBadge);
+  main.appendChild(name);
+  const meta = el("div", "ds-repo-meta", r.branch);
+  main.appendChild(meta);
+  row.appendChild(main);
+  const refresh = el("button", "ds-btn ds-btn-ghost ds-btn-sm", "Pull");
+  refresh.onclick = async () => {
+    refresh.disabled = true; refresh.textContent = "Pulling…";
+    const res = await sid("repos/refresh", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: r.name }) });
+    refresh.disabled = false; refresh.textContent = "Pull";
+    const d = (res && res.data) || {};
+    if (!d.ok) flashDsErr(d.error || res.status);
+    refreshLocal();
+  };
+  row.appendChild(refresh);
+  return row;
+}
+
+async function refreshGithub() {
+  const body = $("dsGhBody"); if (!body) return;
+  const out = $("dsGhStatus");
+  const res = await sid("github/status"); const d = (res && res.data) || {};
+  const connectWrap = $("dsGhConnect");
+  const listWrap = $("dsGhList");
+  if (d.connected) {
+    if (out) out.textContent = "Connected as " + (d.login || "?");
+    if (connectWrap) connectWrap.classList.add("hidden");
+    if (listWrap) listWrap.classList.remove("hidden");
+    const rr = await sid("github/repos");
+    body.innerHTML = "";
+    if (rr.ok && Array.isArray(rr.data)) {
+      if (!rr.data.length) body.appendChild(el("div", "ds-note", "No repositories found."));
+      rr.data.forEach(r => body.appendChild(ghRow(r)));
+    } else {
+      body.appendChild(el("div", "ds-note", "Could not load repos: " + ((rr.data && rr.data.error) || rr.status)));
+    }
+  } else {
+    if (out) out.textContent = "Not connected.";
+    if (connectWrap) connectWrap.classList.remove("hidden");
+    if (listWrap) listWrap.classList.add("hidden");
+  }
+}
+
+async function refreshLocal() {
+  const body = $("dsLocalBody"); if (!body) return;
+  const res = await sid("repos/local");
+  body.innerHTML = "";
+  if (res.ok && Array.isArray(res.data)) {
+    if (!res.data.length) { body.appendChild(el("div", "ds-note", "No local clones yet. Connect GitHub and clone a repo above.")); return; }
+    res.data.forEach(r => body.appendChild(localRow(r)));
+  } else {
+    body.appendChild(el("div", "ds-note", "Could not load local repos."));
+  }
+}
+
+function flashDsErr(msg) {
+  const e = $("dsReposErr"); if (e) { e.textContent = String(msg || "error"); e.classList.remove("hidden"); setTimeout(() => e.classList.add("hidden"), 4000); }
+}
+
+function buildReposOverlay() {
+  if ($("dsReposOverlay")) return;
+  const overlay = el("div", "ds-overlay");
+  overlay.id = "dsReposOverlay";
+  overlay.setAttribute("role", "dialog");
+  overlay.setAttribute("aria-modal", "true");
+  overlay.setAttribute("aria-label", "Repositories");
+  const card = el("div", "ds-card ds-card-wide");
+  const head = el("div", "ds-head");
+  head.appendChild(el("h2", null, "Repositories"));
+  const x = el("button", "ds-x"); x.textContent = "×"; x.title = "Close"; x.setAttribute("aria-label", "Close");
+  x.onclick = closeRepos;
+  head.appendChild(x);
+  card.appendChild(head);
+  // GitHub connect
+  const connectWrap = el("div", null); connectWrap.id = "dsGhConnect";
+  connectWrap.appendChild(el("div", "ds-label", "GitHub"));
+  connectWrap.appendChild(el("div", "ds-note", "Paste a Personal Access Token (with repo read). It is stored in the macOS Keychain, never on disk or sent to the NAS."));
+  const tokRow = el("div", "ds-row");
+  const tokInput = document.createElement("input");
+  tokInput.id = "dsGhToken"; tokInput.type = "password"; tokInput.placeholder = "ghp_…";
+  const connectBtn = el("button", "ds-btn", "Connect");
+  tokRow.appendChild(tokInput); tokRow.appendChild(connectBtn);
+  connectWrap.appendChild(tokRow);
+  const ghStatus = el("div", "ds-note"); ghStatus.id = "dsGhStatus";
+  connectWrap.appendChild(ghStatus);
+  card.appendChild(connectWrap);
+  // GitHub repo list
+  const listWrap = el("div", "hidden"); listWrap.id = "dsGhList";
+  const ghHead = el("div", "ds-label", "Your GitHub repos");
+  const discBtn = el("button", "ds-btn ds-btn-ghost ds-btn-sm", "Disconnect");
+  ghHead.appendChild(discBtn);
+  listWrap.appendChild(ghHead);
+  const ghBody = el("div", null); ghBody.id = "dsGhBody";
+  listWrap.appendChild(ghBody);
+  card.appendChild(listWrap);
+  // Local clones
+  card.appendChild(el("div", "ds-label", "Local clones"));
+  const localBody = el("div", null); localBody.id = "dsLocalBody";
+  card.appendChild(localBody);
+  // Error line
+  const err = el("div", "ds-note hidden"); err.id = "dsReposErr";
+  card.appendChild(err);
+  overlay.appendChild(card);
+  document.body.appendChild(overlay);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) closeRepos(); });
+  connectBtn.onclick = async () => {
+    const token = tokInput.value.trim();
+    if (!token) { ghStatus.textContent = "Paste a token."; return; }
+    connectBtn.disabled = true; ghStatus.textContent = "Connecting…";
+    const r = await sid("github/connect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token }) });
+    connectBtn.disabled = false;
+    const d = (r && r.data) || {};
+    if (d.ok) { tokInput.value = ""; refreshGithub(); }
+    else ghStatus.textContent = "Failed: " + (d.error || r.status);
+  };
+  discBtn.onclick = async () => { await sid("github/disconnect", { method: "POST" }); refreshGithub(); };
+}
+
+function makeReposBtn() {
+  const btn = el("button", "ds-repos-btn");
+  btn.title = "Repositories"; btn.setAttribute("aria-label", "Repositories");
+  btn.textContent = " Repos";
+  btn.onclick = (e) => { e.stopPropagation(); openRepos(); };
+  return btn;
+}
+
 function makeGear() {
   const btn = el("button", "ds-gear");
   btn.title = "Desktop settings"; btn.setAttribute("aria-label", "Desktop settings");
@@ -220,6 +376,7 @@ function addSettingsButton() {
   const app = $("app");
   const appVisible = !!app && !app.classList.contains("hidden");
   const header = document.querySelector("#app header");
+  // Gear (settings)
   const headerGear = header ? header.querySelector(".ds-gear") : null;
   if (appVisible && header && !headerGear) {
     const gear = makeGear();
@@ -235,6 +392,15 @@ function addSettingsButton() {
     document.body.appendChild(fixed);
   } else if (appVisible && fixed) {
     fixed.remove();
+  }
+  // Repos button (header only — repos require auth + backend)
+  const headerRepos = header ? header.querySelector(".ds-repos-btn") : null;
+  if (appVisible && header && !headerRepos) {
+    const reposBtn = makeReposBtn();
+    const sel = header.querySelector(".model-select");
+    if (sel) header.insertBefore(reposBtn, sel); else header.appendChild(reposBtn);
+  } else if (!appVisible && headerRepos) {
+    headerRepos.remove();
   }
 }
 
@@ -288,6 +454,7 @@ async function bootDesktop() {
   try { justReloaded = sessionStorage.getItem("nasllm-ollama-reloaded") === "1"; sessionStorage.removeItem("nasllm-ollama-reloaded"); } catch {}
   await refreshState();
   buildOverlay();
+  buildReposOverlay();
   fillOverlay();
   addSettingsButton();
   hookLogin();

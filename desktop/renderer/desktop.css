@@ -85,3 +85,46 @@
 .ds-sep::before, .ds-sep::after {
   content: ""; flex: 1; height: 1px; background: #2a2e37;
 }
+
+/* --- Repos panel (Phase 2) --- */
+
+/* Repos button in the header (next to the gear). */
+.ds-repos-btn {
+  background: transparent;
+  border: 1px solid #2a2e37;
+  color: #c7ccd4;
+  border-radius: 8px;
+  height: 30px;
+  margin-right: 8px;
+  padding: 0 10px;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+.ds-repos-btn:hover { background: #1b1f27; }
+
+/* Wider card for the repos list. */
+.ds-card-wide { width: 660px; }
+
+/* Repo rows (GitHub + local). */
+.ds-repo-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid #1a1d24;
+}
+.ds-repo-row:last-child { border-bottom: 0; }
+.ds-repo-main { flex: 1; min-width: 0; }
+.ds-repo-name { font-size: 13px; color: #e6e6e6; display: flex; align-items: center; gap: 6px; }
+.ds-repo-meta { font-size: 11px; color: #6b707a; margin-top: 2px; }
+
+/* Small inline badges on repo rows. */
+.ds-badge {
+  font-size: 10px; padding: 1px 6px; border-radius: 4px;
+  text-transform: uppercase; letter-spacing: .03em; font-weight: 600;
+}
+.ds-badge-priv { background: #3b2a1a; color: #e8a060; }
+.ds-badge-dirty { background: #3b221f; color: #e87060; }
+.ds-badge-clean { background: #1a2b22; color: #60c890; }
+
+/* Small button variant for row actions. */
+.ds-btn-sm { padding: 5px 10px; font-size: 12px; }

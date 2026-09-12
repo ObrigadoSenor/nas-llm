@@ -9,6 +9,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod github;
 mod sidecar;
 
 use std::path::PathBuf;
@@ -64,7 +65,9 @@ fn main() {
         .manage(state.clone())
         .setup(move |app| {
             // Run the sidecar HTTP server on the Tauri async runtime (tokio).
-            let router = sidecar::router(state.clone());
+            // Merge the core sidecar router with the GitHub/repos router so all
+            // /__sidecar/* routes are served from one axum app.
+            let router = sidecar::router(state.clone()).merge(github::router(state.clone()));
             let origin_for_log = origin.clone();
             tauri::async_runtime::spawn(async move {
                 // from_std needs an active Tokio 1.x runtime, which exists
