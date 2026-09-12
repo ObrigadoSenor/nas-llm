@@ -466,11 +466,112 @@ function tauriListen(event, cb) {
   return Promise.resolve(listen(event, (e) => cb(e && e.payload))).then((un) => (typeof un === "function" ? un : (() => {})));
 }
 
-// Open the native directory picker; returns a single absolute path or null.
+// Open the native directory picker; returns a single absolute path, or null
+// if the user cancelled. Unlike the previous version, this does NOT swallow a
+// real IPC failure — callers must handle rejection so a broken picker call
+// surfaces an error instead of silently doing nothing (which is exactly what
+// made "Connect folder" look like it was doing nothing at all).
 function pickFolder(title) {
   return tauriInvoke("plugin:dialog|open", { options: { directory: true, multiple: false, title: title || "Select repository folder" } })
-    .then((res) => (Array.isArray(res) ? (res[0] || null) : (res || null)))
-    .catch(() => null);
+    .then((res) => (Array.isArray(res) ? (res[0] || null) : (res || null)));
+}
+
+// addLocalRepo POSTs a single resolved repo path to the sidecar. Reports
+// failure via flashDsErr (a page-level toast, visible regardless of which
+// overlay — if any — triggered the connect). Returns true on success.
+async function addLocalRepo(path) {
+  const r = await sid("repos/add-local", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path }) });
+  const d = (r && r.data) || {};
+  if (d.ok) return true;
+  flashDsErr(d.error || r.status || "Could not connect that folder.");
+  return false;
+}
+
+// showConnectPicker renders a checklist of git repos found inside a picked
+// parent folder (e.g. a projects directory) and lets the user choose which
+// ones to connect. Returns a Promise<boolean> — true if at least one repo was
+// connected successfully.
+function showConnectPicker(candidates) {
+  return new Promise((resolve) => {
+    let overlay = $("dsConnectOverlay");
+    let list, addBtn;
+    if (!overlay) {
+      overlay = el("div", "ds-overlay");
+      overlay.id = "dsConnectOverlay";
+      overlay.setAttribute("role", "dialog");
+      overlay.setAttribute("aria-modal", "true");
+      overlay.setAttribute("aria-label", "Connect repositories");
+      const card = el("div", "ds-card");
+      const head = el("div", "ds-head");
+      head.appendChild(el("h2", null, "Connect repositories"));
+      const x = el("button", "ds-x"); x.textContent = "×"; x.title = "Cancel"; x.setAttribute("aria-label", "Cancel");
+      head.appendChild(x);
+      card.appendChild(head);
+      card.appendChild(el("div", "ds-note", "Found multiple git repositories in that folder. Choose which ones to connect."));
+      list = el("div", "ds-connect-list"); list.id = "dsConnectList";
+      card.appendChild(list);
+      const row = el("div", "ds-row ds-approval-row");
+      addBtn = el("button", "ds-btn", "Add selected"); addBtn.id = "dsConnectAddBtn";
+      row.appendChild(addBtn);
+      card.appendChild(row);
+      overlay.appendChild(card);
+      document.body.appendChild(overlay);
+      x.onclick = () => overlay._close(false);
+      overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay._close(false); });
+    } else {
+      list = $("dsConnectList");
+      addBtn = $("dsConnectAddBtn");
+    }
+    overlay._close = (v) => { overlay.classList.remove("open"); resolve(v); };
+    list.innerHTML = "";
+    candidates.forEach((c) => {
+      const row = el("label", "ds-connect-item");
+      const cb = document.createElement("input"); cb.type = "checkbox"; cb.checked = true; cb.value = c.path;
+      const txt = el("span", "ds-connect-item-name", c.name);
+      row.appendChild(cb); row.appendChild(txt);
+      list.appendChild(row);
+    });
+    addBtn.disabled = false; addBtn.textContent = "Add selected";
+    addBtn.onclick = async () => {
+      const checked = [...list.querySelectorAll("input[type=checkbox]:checked")].map((cb) => cb.value);
+      if (!checked.length) { overlay._close(false); return; }
+      addBtn.disabled = true; addBtn.textContent = "Adding…";
+      let any = false;
+      for (const path of checked) { if (await addLocalRepo(path)) any = true; }
+      overlay._close(any);
+    };
+    overlay.classList.add("open");
+  });
+}
+
+// connectFolderFlow is the single entry point for "connect a local repo":
+// native folder pick -> scan for candidate repos -> add one directly or let
+// the user choose from several. Returns true if at least one repo was
+// connected; false on cancellation, an empty scan, or a failure — all
+// failures are surfaced via flashDsErr so the picker never again looks like
+// it silently did nothing.
+async function connectFolderFlow() {
+  let path;
+  try {
+    path = await pickFolder("Select a repository folder");
+  } catch (e) {
+    flashDsErr("Could not open the folder picker: " + String((e && e.message) || e));
+    return false;
+  }
+  if (!path) return false; // user cancelled — no error, no-op
+  let repos;
+  try {
+    const r = await sid("repos/scan-local", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path }) });
+    const d = (r && r.data) || {};
+    if (!r.ok) { flashDsErr(d.error || r.status || "Could not scan that folder."); return false; }
+    repos = d.repos || [];
+  } catch (e) {
+    flashDsErr("Could not scan that folder: " + String((e && e.message) || e));
+    return false;
+  }
+  if (!repos.length) { flashDsErr("No git repositories found in that folder."); return false; }
+  if (repos.length === 1) return addLocalRepo(repos[0].path);
+  return showConnectPicker(repos);
 }
 
 // Small confirm dialog (replaces native confirm(), which the browser can block).
@@ -593,8 +694,8 @@ async function createRepoChat(r) {
   location.reload();
 }
 
-// --- Repos panel (GitHub + local clones) ---
-function openRepos() { $("dsReposOverlay")?.classList.add("open"); refreshGithub(); refreshLocal(); }
+// --- Repos panel (GitHub connect/browse/clone; local repos live in the sidebar) ---
+function openRepos() { $("dsReposOverlay")?.classList.add("open"); refreshGithub(); }
 function closeRepos() { $("dsReposOverlay")?.classList.remove("open"); }
 
 function ghRow(r) {
@@ -731,7 +832,7 @@ async function refreshLocal() {
   const { repoByFullName, chatsByRepoId } = await loadWorkspaceData();
   body.innerHTML = "";
   if (res.ok && Array.isArray(res.data)) {
-    if (!res.data.length) { body.appendChild(el("div", "ds-note", "No local repos yet. Click “Connect folder” to add an existing repo, or connect GitHub and clone one above.")); return; }
+    if (!res.data.length) { body.appendChild(el("div", "ds-note", "No repos connected yet. Click “+” above to connect a local folder, or use the GitHub button in the header to clone one.")); return; }
     res.data.forEach((r) => {
       const rp = repoByFullName.get(r.name || (r.full_name || ""));
       const chats = rp ? (chatsByRepoId.get(rp.id) || []) : [];
@@ -742,8 +843,21 @@ async function refreshLocal() {
   }
 }
 
+// flashDsErr shows a page-level toast, independent of any overlay's open
+// state — errors from the sidebar's connect/pull/ship actions (which don't
+// open the Repositories modal) need to be visible too, not silently written
+// into a hidden element.
 function flashDsErr(msg) {
-  const e = $("dsReposErr"); if (e) { e.textContent = String(msg || "error"); e.classList.remove("hidden"); setTimeout(() => e.classList.add("hidden"), 4000); }
+  let toast = $("dsToast");
+  if (!toast) {
+    toast = el("div", "ds-toast");
+    toast.id = "dsToast";
+    document.body.appendChild(toast);
+  }
+  toast.textContent = String(msg || "Something went wrong.");
+  toast.classList.add("show");
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => toast.classList.remove("show"), 4500);
 }
 
 function buildReposOverlay() {
@@ -752,10 +866,10 @@ function buildReposOverlay() {
   overlay.id = "dsReposOverlay";
   overlay.setAttribute("role", "dialog");
   overlay.setAttribute("aria-modal", "true");
-  overlay.setAttribute("aria-label", "Repositories");
+  overlay.setAttribute("aria-label", "GitHub");
   const card = el("div", "ds-card ds-card-wide");
   const head = el("div", "ds-head");
-  head.appendChild(el("h2", null, "Repositories"));
+  head.appendChild(el("h2", null, "GitHub"));
   const x = el("button", "ds-x"); x.textContent = "×"; x.title = "Close"; x.setAttribute("aria-label", "Close");
   x.onclick = closeRepos;
   head.appendChild(x);
@@ -797,31 +911,6 @@ function buildReposOverlay() {
   const ghBody = el("div", null); ghBody.id = "dsGhBody";
   listWrap.appendChild(ghBody);
   card.appendChild(listWrap);
-  // Local clones + working changes + connect-folder wizard
-  const localHead = el("div", "ds-label", "Local clones");
-  const connectFolderBtn = el("button", "ds-btn ds-btn-sm", "Connect folder");
-  connectFolderBtn.title = "Connect an existing folder on this computer as a repo";
-  const changesBtn = el("button", "ds-btn ds-btn-ghost ds-btn-sm", "Working changes");
-  localHead.appendChild(connectFolderBtn);
-  localHead.appendChild(changesBtn);
-  card.appendChild(localHead);
-  const localBody = el("div", null); localBody.id = "dsLocalBody";
-  card.appendChild(localBody);
-  changesBtn.onclick = () => openWorkingChanges();
-  connectFolderBtn.onclick = async () => {
-    connectFolderBtn.disabled = true;
-    const path = await pickFolder("Select a repository folder");
-    if (!path) { connectFolderBtn.disabled = false; return; }
-    connectFolderBtn.disabled = true; connectFolderBtn.textContent = "Adding…";
-    const r = await sid("repos/add-local", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path }) });
-    connectFolderBtn.disabled = false; connectFolderBtn.textContent = "Connect folder";
-    const d = (r && r.data) || {};
-    if (d.ok) refreshLocal();
-    else flashDsErr(d.error || r.status || "Could not connect folder");
-  };
-  // Error line
-  const err = el("div", "ds-note hidden"); err.id = "dsReposErr";
-  card.appendChild(err);
   overlay.appendChild(card);
   document.body.appendChild(overlay);
   overlay.addEventListener("click", (e) => { if (e.target === overlay) closeRepos(); });
@@ -1011,10 +1100,102 @@ async function shipCommit(r, push) {
 
 function makeReposBtn() {
   const btn = el("button", "ds-repos-btn");
-  btn.title = "Repositories"; btn.setAttribute("aria-label", "Repositories");
-  btn.textContent = " Repos";
+  btn.title = "GitHub (connect account, browse & clone repos)"; btn.setAttribute("aria-label", "GitHub");
+  btn.textContent = "GitHub";
   btn.onclick = (e) => { e.stopPropagation(); openRepos(); };
   return btn;
+}
+
+// --- Sidebar "Repos" section: local repos live in the left sidebar (not the
+// GitHub modal), with a "+" to connect a folder and a "⋯" for cross-repo
+// working changes. Injected into #sidebar, between #sideHead and #convList. ---
+function toggleSidebarRepos() {
+  const wrap = $("dsSidebarRepos"); if (!wrap) return;
+  const collapsed = wrap.classList.toggle("collapsed");
+  try { localStorage.setItem("nas-llm-repos-collapsed", collapsed ? "1" : "0"); } catch {}
+}
+
+function buildSidebarRepos() {
+  if ($("dsSidebarRepos")) return;
+  const sideHead = document.querySelector("#sideHead");
+  const sidebar = sideHead && sideHead.parentElement;
+  if (!sidebar) return;
+  const wrap = el("div", "ds-sidebar-repos");
+  wrap.id = "dsSidebarRepos";
+  let collapsed = false;
+  try { collapsed = localStorage.getItem("nas-llm-repos-collapsed") === "1"; } catch {}
+  if (collapsed) wrap.classList.add("collapsed");
+  const head = el("div", "ds-sidebar-repos-head");
+  const chev = el("span", "ds-sidebar-repos-chev", "▾");
+  const title = el("div", "ds-sidebar-repos-title", "Repos");
+  head.appendChild(chev); head.appendChild(title);
+  const changesBtn = el("button", "ds-sidebar-icon-btn", "⋯");
+  changesBtn.title = "Working changes across all repos"; changesBtn.setAttribute("aria-label", "Working changes");
+  changesBtn.onclick = (e) => { e.stopPropagation(); openWorkingChanges(); };
+  const addBtn = el("button", "ds-sidebar-icon-btn", "+");
+  addBtn.title = "Connect a folder"; addBtn.setAttribute("aria-label", "Connect a folder");
+  addBtn.onclick = async (e) => {
+    e.stopPropagation();
+    addBtn.disabled = true;
+    const ok = await connectFolderFlow();
+    addBtn.disabled = false;
+    if (ok) refreshLocal();
+  };
+  head.appendChild(changesBtn); head.appendChild(addBtn);
+  head.addEventListener("click", () => toggleSidebarRepos());
+  wrap.appendChild(head);
+  const body = el("div", "ds-sidebar-repos-body"); body.id = "dsLocalBody";
+  wrap.appendChild(body);
+  sidebar.insertBefore(wrap, sideHead.nextSibling);
+}
+
+// --- First-load "connect your repos" wizard --------------------------------
+// Shown once, only the first time the app has zero connected repos. Either
+// action (connect or skip) marks it seen so it never nags again.
+function markRepoWizardSeen() { try { localStorage.setItem("nas-llm-repo-wizard-seen", "1"); } catch {} }
+
+function showRepoWizard() {
+  let overlay = $("dsWizardOverlay");
+  if (!overlay) {
+    overlay = el("div", "ds-overlay");
+    overlay.id = "dsWizardOverlay";
+    overlay.setAttribute("role", "dialog");
+    overlay.setAttribute("aria-modal", "true");
+    overlay.setAttribute("aria-label", "Connect your repos");
+    const card = el("div", "ds-card");
+    const head = el("div", "ds-head");
+    head.appendChild(el("h2", null, "Connect your repos"));
+    const x = el("button", "ds-x"); x.textContent = "×"; x.title = "Skip"; x.setAttribute("aria-label", "Skip");
+    head.appendChild(x);
+    card.appendChild(head);
+    card.appendChild(el("div", "ds-note", "Connect a local git repo to start chatting with your codebase — ask questions, get edits, and review diffs before they're applied."));
+    const row = el("div", "ds-row ds-approval-row");
+    const skipBtn = el("button", "ds-btn ds-btn-ghost", "Skip for now");
+    const connectBtn = el("button", "ds-btn", "Connect a folder");
+    row.appendChild(skipBtn); row.appendChild(connectBtn);
+    card.appendChild(row);
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+    const dismiss = () => { markRepoWizardSeen(); overlay.classList.remove("open"); };
+    x.onclick = dismiss;
+    skipBtn.onclick = dismiss;
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) dismiss(); });
+    connectBtn.onclick = async () => {
+      connectBtn.disabled = true;
+      const ok = await connectFolderFlow();
+      connectBtn.disabled = false;
+      if (ok) { refreshLocal(); markRepoWizardSeen(); overlay.classList.remove("open"); }
+    };
+  }
+  overlay.classList.add("open");
+}
+
+async function maybeShowRepoWizard() {
+  try { if (localStorage.getItem("nas-llm-repo-wizard-seen") === "1") return; } catch {}
+  const r = await sid("repos/local");
+  const count = (r.ok && Array.isArray(r.data)) ? r.data.length : 0;
+  if (count > 0) { markRepoWizardSeen(); return; }
+  showRepoWizard();
 }
 
 function makeGear() {
@@ -1113,11 +1294,25 @@ async function bootDesktop() {
   buildOverlay();
   buildReposOverlay();
   fillOverlay();
-  addSettingsButton();
+  // syncAuthedUI places the gear/GitHub buttons and — once #app is actually
+  // visible (authed) — builds the sidebar Repos section, populates it, and
+  // (only the first time, with zero repos connected) shows the connect wizard.
+  const syncAuthedUI = () => {
+    addSettingsButton();
+    const app = $("app");
+    if (app && !app.classList.contains("hidden")) {
+      buildSidebarRepos();
+      refreshLocal();
+      maybeShowRepoWizard();
+    }
+  };
+  syncAuthedUI();
   hookLogin();
-  // Re-run gear placement when the auth view toggles (#app hidden ⇄ shown).
+  // Re-run gear + sidebar-repos placement when the auth view toggles (#app
+  // hidden ⇄ shown) — the initial auth check in app.js resolves after this
+  // boot script runs, so #app may still be hidden the first time above.
   const app = $("app");
-  if (app) new MutationObserver(addSettingsButton).observe(app, { attributes: true, attributeFilter: ["class"] });
+  if (app) new MutationObserver(syncAuthedUI).observe(app, { attributes: true, attributeFilter: ["class"] });
   // Auto-start a local Ollama if installed but not running, so local models are
   // discoverable through the /__ollama proxy by the time the web UI needs them.
   // If the app is already authed and Ollama just came up, reload once so app.js

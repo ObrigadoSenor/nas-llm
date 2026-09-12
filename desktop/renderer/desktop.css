@@ -212,6 +212,49 @@
 /* Confirm dialog (replaces native confirm()). */
 .ds-confirm-sub { color: #6b707a; }
 
+/* --- Sidebar "Repos" section (desktop-only; injected into the shared #sidebar,
+   between #sideHead and #convList). Reuses .ds-repo-row/.ds-badge*/.ds-btn-sm
+   from the repo-row renderer above, adapted here for the narrow sidebar. --- */
+.ds-sidebar-repos { border-top: 1px solid #2a2e37; border-bottom: 1px solid #2a2e37; margin: 2px 0 6px; padding-bottom: 4px; }
+.ds-sidebar-repos-head { display: flex; align-items: center; gap: 6px; padding: 6px 2px; cursor: pointer; user-select: none; }
+.ds-sidebar-repos-chev { color: #6b707a; font-size: 10px; display: inline-flex; transition: transform .12s; }
+.ds-sidebar-repos.collapsed .ds-sidebar-repos-chev { transform: rotate(-90deg); }
+.ds-sidebar-repos-title { flex: 1; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #8b909a; }
+.ds-sidebar-icon-btn {
+  background: transparent; border: none; color: #8b909a;
+  width: 22px; height: 22px; padding: 0; border-radius: 6px;
+  font-size: 14px; line-height: 1; cursor: pointer;
+}
+.ds-sidebar-icon-btn:hover { color: #e6e6e6; background: #1b1f27; }
+.ds-sidebar-repos-body { display: flex; flex-direction: column; gap: 4px; max-height: 260px; overflow-y: auto; }
+.ds-sidebar-repos.collapsed .ds-sidebar-repos-body { display: none; }
+.ds-sidebar-repos-body .ds-note { font-size: 11px; margin: 2px 0 6px; }
+
+/* Compact repo rows inside the narrow sidebar (vs. the wide GitHub modal card). */
+.ds-sidebar-repos-body .ds-repo-wrap { padding: 2px 0 6px; }
+.ds-sidebar-repos-body .ds-repo-row { flex-wrap: wrap; row-gap: 4px; padding: 4px 0; }
+.ds-sidebar-repos-body .ds-repo-main { width: 100%; }
+.ds-sidebar-repos-body .ds-btn-sm { padding: 3px 7px; font-size: 11px; }
+.ds-sidebar-repos-body .ds-repo-chats { margin-left: 8px; }
+
+/* Connect-picker checklist (folder scan found several git repos). */
+.ds-connect-list { display: flex; flex-direction: column; gap: 6px; max-height: 40vh; overflow-y: auto; margin: 10px 0; }
+.ds-connect-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border: 1px solid #2a2e37; border-radius: 8px; cursor: pointer; }
+.ds-connect-item:hover { background: #1b1f27; }
+.ds-connect-item-name { font-size: 13px; color: #e6e6e6; }
+
+/* Global toast — error feedback that must be visible even when no overlay is
+   open (e.g. a sidebar Pull/connect failure), unlike the old modal-only line. */
+.ds-toast {
+  position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(8px);
+  background: #2a1614; color: #ffb4a8; border: 1px solid #5a2a26; border-radius: 8px;
+  padding: 10px 14px; font-size: 12px; max-width: 360px; text-align: center;
+  box-shadow: 0 10px 40px rgba(0,0,0,.5);
+  opacity: 0; pointer-events: none; transition: opacity .15s, transform .15s;
+  z-index: 10001;
+}
+.ds-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); pointer-events: auto; }
+
 /* --- Ship changes wizard (Phase 6) --- */
 #dsShipVersion, #dsShipMessage {
   width: 100%; box-sizing: border-box;
