@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="dark">
 <title>nas-llm</title>
 <link rel="stylesheet" href="vendor/highlight-github-dark.min.css">
-<link rel="stylesheet" href="styles.css?v=26">
+<link rel="stylesheet" href="styles.css?v=38">
 <script defer src="vendor/highlight.min.js"></script>
 </head>
 <body>
@@ -44,8 +44,9 @@
       <h1 id="chatTitle">nas-llm</h1>
       <span id="chatMeta"></span>
       <div class="gap"></div>
-      <select id="model" title="model"></select>
-      <button id="manageModels" title="Manage models" aria-label="Manage models"><svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/></svg></button>
+      <div class="model-select">
+        <button id="modelBtn" class="model-btn" type="button" aria-haspopup="dialog" aria-expanded="false" title="Model"></button>
+      </div>
     </header>
     <div id="chat"></div>
     <div class="composer">
@@ -54,6 +55,7 @@
       <div class="input-wrap">
         <button id="plusBtn" class="plus-btn" title="Add tools" aria-label="Add tools" aria-expanded="false"></button>
         <div id="plusPopup" class="plus-popup hidden" role="menu"></div>
+        <div id="slashPopup" class="slash-popup hidden" role="listbox" aria-label="Commands"></div>
         <textarea id="input" placeholder="" rows="1"></textarea>
         <button id="attachBtn" class="attach-btn hidden" title="Attach image" aria-label="Attach image"></button>
         <input id="fileInput" type="file" accept="image/*" multiple class="hidden">
@@ -93,8 +95,9 @@
     </div>
     <div class="modal-tabs">
       <button id="tabInstalled" class="modal-tab active">Installed</button>
-      <button id="tabBrowse" class="modal-tab">Browse</button>
+      <button id="tabBrowse" class="modal-tab">Get more models</button>
     </div>
+    <div id="modelBanner" class="model-banner"></div>
     <div class="modal-body">
       <div id="pullStatus" class="pull-status hidden"></div>
       <div id="tabBody"></div>
@@ -102,6 +105,6 @@
   </div>
 </div>
 
-<script type="module" src="app.js?v=26"></script>
+<script type="module" src="app.js?v=42"></script>
 </body>
 </html>

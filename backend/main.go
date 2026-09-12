@@ -23,6 +23,14 @@ type config struct {
 	searxngURL       string
 	maxSearchRounds  int
 	maxClarifyRounds int
+	// askUserInPlainChat offers the ask_user tool on every plain-chat turn for
+	// tool-capable models (not just under the Clarify extra), so a clarifying
+	// question renders as an interactive card instead of prose. Default on.
+	askUserInPlainChat bool
+	// clarifyProseDetect best-effort turns a question the model wrote as prose
+	// into an interactive card (fallback for small/non-tool models that don't
+	// call ask_user). Default on.
+	clarifyProseDetect bool
 	// Agent harness: hard cap on tool-calling rounds per run. Small models loop
 	// on tools; the budget forces a final synthesized answer. Env-tunable.
 	maxAgentSteps int
@@ -75,6 +83,8 @@ func main() {
 		searxngURL:         env("SEARXNG_URL", ""),
 		maxSearchRounds:    envInt("MAX_SEARCH_ROUNDS", 1),
 		maxClarifyRounds:   envInt("MAX_CLARIFY_ROUNDS", 3),
+		askUserInPlainChat: envBool("ASK_USER_IN_PLAIN_CHAT", true),
+		clarifyProseDetect: envBool("CLARIFY_PROSE_DETECT", true),
 		maxAgentSteps:      envInt("MAX_AGENT_STEPS", 6),
 		fetchPageEnabled:   envBool("FETCH_PAGE_ENABLED", false),
 		contextLength:      envInt("OLLAMA_CONTEXT_LENGTH", 16384),
@@ -195,6 +205,9 @@ func (s *server) routes() http.Handler {
 
 	mux.HandleFunc("GET /api/models", s.requireAuth(s.handleModels))
 	mux.HandleFunc("GET /api/models/catalog", s.requireAuth(s.handleModelCatalog))
+	mux.HandleFunc("GET /api/models/library", s.requireAuth(s.handleModelLibrary))
+	mux.HandleFunc("GET /api/models/library/tags", s.requireAuth(s.handleModelLibraryTags))
+	mux.HandleFunc("GET /api/models/preflight", s.requireAuth(s.handleModelPreflight))
 	mux.HandleFunc("POST /api/models/pull", s.requireAuth(s.handleModelPull))
 	mux.HandleFunc("GET /api/models/pulls/active", s.requireAuth(s.handleActivePulls))
 	mux.HandleFunc("GET /api/models/pull/{jobId}/events", s.requireAuth(s.handlePullEvents))
@@ -221,6 +234,9 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("DELETE /api/folders/{id}", s.requireAuth(s.handleDeleteFolder))
 	mux.HandleFunc("GET /api/agent/config", s.requireAuth(s.handleAgentConfigGet))
 	mux.HandleFunc("PUT /api/agent/config", s.requireAuth(s.handleAgentConfigPut))
+	mux.HandleFunc("POST /api/conversations/{id}/tool-response", s.requireAuth(s.handleToolResponse))
+	mux.HandleFunc("GET /api/repos", s.requireAuth(s.handleListRepos))
+	mux.HandleFunc("POST /api/repos", s.requireAuth(s.handleRepoUpsert))
 	return mux
 }
 

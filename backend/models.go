@@ -30,12 +30,13 @@ type ollamaModelDetails struct {
 }
 
 type ollamaModel struct {
-	Name       string             `json:"name"`
-	Model      string             `json:"model"`
-	ModifiedAt string             `json:"modified_at"`
-	Size       int64              `json:"size"`
-	Digest     string             `json:"digest"`
-	Details    ollamaModelDetails `json:"details"`
+	Name         string             `json:"name"`
+	Model        string             `json:"model"`
+	ModifiedAt   string             `json:"modified_at"`
+	Size         int64              `json:"size"`
+	Digest       string             `json:"digest"`
+	Details      ollamaModelDetails `json:"details"`
+	Capabilities []string           `json:"capabilities,omitempty"`
 }
 
 type ollamaTagsResponse struct {
@@ -302,13 +303,13 @@ func (j *pullJob) ingestProgress(p ollamaProgressResponse) {
 		j.emitPhase("success")
 		return
 	}
+	// Byte progress rides on lines carrying digest+total, under status
+	// "pulling <hash>" (current Ollama) or "downloading" (older). Key the bar
+	// on digest+total, not status=="downloading" — current Ollama never sends
+	// "downloading", so the old check left the bar at 0%.
 	if p.Digest != "" && p.Total > 0 {
 		j.mu.Lock()
 		j.layers[p.Digest] = layerProg{p.Completed, p.Total}
-		j.mu.Unlock()
-	}
-	if strings.HasPrefix(status, "downloading") {
-		j.mu.Lock()
 		var completed, total int64
 		for _, l := range j.layers {
 			completed += l.completed
@@ -491,6 +492,10 @@ type catalogEntry struct {
 	Blurb          string     `json:"blurb"`
 	EstTokPerSec   [2]float64 `json:"estTokPerSec"` // [lo, hi]; [0,0] = n/a
 	RecommendedFor string     `json:"recommendedFor"`
+	// Categories are structured use-case tags (code, agentic, math, vision,
+	// long-context, fast, chat, embeddings) so Browse can filter "best for code",
+	// "best for agentic work", etc. Display-only; gating uses live Ollama caps.
+	Categories []string `json:"categories,omitempty"`
 	// Host names the backend this catalog entry is intended for ("mac" for big
 	// models that need the Mac's RAM; "" or "nas" for the always-on NAS). Drives
 	// the default pull target and the host used for fit verdicts.
@@ -522,66 +527,123 @@ type catalogItem struct {
 // this is the browse list; a free-text pull covers anything else.
 var curatedCatalog = []catalogEntry{
 	{
+		Name: "llama3.2:1b", Family: "llama", Params: "1B", Quant: "Q4_K_M",
+		SizeGB: 1.3, ContextWindow: 128000, Capabilities: []string{"completion"},
+		Blurb:        "Smallest llama — very fast, light on RAM. Good fallback for quick answers.",
+		EstTokPerSec: [2]float64{12, 18}, RecommendedFor: "Fast replies",
+		Categories: []string{"fast", "chat"},
+		Layers:     16, KVHeads: 8, HeadDim: 64,
+	},
+	{
 		Name: "qwen3:1.7b", Family: "qwen3", Params: "1.7B", Quant: "Q4_K_M",
 		SizeGB: 1.1, ContextWindow: 32768, Capabilities: []string{"tools", "thinking", "completion"},
 		Blurb:        "Very fast little model. Great for quick answers and tool/web-search calls.",
 		EstTokPerSec: [2]float64{10, 16}, RecommendedFor: "Fast replies, web search",
-		Layers: 28, KVHeads: 8, HeadDim: 128,
+		Categories: []string{"agentic", "fast", "math"},
+		Layers:     28, KVHeads: 8, HeadDim: 128,
 	},
 	{
 		Name: "llama3.2:3b", Family: "llama", Params: "3B", Quant: "Q4_K_M",
 		SizeGB: 2.0, ContextWindow: 128000, Capabilities: []string{"completion"},
 		Blurb:        "The sweet spot on 8 GB. Solid general chat and page summarizing.",
 		EstTokPerSec: [2]float64{7, 11}, RecommendedFor: "General chat, summarizing",
-		Layers: 28, KVHeads: 8, HeadDim: 128,
+		Categories: []string{"chat", "fast"},
+		Layers:     28, KVHeads: 8, HeadDim: 128,
 	},
 	{
 		Name: "qwen2.5:3b", Family: "qwen2.5", Params: "3B", Quant: "Q4_K_M",
 		SizeGB: 1.9, ContextWindow: 32768, Capabilities: []string{"tools", "completion"},
 		Blurb:        "Strong reasoning for its size and tool-capable. A good 3B alternative.",
 		EstTokPerSec: [2]float64{6, 10}, RecommendedFor: "Reasoning, tool calls",
-		Layers: 36, KVHeads: 2, HeadDim: 128,
+		Categories: []string{"agentic", "code"},
+		Layers:     36, KVHeads: 2, HeadDim: 128,
+	},
+	{
+		Name: "qwen2.5-coder:3b", Family: "qwen2.5", Params: "3B", Quant: "Q4_K_M",
+		SizeGB: 1.9, ContextWindow: 32768, Capabilities: []string{"tools", "completion"},
+		Blurb:        "Code-tuned 3B. Good at code completion/Q&A and light enough for the NAS.",
+		EstTokPerSec: [2]float64{6, 10}, RecommendedFor: "Coding (NAS)",
+		Categories: []string{"code", "fast"},
+		Layers:     36, KVHeads: 2, HeadDim: 128,
 	},
 	{
 		Name: "phi3:mini", Family: "phi3", Params: "3.8B", Quant: "Q4_K_M",
 		SizeGB: 2.2, ContextWindow: 128000, Capabilities: []string{"completion"},
 		Blurb:        "Microsoft's small model. Decent reasoning, long context window.",
 		EstTokPerSec: [2]float64{4, 8}, RecommendedFor: "Long-context notes",
-		Layers: 32, KVHeads: 32, HeadDim: 96,
+		Categories: []string{"long-context", "chat"},
+		Layers:     32, KVHeads: 32, HeadDim: 96,
 	},
 	{
 		Name: "gemma3:4b", Family: "gemma3", Params: "4B", Quant: "Q4_K_M",
 		SizeGB: 2.5, ContextWindow: 128000, Capabilities: []string{"vision", "completion"},
 		Blurb:        "Multimodal — understands images as well as text. Slower than the 3B models.",
 		EstTokPerSec: [2]float64{5, 9}, RecommendedFor: "Image + text",
-		Layers: 35, KVHeads: 1, HeadDim: 256,
+		Categories: []string{"vision", "chat"},
+		Layers:     35, KVHeads: 1, HeadDim: 256,
+	},
+	{
+		Name: "deepseek-r1:1.5b", Family: "qwen2", Params: "1.5B", Quant: "Q4_K_M",
+		SizeGB: 1.0, ContextWindow: 131072, Capabilities: []string{"completion"},
+		Blurb:        "Tiny reasoning model (R1 distill). Good at math, but no tool support — won't drive Agent/Web search.",
+		EstTokPerSec: [2]float64{10, 16}, RecommendedFor: "Math/reasoning (no tools)",
+		Categories: []string{"math", "fast"},
+		Layers:     28, KVHeads: 2, HeadDim: 128,
 	},
 	{
 		Name: "llama3.1:8b", Family: "llama3", Params: "8B", Quant: "Q4_K_M",
 		SizeGB: 4.7, ContextWindow: 128000, Capabilities: []string{"tools", "completion"},
 		Blurb:        "Best quality here, but slow and RAM-heavy on 8 GB. Shorten its context.",
 		EstTokPerSec: [2]float64{2, 4}, RecommendedFor: "Best quality (slow)",
-		Layers: 32, KVHeads: 8, HeadDim: 128,
+		Categories: []string{"agentic", "code"},
+		Layers:     32, KVHeads: 8, HeadDim: 128,
+	},
+	{
+		Name: "deepseek-r1:7b", Family: "qwen2", Params: "7.6B", Quant: "Q4_K_M",
+		SizeGB: 4.7, ContextWindow: 131072, Capabilities: []string{"completion"},
+		Blurb:        "R1 distill (Qwen2-Math 7B). Strong math/reasoning, but no tool support — won't drive Agent/Web search. Tight on 8 GB.",
+		EstTokPerSec: [2]float64{3, 6}, RecommendedFor: "Math/reasoning (no tools)",
+		Categories: []string{"math"},
+		Layers:     28, KVHeads: 4, HeadDim: 128,
 	},
 	{
 		Name: "mistral:7b", Family: "llama", Params: "7B", Quant: "Q4_K_M",
 		SizeGB: 4.4, ContextWindow: 32768, Capabilities: []string{"completion"},
 		Blurb:        "Mistral 7B — solid general chat. Runs on the Mac backend, not the 8 GB NAS.",
 		EstTokPerSec: [2]float64{20, 45}, RecommendedFor: "Bigger chat (Mac)",
-		Layers: 32, KVHeads: 8, HeadDim: 128, Host: "mac",
+		Categories: []string{"chat"},
+		Layers:     32, KVHeads: 8, HeadDim: 128, Host: "mac",
+	},
+	{
+		Name: "qwen2.5-coder:7b", Family: "qwen2.5", Params: "7B", Quant: "Q4_K_M",
+		SizeGB: 4.4, ContextWindow: 32768, Capabilities: []string{"tools", "completion"},
+		Blurb:        "Code-tuned 7B — strong for coding and tool calls. Needs the Mac's RAM.",
+		EstTokPerSec: [2]float64{18, 40}, RecommendedFor: "Coding (Mac)",
+		Categories: []string{"code", "agentic"},
+		Layers:     28, KVHeads: 4, HeadDim: 128, Host: "mac",
+	},
+	{
+		Name: "qwen3:8b", Family: "qwen3", Params: "8B", Quant: "Q4_K_M",
+		SizeGB: 4.7, ContextWindow: 32768, Capabilities: []string{"tools", "thinking", "completion"},
+		Blurb:        "Qwen3 8B — strong agentic + math with tools and thinking. Needs the Mac's RAM.",
+		EstTokPerSec: [2]float64{16, 38}, RecommendedFor: "Agentic + math (Mac)",
+		Categories: []string{"agentic", "math"},
+		Layers:     36, KVHeads: 8, HeadDim: 128, Host: "mac",
 	},
 	{
 		Name: "qwen2.5:14b", Family: "qwen2.5", Params: "14B", Quant: "Q4_K_M",
 		SizeGB: 8.4, ContextWindow: 32768, Capabilities: []string{"tools", "completion"},
 		Blurb:        "Qwen2.5 14B — strong reasoning + tool calls. Needs the Mac's RAM.",
 		EstTokPerSec: [2]float64{10, 28}, RecommendedFor: "Best reasoning (Mac)",
-		Layers: 40, KVHeads: 2, HeadDim: 128, Host: "mac",
+		Categories: []string{"agentic", "code", "math"},
+		Layers:     40, KVHeads: 2, HeadDim: 128, Host: "mac",
 	},
 	{
 		Name: "nomic-embed-text", Family: "nomic-bert", Params: "0.1B", Quant: "f16",
 		SizeGB: 0.27, ContextWindow: 8192, Capabilities: []string{"embedding"},
 		Blurb:        "Embeddings for search/RAG — not a chat model. Tiny and fast.",
 		EstTokPerSec: [2]float64{0, 0}, RecommendedFor: "Embeddings",
+		Categories: []string{"embeddings"},
 	},
 }
 
@@ -718,15 +780,16 @@ func (s *server) handleModels(w http.ResponseWriter, r *http.Request) {
 			}
 			seen[name] = true
 			item := map[string]any{
-				"id":         name,
-				"name":       name,
-				"size":       m.Size,
-				"sizeGB":     float64(m.Size) / 1e9,
-				"digest":     m.Digest,
-				"modifiedAt": m.ModifiedAt,
-				"details":    m.Details,
-				"host":       p.host.name,
-				"hostOnline": true,
+				"id":           name,
+				"name":         name,
+				"size":         m.Size,
+				"sizeGB":       float64(m.Size) / 1e9,
+				"digest":       m.Digest,
+				"modifiedAt":   m.ModifiedAt,
+				"details":      m.Details,
+				"capabilities": m.Capabilities,
+				"host":         p.host.name,
+				"hostOnline":   true,
 			}
 			if b := s.store.getBenchmark(name); b != nil {
 				item["benchmark"] = b
@@ -1161,4 +1224,63 @@ func (s *server) handleModelInfo(w http.ResponseWriter, r *http.Request) {
 		out["benchmark"] = b
 	}
 	writeJSON(w, out)
+}
+
+// showCapabilities fetches /api/show for a model on the host that owns it and
+// returns the reported capabilities. ok is true only when /api/show succeeded
+// AND reported a non-empty capability list; otherwise callers fall back to the
+// curated catalog (catalogEntryByName) so a model is never misclassified just
+// because an Ollama build omits capabilities from /api/show.
+func (s *server) showCapabilities(ctx context.Context, model string) (caps []string, ok bool) {
+	h := s.hosts.onlineHostForModel(model)
+	if h == nil {
+		h = s.hosts.defaultHost()
+	}
+	if h == nil {
+		return nil, false
+	}
+	resp, err := s.ollamaRequest(ctx, h, http.MethodPost, "/api/show", map[string]any{"model": model})
+	if err != nil {
+		return nil, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, false
+	}
+	var show ollamaShowResponse
+	if err := json.NewDecoder(resp.Body).Decode(&show); err != nil {
+		return nil, false
+	}
+	if len(show.Capabilities) == 0 {
+		return nil, false
+	}
+	return show.Capabilities, true
+}
+
+// supportsTools reports whether the model can emit OpenAI tool_calls, so the
+// generation loops can decide whether to enter a tool-calling round at all.
+// A non-tool model given the tool schema narrates the call in prose and
+// hallucinates a result instead of emitting structured tool_calls. Resolution:
+//   - Local (browser-relay) models: the backend cannot dial the visitor's
+//     Ollama, so it trusts the frontend-supplied supportsTools flag (derived
+//     from /api/show + /api/tags on localhost by the browser).
+//   - Server models: /api/show on the owning host, falling back to the curated
+//     catalog when /api/show reports no capabilities (older Ollama builds).
+//   - A server model that still can't be classified (not in the catalog, no
+//     /api/show caps) is allowed through so a genuinely tool-capable model the
+//     backend can't introspect isn't regressed; the frontend gates the visible
+//     UI, so this path is reached only by a direct/race caller.
+func (s *server) supportsTools(model string, local, feSaysTools bool) bool {
+	if local {
+		return feSaysTools
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if caps, ok := s.showCapabilities(ctx, model); ok {
+		return slicesContains(caps, "tools")
+	}
+	if e := catalogEntryByName(model); e != nil {
+		return slicesContains(e.Capabilities, "tools")
+	}
+	return true
 }

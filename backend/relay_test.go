@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -487,5 +488,180 @@ func TestHandleModelResponse_NoActiveJobOrWrongUser(t *testing.T) {
 	srv.handleModelResponse(rec3, req3)
 	if rec3.Code != http.StatusConflict {
 		t.Errorf("stale-jobId status = %d, want 409", rec3.Code)
+	}
+}
+
+// TestAgentLoop_LocalRelayToolCallsExecuteAndContinue is the integration test the
+// relay unit tests can't cover: a local (browser-relay) agent job where the
+// browser POSTs a tool_call for one round and a final answer for the next. It
+// proves the relay's tool_calls round-trip feeds the agent loop, the tool
+// executes server-side, and the loop continues to a clean done (the failure
+// mode the reported bug was blamed on). Uses the calculator tool (pure, no
+// SearXNG/config needed) so the execution is deterministic.
+func TestAgentLoop_LocalRelayToolCallsExecuteAndContinue(t *testing.T) {
+	st, err := newStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	defer st.close()
+	srv := &server{cfg: config{contextLength: 8192, maxAgentSteps: 2}, store: st}
+	srv.jobs = newJobManager(st, srv)
+
+	const email = "user@example.com"
+	convID := "conv-agent"
+	if _, err := st.createConversation(email, convID, "t", "local:1b",
+		[]Message{{Role: "user", Content: "what is 2+3*4?"}}); err != nil {
+		t.Fatalf("createConversation: %v", err)
+	}
+
+	j := newJob(convID, email, "local:1b", false, false, true) // agent=true
+	j.local = true
+	j.supportsTools = true // a tool-capable local model (frontend would send true)
+	if err := srv.jobs.enqueue(j); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	// Round 1: the browser runs inference on its own Ollama and POSTs a
+	// calculator tool_call back (as handleModelResponse would deliver it).
+	waitForRelay(t, j, 5*time.Second)
+	tc := oaiToolCall{ID: "tc1", Type: "function"}
+	tc.Function.Name = "calculator"
+	tc.Function.Arguments = `{"expression":"2+3*4"}`
+	claimRelay(t, j, relayResponse{content: "let me compute that", toolCalls: []oaiToolCall{tc}})
+
+	// Round 2: the browser POSTs the final synthesized answer.
+	waitForRelay(t, j, 5*time.Second)
+	claimRelay(t, j, relayResponse{content: "done"})
+
+	select {
+	case <-j.finished:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("agent job did not finalize after the final answer")
+	}
+	status, content, _ := j.snapshot()
+	if status != "done" {
+		t.Errorf("job status = %q, want \"done\"", status)
+	}
+	if !strings.Contains(content, "done") {
+		t.Errorf("accumulated content = %q, want it to contain the final answer", content)
+	}
+	steps := j.stepSnapshot()
+	if len(steps) == 0 {
+		t.Fatalf("expected at least one agent step (the calculator call), got 0")
+	}
+	if steps[0].Tool != "calculator" {
+		t.Errorf("first step tool = %q, want \"calculator\"", steps[0].Tool)
+	}
+	if !strings.Contains(steps[0].Preview, "14") {
+		t.Errorf("first step preview = %q, want it to contain the result 14", steps[0].Preview)
+	}
+}
+
+// nextEvent reads the next subscriber event, failing the test if none arrives
+// within timeout. Used by the runGeneration guard test to inspect the SSE event
+// stream (search marker / modelCall cue) the worker emits.
+func nextEvent(t *testing.T, ch chan subEvent, timeout time.Duration) subEvent {
+	t.Helper()
+	select {
+	case ev := <-ch:
+		return ev
+	case <-time.After(timeout):
+		t.Fatalf("no subscriber event within %v", timeout)
+		return subEvent{}
+	}
+}
+
+// TestRunGeneration_NonToolModelSkipsToolLoop is the regression test for the
+// reported bug: with Web search on but a model that can't emit tool_calls,
+// runGeneration must NOT enter the tool-calling loop (where the model narrates
+// a fake web_search and hallucinates a result). Instead it emits a Skipped
+// marker explaining the model lacks tool support and runs a plain streamed
+// pass. Uses a local (browser-relay) job so the backend trusts the frontend
+// supportsTools=false verdict without needing a real Ollama; the plain pass is
+// satisfied by claiming the pending relay channel.
+func TestRunGeneration_NonToolModelSkipsToolLoop(t *testing.T) {
+	st, err := newStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	defer st.close()
+	srv := &server{cfg: config{contextLength: 8192}, store: st}
+	srv.jobs = newJobManager(st, srv)
+
+	const email = "user@example.com"
+	convID := "conv-notool"
+	if _, err := st.createConversation(email, convID, "t", "local:1b",
+		[]Message{{Role: "user", Content: "who won the 2023 world series?"}}); err != nil {
+		t.Fatalf("createConversation: %v", err)
+	}
+
+	j := newJob(convID, email, "local:1b", true, false, false) // webSearch=true
+	j.local = true
+	j.supportsTools = false // frontend says this model can't call tools
+
+	// Subscribe before enqueue so the worker's emits are captured in order.
+	ch, _ := j.subscribe()
+	defer j.unsubscribe(ch)
+	if err := srv.jobs.enqueue(j); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	// Before the browser POST, the guard emits a Skipped search marker, a phase,
+	// then the modelCall cue for the plain (tool-less) pass — proving the tool
+	// loop was skipped (a web_search loop would have sent a modelCall carrying
+	// the web_search tool).
+	var sawSearch bool
+	for sawModelCall := false; !sawModelCall; {
+		ev := nextEvent(t, ch, 5*time.Second)
+		switch ev.kind {
+		case "search":
+			sawSearch = true
+			var entry searchEntry
+			if err := json.Unmarshal([]byte(ev.text), &entry); err != nil {
+				t.Fatalf("unmarshal search event: %v", err)
+			}
+			if !entry.Skipped {
+				t.Errorf("search entry should be Skipped, got %+v", entry)
+			}
+			if !strings.Contains(entry.Reason, "no tool support") {
+				t.Errorf("search reason = %q, want it to mention no tool support", entry.Reason)
+			}
+		case "modelCall":
+			sawModelCall = true
+			var mc modelCallPayload
+			if err := json.Unmarshal([]byte(ev.text), &mc); err != nil {
+				t.Fatalf("unmarshal modelCall event: %v", err)
+			}
+			if len(mc.Tools) != 0 {
+				t.Fatalf("plain-pass modelCall should carry no tools, got %d: %+v", len(mc.Tools), mc.Tools)
+			}
+		}
+	}
+	if !sawSearch {
+		t.Fatalf("expected a Skipped search marker before the modelCall, never saw one")
+	}
+
+	// The browser delivers the final answer; runStreamPass returns it and the
+	// worker finalizes the job as done.
+	waitForRelay(t, j, 5*time.Second)
+	claimRelay(t, j, relayResponse{content: "I can't browse the web."})
+
+	select {
+	case <-j.finished:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("job did not finalize after the plain answer")
+	}
+	status, content, _ := j.snapshot()
+	if status != "done" {
+		t.Errorf("job status = %q, want \"done\"", status)
+	}
+	if content != "I can't browse the web." {
+		t.Errorf("content = %q, want the plain answer", content)
+	}
+	if got := j.searchSnapshot(); len(got) != 1 || !got[0].Skipped {
+		t.Errorf("searchSnapshot = %+v, want one Skipped entry", got)
+	}
+	if steps := j.stepSnapshot(); len(steps) != 0 {
+		t.Errorf("expected no agent steps (not agent mode), got %+v", steps)
 	}
 }

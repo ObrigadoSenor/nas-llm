@@ -125,29 +125,50 @@ includes `json` — off by default, and without it every consumer silently gets
 HTML) and disables the rate limiter (no Redis). It is internal-only (no
 published port); rotate `server.secret_key` if you ever expose it.
 
-## Clarifying questions (optional)
+## Clarifying questions
 
-The chat page's + menu has a **Clarify** toggle. When on, the backend gives the
-model an `ask_user` tool and runs a small agent loop: if the task is ambiguous,
-the model emits a clarifying question with concrete options, shown as a
-clickable card; the user picks one (or types a free-text answer) and that
-becomes the next turn, so the model asks again or answers. It reuses the
-existing background-generation + SSE machinery — each question is a persisted
-assistant turn, each answer a normal user turn — so a half-answered question
-survives a reload or a backend restart (it lives in the conversation, not in
-memory). Back-to-back questions are capped at `MAX_CLARIFY_ROUNDS` (default 3):
-once the cap is reached the `ask_user` tool is withheld and the model must
-answer.
+The chat page turns a clarifying question into an interactive card instead of
+plain text, in two ways:
+
+- **Every chat (default).** On a tool-capable model, the backend offers the
+  model an `ask_user` tool on each plain turn (no toggle needed): if the task
+  is ambiguous, the model calls `ask_user` with a clear question and concrete
+  options, and the backend renders them as a card. This is why a question that
+  used to arrive as prose now arrives as something you can click through. A
+  small/non-tool model that writes the question as prose is still caught:
+  `CLARIFY_PROSE_DETECT` best-effort detects a question shape ("Question: …?
+  (e.g., A, B, C)") and turns it into the same card.
+- **Clarify toggle (interrogation mode).** The + menu's **Clarify** toggle
+  forces the question-first loop and caps back-to-back questions at
+  `MAX_CLARIFY_ROUNDS` (default 3): once the cap is reached the `ask_user` tool
+  is withheld and the model must answer. Use it when you want the model to
+  interrogate you before answering.
+
+The card shows a selectable list — radio for a single-select question,
+checkbox for multi-select — plus an inline **"Or type your own answer…"** input
++ Send, so you can pick an option or write your own when none fit. The user's
+pick (or typed text) becomes the next turn, so the model asks again or answers.
+It reuses the existing background-generation + SSE machinery — each question is
+a persisted assistant turn, each answer a normal user turn — so a half-answered
+question survives a reload or a backend restart (it lives in the conversation,
+not in memory).
 
 Clarify and Web search are mutually exclusive in the UI (turning one on turns
-the other off). Clarify needs a tool-calling model — `qwen3:1.7b`,
+the other off). The `ask_user` tool needs a tool-calling model — `qwen3:1.7b`,
 `qwen2.5:3b`, or `llama3.1:8b` (`deepseek-r1` and the non-tool 3B models just
-answer directly instead of asking). The pure-API host `llm.selected.systems`
-and the browser extension are unaffected; everything rides the existing
-session-cookie `/api/*` surface.
+answer directly, though the prose detector can still catch a question they
+write as text). The pure-API host `llm.selected.systems` and the browser
+extension are unaffected; everything rides the existing session-cookie
+`/api/*` surface.
 
-Env (`.env`, with a safe default): `MAX_CLARIFY_ROUNDS=3` — raise it for more
-thorough interrogation, lower it to force a faster answer.
+Env (`.env`, with safe defaults):
+- `MAX_CLARIFY_ROUNDS=3` — back-to-back question cap under the Clarify toggle.
+- `ASK_USER_IN_PLAIN_CHAT=true` — offer `ask_user` on every plain turn for
+  tool-capable models. Set false to skip the tool-schema overhead on every
+  turn (a question can still become a card via the detector).
+- `CLARIFY_PROSE_DETECT=true` — detect a question the model wrote as prose and
+  render it as a card (fallback for small/non-tool models). Set false to keep
+  such turns as plain text.
 
 ## Agent mode
 
@@ -182,12 +203,34 @@ overflow 8–16k). Each run's tool-call trace (step, tool, args, result preview,
 duration) is streamed live to a steps drawer above the answer and persisted
 (`agent_steps` table + `jobs.prompt_tokens`/`completion_tokens` for analytics).
 
-Configure the agent from the **Agent settings** entry at the bottom of the +
-menu: a system prompt (blank = the built-in date-injected nudge) and a tool
-allowlist (a small set suits a small model). Settings are global defaults stored
-in SQLite (`settings` table); per-conversation overrides are supported in the
-schema (`PATCH /api/conversations/:id` with `agentSystem`/`agentTools`) but not
-yet exposed in the UI.
+### System prompt
+
+The agent runs with a configurable system prompt, prepended as the first
+(`system`) message of every model round. Resolution order, most-specific first:
+
+1. **Per-conversation override** — `agent_system` on the conversation, set via
+   `PATCH /api/conversations/:id` with `agentSystem`/`agentTools`. Supported in
+   the schema but not yet exposed in the UI.
+2. **Global default** — the `agent_system` row in the SQLite `settings` table,
+   set from the UI or `PUT /api/agent/config`, read back with
+   `GET /api/agent/config` (or `sqlite3 /data/nas-llm.db
+   "SELECT value FROM settings WHERE key='agent_system'"`).
+3. **Built-in nudge** — when nothing is configured, `agentSystemNudge()` in
+   `backend/agent.go` supplies a lean default that injects today's date (so a
+   stale-cutoff model can reason about "today") and steers toward one or two
+   tool calls before answering.
+
+Configure it from the **Agent settings** entry at the bottom of the + menu
+(`/agent-settings` slash command): a system-prompt textarea (blank = the
+built-in nudge) and a tool allowlist (a small set suits a small model). When
+`memory_read` is in the allowlist, a short index of the user's memory-note keys
+is auto-appended to the prompt so the agent knows what it can recall.
+
+**Scope.** The configurable prompt applies to **Agent mode only**. Plain chat
+runs a bare streamed pass with no system message; Web search and Clarify use
+their own fixed, code-compiled nudges (`systemNudge()`, `clarifyNudgeText()`).
+A prompt saved in Agent settings never leaks into a normal chat turn. The
+resolution order and scope are pinned by `backend/agent_test.go`.
 
 ### Guardrails: `fetch_page` and the injection surface
 
@@ -330,11 +373,28 @@ feel too shallow for multi-part questions.
 
 ## Model management
 
-Models are managed from the chat UI — no SSH required. Click the grid icon
-(⊞) next to the model selector in the header to open the **Manage models**
-panel, which has two tabs:
+Models are managed from the chat UI — no SSH required. Click the model
+selector in the header to open the unified **Models** panel. The current model
+is shown in a banner at the top of the panel so the choice is always obvious.
+The panel has two tabs:
 
-- **Browse** — a curated set of N100/8 GB-friendly models, each with:
+- **Installed** — every available model (NAS, Mac, and Local/this computer) as
+  a one-click selectable list, grouped by host, with size, quant, family,
+  capability badges, and the last measured tok/s (or "not benchmarked").
+  - Click a row to switch the current conversation to that model — the banner
+    and header update in place and the panel stays open so you can keep
+    managing. The selected row is checked.
+  - A per-row **⋯** menu offers **Benchmark**, **Details**, and **Remove**
+    (server models). Local models are selectable only.
+  - **Benchmark** — runs a short 64-token generation and reports the real
+    tok/s (`eval_count / eval_duration × 1e⁹`), prompt tok/s, and load time.
+    The result is persisted in SQLite and shown across browsers/reloads.
+  - **Details** — architecture dims (layers, KV heads, head dim), context
+    length, capabilities, and the computed RAM fit.
+  - **Remove** — deletes the model from the NAS to free disk space.
+  - A **Get more models** button at the bottom of the list jumps to the
+    download tab.
+- **Get more models** — a curated set of N100/8 GB-friendly models, each with:
   - a **fit verdict** (Fits / Tight / Won't fit) estimating RAM use as the
     model's on-disk size plus its KV cache at your configured context length,
     compared against `NAS_RAM_GB − NAS_SYSTEM_RESERVE_GB`;
@@ -343,15 +403,6 @@ panel, which has two tabs:
   - capability badges (chat, tools, vision, thinking, embeddings) and a
     one-line blurb. **Download** starts a background pull with a live progress
     bar. A free-text **Pull by name** field downloads any `model:tag`.
-- **Installed** — every model on the NAS, with size, quant, family, capability
-  badges, and the last measured tok/s (or "not benchmarked"). Actions:
-  - **Use** — switch the current conversation to this model.
-  - **Benchmark** — runs a short 64-token generation and reports the real
-    tok/s (`eval_count / eval_duration × 1e⁹`), prompt tok/s, and load time.
-    The result is persisted in SQLite and shown across browsers/reloads.
-  - **Details** — architecture dims (layers, KV heads, head dim), context
-    length, capabilities, and the computed RAM fit.
-  - **Remove** — deletes the model from the NAS to free disk space.
 
 Downloads run as detached jobs on the NAS (one at a time, mirroring the
 generation job system) and stream progress over SSE, so they survive a page

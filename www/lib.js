@@ -312,11 +312,12 @@ export function appendAgentStep(container, st) {
   container.appendChild(buildStepRow(st));
 }
 
-// --- Agent thinking drawer (per-round reasoning, smaller + collapsible) ----------
-// renderThoughts replaces the drawer with the full set (SSE replay / reload).
-// appendThought adds one live thought as its round completes. Each is a small
-// muted block inside a <details> that is open while streaming and auto-closed
-// on done so the user is left with only the summarized answer.
+// --- Agent thinking drawer (per-round reasoning, minimal + collapsible) ----------
+// renderThoughts replaces the drawer body with the full set (SSE replay / reload);
+// appendThought adds one live thought as its round completes. The <summary> holds
+// a mutable label span (setThoughtsSummary) so callers can show "Thinking" +
+// animated dots while reasoning streams, then swap to "Thought for Xs" and
+// collapse the drawer when it completes. Each thought is a small, dim block.
 function buildThoughtRow(text) {
   const div = document.createElement('div');
   div.className = 'thought';
@@ -342,26 +343,47 @@ export function appendThought(container, text) {
   container.classList.remove('hidden');
   det.querySelector('.thoughts-body').appendChild(buildThoughtRow(text));
 }
+// Update the thinking drawer's summary label. streaming=true shows the text
+// followed by animated dots (used while reasoning streams); streaming=false
+// shows a plain one-liner (the "Thought for Xs" done state, or reloaded history
+// which has no live timer). The drawer's open/collapsed state is owned by the
+// caller (tailJob / addMsg), not by this helper.
+export function setThoughtsSummary(det, text, { streaming = false } = {}) {
+  if (!det) return;
+  const label = det.querySelector('.thoughts-label');
+  if (!label) return;
+  label.classList.toggle('streaming', !!streaming);
+  label.replaceChildren();
+  const t = document.createElement('span'); t.textContent = String(text || '');
+  label.appendChild(t);
+  if (streaming) label.appendChild(thinkingDots());
+}
 // Build the collapsible thinking wrapper (<details open>) the SSE handlers
-// fill. open by default so thinking is visible (smaller) while it streams;
-// the tailJob done handler removes `open` to collapse it.
+// fill. open by default so thinking is visible (smaller) while it streams; the
+// tailJob done handler swaps the label to "Thought for Xs" and removes `open`.
 export function buildThoughtsWrap() {
   const wrap = document.createElement('div'); wrap.className = 'msg-thoughts hidden';
   const det = document.createElement('details'); det.className = 'thoughts-det'; det.open = true;
-  const sum = document.createElement('summary'); sum.textContent = 'Thinking';
+  const sum = document.createElement('summary');
+  const label = document.createElement('span'); label.className = 'thoughts-label'; label.textContent = 'Thinking';
+  sum.appendChild(label);
   const body = document.createElement('div'); body.className = 'thoughts-body';
   det.appendChild(sum); det.appendChild(body); wrap.appendChild(det);
   return { wrap, det };
 }
 
 // --- Clarifying questions (agent loop) --------------------------------------
-// renderClarifyCard paints the model's clarifying question(s) as a card with
-// one button per option (single-select) or a "type your answer" hint (free).
-// It replaces the bubble's streamed preamble so the card is the whole answer.
-// When answered=true the option buttons render disabled (the user already
-// replied, e.g. on a reload of history); onAnswer(value) fires on click for a
+// renderClarifyCard paints the model's clarifying question(s) as a card with a
+// selectable option list — radio rows for a single-select question, checkbox
+// rows for a multi-select question — plus an inline free-text input + Send so
+// the user can type their own answer when none of the options fit. It replaces
+// the bubble's streamed preamble so the card is the whole answer.
+// When answered=true the controls render disabled (the user already replied,
+// e.g. on a reload of history); selectedValue is the user's recorded answer
+// (the next user message's content), used to highlight the chosen option or
+// fill the free-text input on reload. onAnswer(value) fires on submit for a
 // live, unanswered card and is expected to send the value as the next turn.
-export function renderClarifyCard(container, clarify, answered, onAnswer) {
+export function renderClarifyCard(container, clarify, answered, onAnswer, selectedValue) {
   if (!container) return;
   container.replaceChildren();
   const qs = (clarify && clarify.questions) || [];
@@ -371,27 +393,87 @@ export function renderClarifyCard(container, clarify, answered, onAnswer) {
     head.textContent = q.text || '';
     card.appendChild(head);
     const opts = q.options || [];
-    if (q.type === 'free' || !opts.length) {
-      const hint = document.createElement('div'); hint.className = 'clarify-hint muted';
-      hint.textContent = 'Type your answer below and send.';
-      card.appendChild(hint);
-    } else {
-      const row = document.createElement('div'); row.className = 'clarify-options';
-      opts.forEach(o => {
+    const multi = q.type === 'multi';
+    const isFree = q.type === 'free' || !opts.length;
+    const selected = new Set(); // indices of selected options
+
+    let rowsWrap = null;
+    if (!isFree) {
+      rowsWrap = document.createElement('div'); rowsWrap.className = 'clarify-options';
+      opts.forEach((o, i) => {
         const v = o.value || o.label;
-        const btn = document.createElement('button'); btn.type = 'button'; btn.className = 'clarify-option';
-        btn.textContent = o.label || v || '';
+        const label = o.label || v || '';
+        const row = document.createElement('button'); row.type = 'button';
+        row.className = 'clarify-row ' + (multi ? 'multi' : 'single');
+        row.setAttribute('role', multi ? 'checkbox' : 'radio');
+        row.setAttribute('aria-checked', 'false');
+        const ind = document.createElement('span'); ind.className = 'clarify-row-ind';
+        const lab = document.createElement('span'); lab.className = 'clarify-row-label';
+        lab.textContent = label;
+        row.appendChild(ind); row.appendChild(lab);
         if (answered) {
-          btn.disabled = true;
+          row.disabled = true;
+          if (optionMatches(label, v, selectedValue, multi)) {
+            row.classList.add('selected'); row.setAttribute('aria-checked', 'true');
+          }
         } else if (onAnswer) {
-          btn.addEventListener('click', () => onAnswer(v));
+          row.addEventListener('click', () => {
+            if (multi) {
+              if (selected.has(i)) { selected.delete(i); row.classList.remove('selected'); row.setAttribute('aria-checked', 'false'); }
+              else { selected.add(i); row.classList.add('selected'); row.setAttribute('aria-checked', 'true'); }
+            } else {
+              selected.clear(); selected.add(i);
+              rowsWrap.querySelectorAll('.clarify-row').forEach(r => { r.classList.remove('selected'); r.setAttribute('aria-checked', 'false'); });
+              row.classList.add('selected'); row.setAttribute('aria-checked', 'true');
+            }
+          });
         }
-        row.appendChild(btn);
+        rowsWrap.appendChild(row);
       });
-      card.appendChild(row);
+      card.appendChild(rowsWrap);
     }
+
+    // Inline free-text input — always present so the user can type their own
+    // answer even when the model offered options.
+    const free = document.createElement('div'); free.className = 'clarify-free';
+    const inp = document.createElement('input'); inp.type = 'text';
+    inp.className = 'clarify-input';
+    inp.placeholder = isFree ? 'Type your answer…' : 'Or type your own answer…';
+    if (answered) {
+      inp.disabled = true;
+      if (isFree && selectedValue) inp.value = selectedValue;
+    }
+    const send = document.createElement('button'); send.type = 'button';
+    send.className = 'clarify-send'; send.textContent = 'Send';
+    if (answered) send.disabled = true;
+    const submit = () => {
+      if (answered || !onAnswer) return;
+      const typed = inp.value.trim();
+      if (typed) { onAnswer(typed); return; }
+      if (isFree || selected.size === 0) { inp.focus(); return; }
+      const chosen = [...selected].sort((a, b) => a - b).map(i => opts[i].value || opts[i].label);
+      onAnswer(multi ? chosen.join('\n') : chosen[0]);
+    };
+    send.addEventListener('click', submit);
+    inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+    free.appendChild(inp); free.appendChild(send);
+    card.appendChild(free);
+
     container.appendChild(card);
   });
+}
+
+// optionMatches checks whether a given option was the user's recorded answer
+// (used to highlight the chosen row on reload). For multi-select the stored
+// answer is the selected values joined (newline/comma/semicolon), so each
+// option is checked for membership.
+function optionMatches(label, value, answer, multi) {
+  if (answer == null) return false;
+  const a = String(answer).trim();
+  if (!a) return false;
+  if (!multi) return a === (value || label) || a === label;
+  const parts = a.split(/[\n,;]/).map(s => s.trim()).filter(Boolean);
+  return parts.includes(value || label) || parts.includes(label);
 }
 
 // Escape plain text (used for user messages, which are NOT rendered as markdown
