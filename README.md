@@ -351,11 +351,28 @@ feel too shallow for multi-part questions.
 
 ## Model management
 
-Models are managed from the chat UI — no SSH required. Click the grid icon
-(⊞) next to the model selector in the header to open the **Manage models**
-panel, which has two tabs:
+Models are managed from the chat UI — no SSH required. Click the model
+selector in the header to open the unified **Models** panel. The current model
+is shown in a banner at the top of the panel so the choice is always obvious.
+The panel has two tabs:
 
-- **Browse** — a curated set of N100/8 GB-friendly models, each with:
+- **Installed** — every available model (NAS, Mac, and Local/this computer) as
+  a one-click selectable list, grouped by host, with size, quant, family,
+  capability badges, and the last measured tok/s (or "not benchmarked").
+  - Click a row to switch the current conversation to that model — the banner
+    and header update in place and the panel stays open so you can keep
+    managing. The selected row is checked.
+  - A per-row **⋯** menu offers **Benchmark**, **Details**, and **Remove**
+    (server models). Local models are selectable only.
+  - **Benchmark** — runs a short 64-token generation and reports the real
+    tok/s (`eval_count / eval_duration × 1e⁹`), prompt tok/s, and load time.
+    The result is persisted in SQLite and shown across browsers/reloads.
+  - **Details** — architecture dims (layers, KV heads, head dim), context
+    length, capabilities, and the computed RAM fit.
+  - **Remove** — deletes the model from the NAS to free disk space.
+  - A **Get more models** button at the bottom of the list jumps to the
+    download tab.
+- **Get more models** — a curated set of N100/8 GB-friendly models, each with:
   - a **fit verdict** (Fits / Tight / Won't fit) estimating RAM use as the
     model's on-disk size plus its KV cache at your configured context length,
     compared against `NAS_RAM_GB − NAS_SYSTEM_RESERVE_GB`;
@@ -364,15 +381,6 @@ panel, which has two tabs:
   - capability badges (chat, tools, vision, thinking, embeddings) and a
     one-line blurb. **Download** starts a background pull with a live progress
     bar. A free-text **Pull by name** field downloads any `model:tag`.
-- **Installed** — every model on the NAS, with size, quant, family, capability
-  badges, and the last measured tok/s (or "not benchmarked"). Actions:
-  - **Use** — switch the current conversation to this model.
-  - **Benchmark** — runs a short 64-token generation and reports the real
-    tok/s (`eval_count / eval_duration × 1e⁹`), prompt tok/s, and load time.
-    The result is persisted in SQLite and shown across browsers/reloads.
-  - **Details** — architecture dims (layers, KV heads, head dim), context
-    length, capabilities, and the computed RAM fit.
-  - **Remove** — deletes the model from the NAS to free disk space.
 
 Downloads run as detached jobs on the NAS (one at a time, mirroring the
 generation job system) and stream progress over SSE, so they survive a page

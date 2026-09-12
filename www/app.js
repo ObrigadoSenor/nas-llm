@@ -4,7 +4,7 @@ import { icon, setIcon, renderMessage, escapeHtml, StreamRenderer, thinkingDots,
 
 const $ = id => document.getElementById(id);
 const app=$("app"), loginView=$("login");
-const chat=$("chat"), input=$("input"), send=$("send"), modelBtn=$("modelBtn"), modelPopup=$("modelPopup");
+const chat=$("chat"), input=$("input"), send=$("send"), modelBtn=$("modelBtn"), modelBanner=$("modelBanner");
 const convList=$("convList"), whoEmail=$("whoEmail");
 const chatTitle=$("chatTitle"), chatMeta=$("chatMeta");
 const loginEmail=$("loginEmail"), loginBtn=$("loginBtn"), loginInfo=$("loginInfo");
@@ -22,7 +22,6 @@ setIcon($("plusBtn"), "plus", 18);
 setIcon($("send"),"send",16); $("send").setAttribute("aria-label","Send");
 setIcon(attachBtn,"paperclip",16);
 setIcon($("logout"), "logout", 15); $("logout").insertAdjacentHTML("beforeend", '<span>Log out</span>');
-setIcon($("manageModels"), "boxes", 16); $("manageModels").setAttribute("aria-label", "Manage models");
 setIcon($("closeModels"), "close", 18);
 setIcon($("closeAgent"), "close", 18);
 
@@ -464,27 +463,147 @@ function capBadge(c){
   const b=document.createElement("span"); b.className="model-badge cap cap-"+c;
   b.textContent=label; return b;
 }
-function buildModelRow(e){
-  const row=document.createElement("button");
-  row.type="button"; row.className="model-row"; row.setAttribute("role","option");
-  row.dataset.name=e.name;
-  row.setAttribute("aria-selected", String(e.name===selectedModel));
-  if(e.name===selectedModel) row.classList.add("selected");
-  if(!e.hostOnline){ row.classList.add("offline"); row.disabled=true; }
-  const name=document.createElement("span"); name.className="model-row-name"; name.textContent=e.name;
-  row.appendChild(name);
+// --- Unified model picker (drawer) ------------------------------------------
+// The header model button opens a single drawer: an Installed tab that is a
+// one-click selectable list (the current model is always bannered at the top)
+// and a "Get more models" tab for downloads. There is no separate dropdown
+// popover or manage-models button — picking and managing happen in one place.
+// A selectable installed-model row (NAS/Mac server). Clicking selects the model
+// and updates the banner/header/row highlights in place — the drawer stays open
+// so the choice is visible. A per-row ⋯ menu offers Benchmark / Details / Remove.
+function buildInstalledRow(m){
+  const host=m.host||"nas";
+  const online=m.hostOnline!==false;
+  const row=document.createElement("div");
+  row.className="model-row inst-row"+(m.name===selectedModel?" selected":"")+(!online?" offline":"");
+  row.setAttribute("role","option"); row.tabIndex=online?0:-1; row.dataset.name=m.name;
+  row.setAttribute("aria-selected", String(m.name===selectedModel));
+  const main=document.createElement("div"); main.className="model-row-main";
+  const name=document.createElement("span"); name.className="model-row-name"; name.textContent=m.name;
+  main.appendChild(name);
   const badges=document.createElement("span"); badges.className="model-row-badges";
-  badges.appendChild(hostBadge(e.host));
-  const sp=speedBadgeFor(e.tokPerSec); if(sp) badges.appendChild(sp);
-  for(const c of modelCapsFor(e.name)){ const cb=capBadge(c); if(cb) badges.appendChild(cb); }
-  row.appendChild(badges);
-  if(e.hostOnline) row.addEventListener("click",()=>chooseModel(e.name));
+  badges.appendChild(hostBadge(host));
+  if(m.benchmark && m.benchmark.tokPerSec>0){
+    const b=document.createElement("span"); b.className="model-badge speed speed-fast";
+    b.textContent=m.benchmark.tokPerSec.toFixed(0)+" t/s";
+    b.title=`load ${m.benchmark.loadMs||0}ms · prompt ${(m.benchmark.promptTokPerSec||0).toFixed(1)} tok/s`;
+    badges.appendChild(b);
+  }
+  for(const c of (m.capabilities||[])){ const cb=capBadge(c); if(cb) badges.appendChild(cb); }
+  main.appendChild(badges);
+  row.appendChild(main);
+  const sub=document.createElement("div"); sub.className="model-row-sub";
+  const d=m.details||{}; const bits=[d.parameter_size, d.quantization_level, d.family].filter(Boolean);
+  if(m.sizeGB) bits.push(m.sizeGB.toFixed(1)+" GB");
+  sub.textContent=bits.join(" · ") || (!online ? "offline" : "");
+  row.appendChild(sub);
+  const act=document.createElement("span"); act.className="model-row-actions";
+  const chk=document.createElement("span"); chk.className="model-row-check"; chk.innerHTML=icon("check",14);
+  act.appendChild(chk);
+  const more=document.createElement("button"); more.type="button"; more.className="inst-more"; more.title="More"; more.setAttribute("aria-label","Model actions");
+  more.innerHTML=icon("more",16);
+  more.addEventListener("click",e=>{ e.stopPropagation(); openInstalledMenu(m, more, row); });
+  act.appendChild(more);
+  row.appendChild(act);
+  if(online) row.addEventListener("click",e=>{ if(e.target.closest(".inst-more,.inst-confirm,.mcard-details")) return; chooseModel(m.name); });
   return row;
 }
-// Refresh one row's badges after its capabilities finish loading (keeps the
-// popup's scroll/selection intact instead of a full re-render).
+// A Local (this computer) model row: selectable only — we can't benchmark or
+// remove the visitor's own Ollama models from here.
+function buildLocalRow(m){
+  const row=document.createElement("div");
+  row.className="model-row local-row"+(m.name===selectedModel?" selected":"");
+  row.setAttribute("role","option"); row.tabIndex=0; row.dataset.name=m.name;
+  row.setAttribute("aria-selected", String(m.name===selectedModel));
+  const main=document.createElement("div"); main.className="model-row-main";
+  const name=document.createElement("span"); name.className="model-row-name"; name.textContent=m.name;
+  main.appendChild(name);
+  const badges=document.createElement("span"); badges.className="model-row-badges";
+  badges.appendChild(hostBadge("local"));
+  for(const c of (m.capabilities||[])){ const cb=capBadge(c); if(cb) badges.appendChild(cb); }
+  main.appendChild(badges);
+  row.appendChild(main);
+  const sub=document.createElement("div"); sub.className="model-row-sub";
+  const d=m.details||{}; const bits=[d.parameter_size, d.quantization_level, d.family].filter(Boolean);
+  if(m.sizeGB) bits.push(m.sizeGB.toFixed(1)+" GB");
+  sub.textContent=bits.join(" · ");
+  row.appendChild(sub);
+  const act=document.createElement("span"); act.className="model-row-actions";
+  const chk=document.createElement("span"); chk.className="model-row-check"; chk.innerHTML=icon("check",14);
+  act.appendChild(chk);
+  row.appendChild(act);
+  row.addEventListener("click",()=>chooseModel(m.name));
+  return row;
+}
+// Per-row ⋯ menu for a server model: Benchmark, Details, Remove.
+function openInstalledMenu(m, anchor, row){
+  closeMenu();
+  const menu=document.createElement("div"); menu.className="menu";
+  const bench=menuButton("gauge","Benchmark");
+  bench.addEventListener("click",e=>{ e.stopPropagation(); closeMenu(); benchmarkRow(m.name, row); });
+  const det=menuButton("search","Details");
+  det.addEventListener("click",e=>{ e.stopPropagation(); closeMenu(); toggleDetails(m.name, row); });
+  const rm=menuButton("trash","Remove"); rm.classList.add("danger");
+  rm.addEventListener("click",e=>{ e.stopPropagation(); closeMenu(); confirmRemoveRow(m.name, row); });
+  const sep1=document.createElement("div"); sep1.className="sep";
+  const sep2=document.createElement("div"); sep2.className="sep";
+  if(m.hostOnline===false) bench.disabled=true;
+  menu.appendChild(bench); menu.appendChild(sep1); menu.appendChild(det); menu.appendChild(sep2); menu.appendChild(rm);
+  document.body.appendChild(menu);
+  const r=anchor.getBoundingClientRect();
+  menu.style.left=Math.min(r.left, window.innerWidth-menu.offsetWidth-8)+"px";
+  menu.style.top=(r.bottom+4)+"px";
+  openMenu=menu;
+  setTimeout(()=>document.addEventListener("click",closeMenu),0);
+}
+// Run a benchmark and drop the result into the row's badge row as a tok/s badge
+// (replacing any prior benchmark badge). Keeps the row compact.
+function benchmarkRow(name, row){
+  const badges=row.querySelector(".model-row-badges"); if(!badges) return;
+  const old=badges.querySelector(".model-badge.speed"); if(old) old.remove();
+  const slot=document.createElement("span"); slot.className="model-badge speed bench-pending"; slot.textContent="…";
+  badges.appendChild(slot);
+  fetchRetry("/api/models/"+encodeURIComponent(name)+"/benchmark",{method:"POST"},{label:"Benchmark"})
+    .then(r=>r.json().catch(()=>({})))
+    .then(j=>{ slot.remove();
+      if(j && j.tokPerSec>0){
+        const b=document.createElement("span"); b.className="model-badge speed speed-fast"; b.textContent=j.tokPerSec.toFixed(0)+" t/s";
+        b.title=`load ${j.loadMs||0}ms · prompt ${(j.promptTokPerSec||0).toFixed(1)} tok/s`;
+        badges.appendChild(b);
+      } else {
+        const b=document.createElement("span"); b.className="model-badge speed bench-fail"; b.textContent="n/a";
+        b.title=(j&&j.error)||"Benchmark failed"; badges.appendChild(b);
+      }
+    })
+    .catch(()=>{ slot.remove(); const b=document.createElement("span"); b.className="model-badge speed bench-fail"; b.textContent="n/a"; badges.appendChild(b); });
+}
+// Inline remove-confirm that expands under the row (replaces native confirm).
+function confirmRemoveRow(name, row, err){
+  let box=row.querySelector(".inst-confirm"); if(box) box.remove();
+  box=document.createElement("div"); box.className="inst-confirm";
+  const msg=document.createElement("span"); msg.className = err ? "rm-msg err-note" : "rm-msg muted";
+  msg.textContent = err ? err : `Remove "${name}" from the NAS? This frees disk space.`;
+  const cancel=document.createElement("button"); cancel.textContent="Cancel";
+  cancel.addEventListener("click",e=>{ e.stopPropagation(); box.remove(); });
+  const ok=document.createElement("button"); ok.className="danger"; ok.textContent="Remove";
+  ok.addEventListener("click",e=>{ e.stopPropagation(); deleteRowModel(name, row); });
+  box.appendChild(msg); box.appendChild(cancel); box.appendChild(ok);
+  row.appendChild(box);
+}
+async function deleteRowModel(name, row){
+  try{
+    const r=await fetchRetry("/api/models/"+encodeURIComponent(name),{method:"DELETE"},{label:"Remove model"});
+    if(r.status===404){ confirmRemoveRow(name, row, "Model not found."); return; }
+    if(!r.ok && r.status!==204){ let j={}; try{j=await r.json()}catch{}; confirmRemoveRow(name, row, j.error||"Could not remove model"); return; }
+    row.remove();
+    await loadModels(); renderModels();
+    if(modelsTab==="browse") await renderBrowseTab();
+  }catch(e){ confirmRemoveRow(name, row, errText(e)); }
+}
+// Refresh one row's capability badges after its /info resolves (keeps the
+// drawer's scroll/selection intact instead of a full re-render).
 function refreshRowBadges(name){
-  const row=modelPopup.querySelector('.model-row[data-name="'+name+'"]');
+  const row=document.querySelector('#tabBody .model-row[data-name="'+name+'"]');
   if(!row) return;
   const badges=row.querySelector(".model-row-badges"); if(!badges) return;
   const e=modelEntries.find(x=>x.name===name); if(!e) return;
@@ -504,28 +623,42 @@ function renderModels(){
   if(cur) modelBtn.appendChild(hostBadge(cur.host));
   const chev=document.createElement("span"); chev.className="model-chev"; chev.innerHTML=icon("chevron-down",14);
   modelBtn.appendChild(chev);
-  // Popup: grouped sections (NAS / Mac / Local).
-  modelPopup.replaceChildren();
-  const groups={};
-  for(const e of modelEntries){ (groups[e.host]=groups[e.host]||[]).push(e); }
-  const labels={nas:"NAS", mac:"Mac", local:"Local (this computer)"};
-  for(const h of ["nas","mac","local"]){
-    const arr=groups[h]; if(!arr||!arr.length) continue;
-    const g=document.createElement("div"); g.className="model-group";
-    const gl=document.createElement("div"); gl.className="model-group-label"; gl.textContent=labels[h]||h;
-    g.appendChild(gl);
-    for(const e of arr) g.appendChild(buildModelRow(e));
-    modelPopup.appendChild(g);
-  }
+  modelBtn.setAttribute("aria-expanded", String($("modelsModal").classList.contains("open")));
+  // Keep the drawer's banner in sync when models refresh while the panel is
+  // open (e.g. after a pull or local re-probe). Row highlights are updated in
+  // place by chooseModel/useModel, so no full re-render here (preserves scroll).
+  if($("modelsModal").classList.contains("open")) renderModelBanner();
 }
-function setModelPopup(open){
-  modelPopup.classList.toggle("hidden", !open);
-  modelBtn.classList.toggle("open", open);
-  modelBtn.setAttribute("aria-expanded", String(open));
-  if(open){
-    const focusEl=modelPopup.querySelector(".model-row.selected:not(.offline)") || modelPopup.querySelector(".model-row:not(.offline)");
-    if(focusEl) focusEl.focus();
+// Current-selection banner: pinned above the tab body, always visible across
+// both tabs so the chosen model is obvious. Empty state nudges to pick/get more.
+function renderModelBanner(){
+  const b=modelBanner; if(!b) return;
+  const cur=modelEntries.find(e=>e.name===selectedModel);
+  b.replaceChildren();
+  b.classList.toggle("empty", !cur);
+  if(!cur){
+    const t=document.createElement("div"); t.className="model-banner-title"; t.textContent="No model selected";
+    const s=document.createElement("div"); s.className="model-banner-sub muted"; s.textContent="Pick one below, or get more models.";
+    b.appendChild(t); b.appendChild(s); return;
   }
+  const t=document.createElement("div"); t.className="model-banner-title";
+  const nm=document.createElement("span"); nm.textContent=cur.name; t.appendChild(nm);
+  const badges=document.createElement("span"); badges.className="model-row-badges";
+  badges.appendChild(hostBadge(cur.host));
+  for(const c of modelCapsFor(cur.name)){ const cb=capBadge(c); if(cb) badges.appendChild(cb); }
+  t.appendChild(badges);
+  b.appendChild(t);
+  const s=document.createElement("div"); s.className="model-banner-sub muted"; s.textContent="Selected — click another model to switch.";
+  b.appendChild(s);
+}
+// Update the installed rows' selected highlight in place (no full re-render, so
+// scroll position is preserved when switching models).
+function updateRowSelection(){
+  document.querySelectorAll('#tabBody .model-row').forEach(r=>{
+    const on=r.dataset.name===selectedModel;
+    r.classList.toggle("selected", on);
+    r.setAttribute("aria-selected", String(on));
+  });
 }
 function chooseModel(name){
   selectedModel=name; localStorage.setItem("nas-llm-model", selectedModel);
@@ -535,11 +668,11 @@ function chooseModel(name){
   // without a refresh. A model-only PATCH is safe even while a background job
   // is mid-generation: it touches just the model column, so the job's
   // appendAssistantMessage finalization (which writes messages) is unaffected.
-  // The full saveConversation PUT was previously skipped during generation (it
-  // re-sends messages and would clobber the in-flight reply), which is why a
-  // model change only "stuck" after a page refresh.
   if(activeId) saveModelSelection();
-  setModelPopup(false); modelBtn.focus();
+  // Update the drawer in place (banner + row highlights) instead of closing a
+  // popup, so the new choice stays visible and the user can keep managing.
+  renderModelBanner();
+  updateRowSelection();
 }
 // Persist just the selected model for the active conversation. Model-only (no
 // messages) so it's safe to call during generation — see chooseModel. Refreshes
@@ -568,18 +701,25 @@ function prefetchCaps(){
     ensureCaps(n).then(()=>{ refreshRowBadges(n); if(n===selectedModel) renderComposer(); next(); });
   })();
 }
-modelBtn.addEventListener("click", e=>{ e.stopPropagation(); setModelPopup(modelPopup.classList.contains("hidden")); });
-document.addEventListener("click", e=>{ if(modelPopup.classList.contains("hidden")) return; if(!modelPopup.contains(e.target) && !modelBtn.contains(e.target)) setModelPopup(false); });
+modelBtn.addEventListener("click", e=>{ e.stopPropagation(); openModelsPanel("installed"); });
+// Keyboard navigation across the installed list: ArrowUp/Down move focus,
+// Enter/Space selects. Escape is handled by the modal-level listener.
 document.addEventListener("keydown", e=>{
-  if(modelPopup.classList.contains("hidden")) return;
-  if(e.key==="Escape"){ setModelPopup(false); modelBtn.focus(); return; }
-  const rows=[...modelPopup.querySelectorAll(".model-row:not(.offline)")];
+  if(!$("modelsModal").classList.contains("open") || modelsTab!=="installed") return;
+  const body=$("tabBody"); if(!body) return;
+  const rows=[...body.querySelectorAll(".model-row:not(.offline)")];
   if(!rows.length) return;
-  const cur=modelPopup.querySelector(".model-row:focus");
-  let idx=cur?rows.indexOf(cur):0;
-  if(e.key==="ArrowDown"){ e.preventDefault(); idx=Math.min(rows.length-1, idx+1); rows[idx].focus(); }
-  else if(e.key==="ArrowUp"){ e.preventDefault(); idx=Math.max(0, idx-1); rows[idx].focus(); }
-  else if(e.key==="Enter"||e.key===" "){ e.preventDefault(); const r=cur||rows[0]; if(r) chooseModel(r.dataset.name); }
+  if(e.key=="ArrowDown"||e.key=="ArrowUp"){
+    e.preventDefault();
+    const cur=body.querySelector(".model-row:focus");
+    let idx=cur?rows.indexOf(cur):rows.findIndex(r=>r.classList.contains("selected"));
+    if(idx<0) idx=0;
+    idx=e.key=="ArrowDown"?Math.min(rows.length-1,idx+1):Math.max(0,idx-1);
+    rows[idx].focus();
+  } else if(e.key=="Enter"||e.key==" "){
+    const cur=body.querySelector(".model-row:focus");
+    if(cur){ e.preventDefault(); chooseModel(cur.dataset.name); }
+  }
 });
 
 // --- Sidebar / conversations ------------------------------------------------
@@ -1416,14 +1556,13 @@ let activePullAbort = null;     // AbortController for an in-flight LOCAL (brows
 function loadLocalPullName(){ return localStorage.getItem("nas-llm-local-pull") || ""; }
 function saveLocalPullName(name){ if(name) localStorage.setItem("nas-llm-local-pull", name); else localStorage.removeItem("nas-llm-local-pull"); }
 
-$("manageModels").addEventListener("click", openModelsPanel);
 $("closeModels").addEventListener("click", closeModelsPanel);
 $("tabInstalled").addEventListener("click", ()=>switchTab("installed"));
 $("tabBrowse").addEventListener("click", ()=>switchTab("browse"));
 $("modelsModal").addEventListener("click", e=>{ if(e.target===$("modelsModal")) closeModelsPanel(); });
 document.addEventListener("keydown", e=>{ if(e.key==="Escape" && $("modelsModal").classList.contains("open")) closeModelsPanel(); });
 
-function openModelsPanel(){ $("modelsModal").classList.add("open"); switchTab(modelsTab, true); }
+function openModelsPanel(tab){ $("modelsModal").classList.add("open"); renderModelBanner(); switchTab(tab||"installed"); }
 function closeModelsPanel(){
   $("modelsModal").classList.remove("open");
   if(pullES){ pullES.close(); pullES=null; } // pull keeps running on the NAS; reattach on reopen
@@ -1443,22 +1582,34 @@ async function renderInstalledTab(){
   catch(e){ body.appendChild(mutedNote("Could not load models: "+errText(e))); await resumePullIfActive(); return; }
   const list=data.data||[];
   lastServerModels=list;
-  // Local (this computer) section sits above the server card list. It shows
-  // the visitor's own Ollama models, distinct from NAS/Mac server models.
-  body.appendChild(renderLocalSection());
   modelEntries=buildModelEntries(list, localEntries());
   models=modelEntries.map(e=>e.name);
   syncSelectedFromEntries();
-  renderModels();                                   // keep the header selector in sync
-  if(!list.length){
-    if(!localModelNames.length) body.appendChild(mutedNote("No models installed yet. Go to Browse to download one."));
-  } else list.forEach(m=>body.appendChild(renderInstalledCard(m)));
+  renderModels();                                   // header button + banner in sync
+  renderModelBanner();
+  // Grouped selectable rows: NAS, Mac, then Local (this computer).
+  const groups={};
+  for(const m of list){ const h=m.host||"nas"; (groups[h]=groups[h]||[]).push(m); }
+  const none=!((groups.nas&&groups.nas.length)||(groups.mac&&groups.mac.length)||localModelNames.length);
+  if(none) body.appendChild(mutedNote("No models installed yet. Get more models to download one."));
+  for(const h of ["nas","mac"]){
+    const arr=groups[h]; if(!arr||!arr.length) continue;
+    body.appendChild(makeGroupLabel({nas:"NAS",mac:"Mac"}[h]));
+    arr.forEach(m=>body.appendChild(buildInstalledRow(m)));
+  }
+  body.appendChild(renderLocalBlock());
+  // Prominent bottom CTA so "get more models" is obvious without changing tabs.
+  const cta=document.createElement("button"); cta.type="button"; cta.className="get-more-cta";
+  cta.innerHTML=icon("download",15)+'<span>Get more models</span>';
+  cta.addEventListener("click",()=>switchTab("browse"));
+  body.appendChild(cta);
   await resumePullIfActive();
 }
-// The Local section: a heading + "Connect local models" button, then either
-// the discovered model cards, a hint (nothing connected yet), or the last
-// discovery error (403/refused) rendered verbatim per the relay contract.
-function renderLocalSection(){
+function makeGroupLabel(text){ const gl=document.createElement("div"); gl.className="model-group-label"; gl.textContent=text; return gl; }
+// Local (this computer) block: heading + Connect button, then either the
+// visitor's discovered model rows, a hint (nothing connected yet), or the last
+// discovery error (403/refused) per the relay contract. Rows are selectable.
+function renderLocalBlock(){
   const sec=document.createElement("div"); sec.className="local-section";
   const head=document.createElement("div"); head.className="local-head";
   const label=document.createElement("div"); label.className="local-label"; label.textContent="Local (this computer)";
@@ -1472,30 +1623,13 @@ function renderLocalSection(){
   }
   const known=localModels.length?localModels:localModelNames.map(n=>({name:n}));
   if(known.length){
-    known.forEach(m=>sec.appendChild(renderLocalCard(m)));
+    known.forEach(m=>sec.appendChild(buildLocalRow(m)));
   } else if(!localDiscoverMsg){
     const hint=document.createElement("div"); hint.className="muted local-hint";
     hint.textContent="Connect to Ollama on this computer (localhost:11434) to use your own models here — full feature parity with server models.";
     sec.appendChild(hint);
   }
   return sec;
-}
-// A local model card: name + size/details (if known) + a Use button. We can't
-// remove or benchmark the visitor's models, so no Remove/Benchmark actions.
-function renderLocalCard(m){
-  const card=document.createElement("div"); card.className="mcard local-card";
-  const head=document.createElement("div"); head.className="mcard-head";
-  const title=document.createElement("div"); title.className="mcard-title"; title.textContent=m.name;
-  const sub=document.createElement("div"); sub.className="mcard-sub";
-  const d=m.details||{}; const bits=[d.parameter_size, d.quantization_level, d.family].filter(Boolean);
-  if(m.sizeGB) bits.push(m.sizeGB.toFixed(1)+" GB");
-  sub.textContent=bits.join(" · ");
-  head.appendChild(title); head.appendChild(sub); card.appendChild(head);
-  if(m.capabilities && m.capabilities.length){ const cb=capBadges(m.capabilities); if(cb) card.appendChild(cb); }
-  const actions=document.createElement("div"); actions.className="mcard-actions";
-  const use=document.createElement("button"); use.textContent="Use"; use.addEventListener("click",()=>useModel(m.name));
-  actions.appendChild(use); card.appendChild(actions);
-  return card;
 }
 async function onConnectLocal(){
   localDiscoverMsg=null;
@@ -1515,44 +1649,6 @@ async function onConnectLocal(){
   await renderInstalledTab();
 }
 
-function renderInstalledCard(m){
-  const card=document.createElement("div"); card.className="mcard";
-  if(m.hostOnline===false) card.classList.add("offline");
-  const d=m.details||{};
-  const head=document.createElement("div"); head.className="mcard-head";
-  const title=document.createElement("div"); title.className="mcard-title"; title.textContent=m.name;
-  const sub=document.createElement("div"); sub.className="mcard-sub";
-  const bits=[d.parameter_size, d.quantization_level, d.family].filter(Boolean);
-  if(m.sizeGB) bits.push(m.sizeGB.toFixed(1)+" GB");
-  sub.textContent=bits.join(" · ");
-  head.appendChild(title); head.appendChild(sub); card.appendChild(head);
-  if(m.capabilities && m.capabilities.length){ const cb=capBadges(m.capabilities); if(cb) card.appendChild(cb); }
-
-  const meta=document.createElement("div"); meta.className="mcard-meta";
-  if(m.host) meta.appendChild(badge(hostLabel(m.host), "host"));
-  if(m.hostOnline===false) meta.appendChild(badge("offline", "fit-bad"));
-  if(m.benchmark && m.benchmark.tokPerSec>0){
-    meta.appendChild(badge(`${m.benchmark.tokPerSec.toFixed(1)} tok/s (measured)`, "speed-fast"));
-    const s=document.createElement("span"); s.className="muted bench-sub";
-    s.textContent=`load ${m.benchmark.loadMs||0}ms · prompt ${(m.benchmark.promptTokPerSec||0).toFixed(1)} tok/s`;
-    meta.appendChild(s);
-  } else {
-    meta.appendChild(badge("not benchmarked", ""));
-  }
-  card.appendChild(meta);
-
-  const actions=document.createElement("div"); actions.className="mcard-actions";
-  const use=document.createElement("button"); use.textContent="Use"; use.addEventListener("click",()=>useModel(m.name));
-  const bench=document.createElement("button"); bench.textContent="Benchmark"; bench.addEventListener("click",()=>benchmarkModel(m.name, meta));
-  const det=document.createElement("button"); det.textContent="Details"; det.addEventListener("click",()=>toggleDetails(m.name, card));
-  const rm=document.createElement("button"); rm.textContent="Remove"; rm.className="danger";
-  rm.addEventListener("click",()=>confirmRemoveModel(m.name, card));
-  if(activeId && generatingIds.has(activeId) && selectedModel===m.name) rm.disabled=true;
-  if(m.hostOnline===false){ use.disabled=true; bench.disabled=true; }  // can't run on an offline host
-  actions.appendChild(use); actions.appendChild(bench); actions.appendChild(det); actions.appendChild(rm);
-  card.appendChild(actions);
-  return card;
-}
 
 // Browse state: the catalog is fetched once per tab render and re-filtered
 // client-side as the user types/selects categories (no re-fetch per filter).
@@ -2057,52 +2153,15 @@ async function cancelPull(jobId){
 // --- Per-model actions ------------------------------------------------------
 function useModel(name){
   selectedModel=name; localStorage.setItem("nas-llm-model", selectedModel);
-  syncVision();
-  renderModels();
-  enforceToolGating();
+  syncVision(); renderModels(); enforceToolGating();
   if(activeId) saveModelSelection();   // model-only PATCH; safe during generation
-  closeModelsPanel();
+  // Land on the installed list with the new pick highlighted; keep the panel
+  // open so the selection is visible (instead of closing the drawer).
+  renderModelBanner();
+  if(modelsTab!=="installed") switchTab("installed");
+  else updateRowSelection();
 }
 
-async function benchmarkModel(name, metaEl){
-  metaEl.replaceChildren(thinkingDots());
-  const t=document.createElement("span"); t.className="muted"; t.textContent=" benchmarking…"; metaEl.appendChild(t);
-  try{
-    const r=await fetchRetry("/api/models/"+encodeURIComponent(name)+"/benchmark",{method:"POST"},{label:"Benchmark"});
-    const j=await r.json().catch(()=>({}));
-    if(!r.ok){ metaEl.replaceChildren(badge("not benchmarked","")); const e=document.createElement("span"); e.className="err-note bench-sub"; e.textContent=j.error||"Benchmark failed"; metaEl.appendChild(e); return; }
-    metaEl.replaceChildren();
-    metaEl.appendChild(badge(`${(j.tokPerSec||0).toFixed(1)} tok/s (measured)`, "speed-fast"));
-    const s=document.createElement("span"); s.className="muted bench-sub";
-    s.textContent=`load ${j.loadMs||0}ms · prompt ${(j.promptTokPerSec||0).toFixed(1)} tok/s`;
-    metaEl.appendChild(s);
-  }catch(e){ metaEl.replaceChildren(badge("not benchmarked","")); const er=document.createElement("span"); er.className="err-note bench-sub"; er.textContent=errText(e); metaEl.appendChild(er); }
-}
-
-async function deleteModel(name, card){
-  try{
-    const r=await fetchRetry("/api/models/"+encodeURIComponent(name),{method:"DELETE"},{label:"Remove model"});
-    if(r.status===404){ confirmRemoveModel(name, card, "Model not found."); return; }
-    if(!r.ok && r.status!==204){ let j={}; try{j=await r.json()}catch{}; confirmRemoveModel(name, card, j.error||"Could not remove model"); return; }
-    card.remove();
-    await loadModels(); renderModels();
-    if(modelsTab==="browse") await renderBrowseTab();
-  }catch(e){ confirmRemoveModel(name, card, errText(e)); }
-}
-// Inline confirm inside a model card's action row (replaces native confirm).
-function confirmRemoveModel(name, card, err){
-  const actions=card.querySelector(".mcard-actions");
-  if(!actions) return;
-  actions.replaceChildren();
-  const msg=document.createElement("span");
-  msg.className = err ? "rm-msg err-note" : "rm-msg muted";
-  msg.textContent = err ? err : `Remove "${name}" from the NAS? This frees disk space.`;
-  const cancel=document.createElement("button"); cancel.textContent="Cancel";
-  cancel.addEventListener("click", async ()=>{ if(modelsTab==="installed") await renderInstalledTab(); else await renderBrowseTab(); });
-  const ok=document.createElement("button"); ok.className="danger"; ok.textContent="Remove";
-  ok.addEventListener("click",()=>deleteModel(name, card));
-  actions.appendChild(msg); actions.appendChild(cancel); actions.appendChild(ok);
-}
 // Transient inline error note at the top of the models panel (replaces alert).
 function flashError(text){
   const body=$("tabBody");
@@ -2356,8 +2415,8 @@ const COMMANDS = [
   { name:"web", desc:"Toggle Web search mode", icon:"globe", args:false, run(){ toggleExtra("web"); } },
   { name:"clarify", desc:"Toggle Clarify mode", icon:"help", args:false, run(){ toggleExtra("clarify"); } },
   { name:"agent", desc:"Toggle Agent mode", icon:"sparkles", args:false, run(){ toggleExtra("agent"); } },
-  { name:"models", desc:"Open Manage models", icon:"boxes", args:false, run(){ openModelsPanel(); } },
-  { name:"model", desc:"Open the model selector", icon:"chevron-down", args:false, run(){ setModelPopup(true); } },
+  { name:"models", desc:"Open the model picker", icon:"boxes", args:false, run(){ openModelsPanel("installed"); } },
+  { name:"model", desc:"Pick a model", icon:"chevron-down", args:false, run(){ openModelsPanel("installed"); } },
   { name:"agent-settings", desc:"Open Agent settings", icon:"wrench", args:false, run(){ openAgentPanel(); } },
   { name:"plan", desc:"Pre-fill a planning prompt", icon:"sparkles", args:true, run(a){ const task=(a||"").trim(); if(!task){ slashNote("Usage: /plan <task>"); return; } input.value=PLAN_TEMPLATE.replace("{task}", task); autosize(); closeSlashPopup(); input.focus(); } },
   { name:"logout", desc:"Sign out", icon:"logout", args:false, run(){ logout(); } },
@@ -2434,11 +2493,11 @@ function runSlashIndex(i){
   runCommand(c, c.args ? v.slice(sp+1) : "");
 }
 // Execute a command: clear the input, close the popup, run, then refocus the
-// composer unless a modal or the model dropdown took over the view.
+// composer unless a modal took over the view.
 function runCommand(c, args){
   input.value=""; autosize(); closeSlashPopup();
   try{ c.run(args); }catch(err){ slashNote(String(err&&err.message||err)); }
-  if($("modelsModal").classList.contains("open")||agentModal.classList.contains("open")||!modelPopup.classList.contains("hidden")) return;
+  if($("modelsModal").classList.contains("open")||agentModal.classList.contains("open")) return;
   input.focus();
 }
 // Toggle a tool mode (web/clarify/agent) with the same gating + exclusivity as
