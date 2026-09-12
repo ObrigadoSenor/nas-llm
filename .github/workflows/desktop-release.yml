@@ -36,14 +36,10 @@ jobs:
       - name: Build and bundle (macOS)
         if: matrix.platform == 'macos-latest'
         working-directory: desktop
+        # Unsigned builds for local testing. To sign + notarize, add an `env:`
+        # block here with APPLE_SIGNING_IDENTITY / APPLE_ID / APPLE_PASSWORD /
+        # APPLE_TEAM_ID secrets and uncomment them.
         run: npx tauri build ${{ matrix.args }}
-        env:
-          # No code signing for now — unsigned builds for local testing.
-          # To sign + notarize, set these secrets and uncomment:
-          # APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          # APPLE_ID: ${{ secrets.APPLE_ID }}
-          # APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
 
       - name: Build and bundle (Windows)
         if: matrix.platform == 'windows-latest'
