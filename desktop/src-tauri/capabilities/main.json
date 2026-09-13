@@ -9,6 +9,7 @@
     "core:default",
     "core:event:default",
     "dialog:default",
+    "notification:default",
     "allow-app-version",
     "allow-check-for-updates",
     "allow-download-and-install-update"

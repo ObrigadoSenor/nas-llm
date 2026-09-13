@@ -395,13 +395,21 @@ func createPrTool() oaiTool {
 // injectRepoContext prepends a repo context block to the agent system prompt
 // so the model knows which repository it's working against: the repo name,
 // current branch, HEAD, and the top-level file tree. This is injected only for
-// repo-bound agent runs.
-func injectRepoContext(sys string, r *Repo) string {
+// repo-bound agent runs. convBranch is the conversation's own bound branch
+// (conversations.repo_branch); when set it wins over r.Branch, which is only
+// the shared working tree's branch and can be plain wrong for a chat pinned to
+// its own branch (e.g. via a worktree) — telling the model the wrong branch
+// would make its "what am I working on" narration false.
+func injectRepoContext(sys string, r *Repo, convBranch string) string {
+	branch := r.Branch
+	if strings.TrimSpace(convBranch) != "" {
+		branch = convBranch
+	}
 	var b strings.Builder
 	b.WriteString("You are working against a cloned codebase: ")
 	b.WriteString(r.FullName)
 	b.WriteString(" (branch: ")
-	b.WriteString(r.Branch)
+	b.WriteString(branch)
 	if r.Head != "" {
 		b.WriteString(", HEAD: ")
 		b.WriteString(r.Head[:min(12, len(r.Head))])

@@ -490,6 +490,14 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	j := newJob(convID, email, body.Model, body.WebSearch, body.Clarify, body.Agent)
 	j.local = body.Local
 	j.supportsTools = body.SupportsTools
+	j.hub = s.hub
+	// needsBrowser marks a job as connection-bound: local (browser-relay)
+	// inference relays through the browser by definition, and a repo-bound
+	// agent run also relays its file tools through the browser (toolExec) even
+	// when the model itself runs server-side. Both get the grace-period cancel
+	// in handleEvents/handleUserEvents instead of the "survive any disconnect"
+	// behavior a plain server-model job gets.
+	j.needsBrowser = body.Local || (body.Agent && c.RepoID != "")
 	if err := s.jobs.enqueue(j); err != nil {
 		if errors.Is(err, errJobActive) {
 			if existing := s.jobs.get(convID); existing != nil {
@@ -683,14 +691,18 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case <-r.Context().Done():
-			// A local-model (browser-relay) job is connection-bound: the SSE tail is
-			// the only channel the browser uses to receive modelCall cues and POST
-			// results, so if it drops (tab closed/navigated) the generation cannot
-			// continue. Cancel the job — aborting any pending relay wait — and let
-			// the worker persist the partial reply as cancelled. Server-model jobs
-			// stay detached and keep generating after a disconnect.
-			if j.local {
-				j.cancel()
+			// A job that needs the browser (local inference, or a repo-bound agent
+			// run relaying file tools) is connection-bound: this tail is one of the
+			// two channels (the other being the user's /api/events stream) the
+			// browser uses to receive modelCall/toolExec cues and POST results back.
+			// Rather than cancelling outright, give it BROWSER_RELAY_GRACE to
+			// reattach via either channel — this is what lets a chat switch or a
+			// page reload survive instead of killing the generation, while an
+			// actually-closed app still gets cleaned up. Jobs that don't need the
+			// browser stay detached and keep generating after a disconnect, exactly
+			// as before.
+			if j.needsBrowser {
+				j.scheduleGraceCancel(s.cfg.browserRelayGrace, s.hub)
 			}
 			return
 		case ev := <-ch:
@@ -764,6 +776,88 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 				writeSSE("event: done\ndata: \n\n")
 			}
 			return
+		}
+	}
+}
+
+// handleUserEvents is GET /api/events: a per-user multiplexed SSE stream
+// carrying modelCall/toolExec/phase/done/joberror events for every job the
+// caller has running, each tagged with convId+jobId so the client can route it
+// to the right chat. This is what lets a backgrounded chat's browser relay
+// keep working and the sidebar/notification UI stay current without a
+// dedicated per-conversation tail per chat — the desktop sidecar's HTTP/1.1
+// 127.0.0.1 origin and the webview's ~6-connections-per-origin cap mean only
+// two long-lived connections (this one plus the single foreground tail) can be
+// afforded regardless of how many chats are actually running. With no
+// user-specific state to replay (unlike a job's per-conversation tail), this
+// only streams events live plus the same keepalive discipline as handleEvents.
+func (s *server) handleUserEvents(w http.ResponseWriter, r *http.Request) {
+	email := emailFrom(r)
+
+	flusher, _ := w.(http.Flusher)
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("X-Accel-Buffering", "no")
+	h.Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	if flusher != nil {
+		flusher.Flush()
+	}
+
+	ch := s.hub.subscribe(email)
+	defer s.hub.unsubscribe(email, ch)
+
+	var mu sync.Mutex
+	writeSSE := func(str string) {
+		mu.Lock()
+		_, _ = io.WriteString(w, str)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		mu.Unlock()
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		t := time.NewTicker(keepaliveEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				writeSSE(":keep\n\n")
+			}
+		}
+	}()
+	defer func() {
+		close(stop)
+		wg.Wait()
+	}()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			// This stream dropped (chat backgrounded/tab closed/app closed). Any of
+			// this user's browser-bound jobs gets a grace period to reattach — via
+			// this stream again or its own per-conversation tail — before being
+			// cancelled; see job.scheduleGraceCancel. A job whose per-conversation
+			// tail is still open is scheduled too, harmlessly: its check finds that
+			// tail live and does nothing.
+			s.jobs.scheduleGraceForUser(email, s.cfg.browserRelayGrace, s.hub)
+			return
+		case ev := <-ch:
+			// "error" is the internal kind; the wire event name is "joberror" per
+			// contract 1, matching handleEvents' flushError.
+			name := ev.kind
+			if name == "error" {
+				name = "joberror"
+			}
+			writeSSE("event: " + name + "\ndata: " + ev.text + "\n\n")
 		}
 	}
 }

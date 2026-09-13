@@ -320,6 +320,165 @@ fn resolve_repo(data_dir: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
+// --- Per-(repo, branch) worktrees (real branch isolation per chat) --------
+//
+// Two chats on different branches of the same repo used to share one
+// checkout, so `repos_branch`/`repos_checkout` (git switch) on one chat would
+// silently move another chat's tree too. Git guarantees a branch is checked
+// out in at most one worktree, so giving each (repo, branch) pair its own
+// worktree under <data_dir>/worktrees/<repo>/<branch> makes that isolation
+// real instead of cosmetic. The main tree (the repo's original clone/linked
+// folder) is reused whenever it already has the requested branch checked
+// out — `git worktree add` would refuse a second checkout of that branch
+// anyway, and reusing it is the correct answer, not a fallback.
+//
+// Known tradeoff, surfaced in the UI rather than worked around here: a fresh
+// worktree has no untracked or ignored files, so node_modules, .env and build
+// caches are absent until the agent (re-)creates them. Do not try to copy
+// those files in — that would defeat the point of an isolated tree (an
+// untracked file dropped in a worktree by another process could silently
+// leak state between chats).
+
+fn worktrees_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("worktrees")
+}
+
+// git_worktree_list parses `git worktree list --porcelain` (run against any
+// worktree of a repo — git resolves the whole set from any member) into
+// (path, branch) pairs. branch is None for a detached or bare entry.
+async fn git_worktree_list(path: &Path) -> Vec<(PathBuf, Option<String>)> {
+    let out = tokio::process::Command::new("git")
+        .arg("-C").arg(path)
+        .arg("worktree").arg("list").arg("--porcelain")
+        .output().await;
+    let mut result = Vec::new();
+    let Ok(o) = out else { return result };
+    if !o.status.success() {
+        return result;
+    }
+    let mut cur_path: Option<PathBuf> = None;
+    let mut cur_branch: Option<String> = None;
+    for line in String::from_utf8_lossy(&o.stdout).lines() {
+        if line.is_empty() {
+            if let Some(p) = cur_path.take() {
+                result.push((p, cur_branch.take()));
+            }
+            continue;
+        }
+        if let Some(p) = line.strip_prefix("worktree ") {
+            cur_path = Some(PathBuf::from(p));
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            cur_branch = Some(b.trim_start_matches("refs/heads/").to_string());
+        }
+    }
+    if let Some(p) = cur_path.take() {
+        result.push((p, cur_branch.take()));
+    }
+    result
+}
+
+// git_worktree_prune clears stale worktree registrations (e.g. a worktree dir
+// that was deleted by hand) so a lookup below never returns a dead path.
+async fn git_worktree_prune(path: &Path) {
+    let _ = tokio::process::Command::new("git")
+        .arg("-C").arg(path)
+        .arg("worktree").arg("prune")
+        .output().await;
+}
+
+// ensure_worktree resolves `branch` for `repo_name` (whose main tree is
+// `main`) to a single checkout, creating a worktree on demand. Returns
+// (path, created). Cases, in order:
+//  1. `branch` is what the main tree (or some other existing worktree)
+//     already has checked out -> reuse it. `git worktree list` reports the
+//     main tree as an entry too, so this and case 2 share one lookup.
+//  2. A worktree for `branch` already exists -> reuse it (after a prune, so a
+//     hand-deleted worktree dir doesn't shadow a fresh `add`).
+//  3. `branch` exists as a local ref -> `git worktree add <dest> <branch>`.
+//  4. `branch` exists only on origin -> tracking checkout via
+//     `git worktree add -b <branch> <dest> origin/<branch>`.
+//  5. `branch` does not exist anywhere: if `create`, branch off the repo's
+//     default branch; otherwise this is an error. Resolving a branch never
+//     invents one unless the caller (the dedicated worktree route) asked for
+//     that explicitly — repos_exec and the session-panel routes always pass
+//     create=false, since a chat's branch should already exist by the time
+//     they run.
+async fn ensure_worktree(
+    data_dir: &Path,
+    repo_name: &str,
+    main: &Path,
+    branch: &str,
+    create: bool,
+) -> Result<(PathBuf, bool), String> {
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return Ok((main.to_path_buf(), false));
+    }
+    git_worktree_prune(main).await;
+    for (p, b) in git_worktree_list(main).await {
+        if b.as_deref() == Some(branch) && p.is_dir() {
+            return Ok((p, false));
+        }
+    }
+    let dest = worktrees_dir(data_dir).join(safe_name(repo_name)).join(safe_name(branch));
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("worktree dir: {e}"))?;
+    }
+    let out = if git_has_ref(main, &format!("refs/heads/{branch}")).await {
+        tokio::process::Command::new("git")
+            .arg("-C").arg(main)
+            .arg("worktree").arg("add").arg(&dest).arg(branch)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output().await
+    } else if git_has_ref(main, &format!("refs/remotes/origin/{branch}")).await {
+        tokio::process::Command::new("git")
+            .arg("-C").arg(main)
+            .arg("worktree").arg("add").arg("-b").arg(branch).arg(&dest).arg(format!("origin/{branch}"))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output().await
+    } else if create {
+        let base = git_default_branch(main).await;
+        tokio::process::Command::new("git")
+            .arg("-C").arg(main)
+            .arg("worktree").arg("add").arg("-b").arg(branch).arg(&dest).arg(&base)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output().await
+    } else {
+        return Err(format!("branch '{branch}' does not exist locally or on origin"));
+    };
+    match out {
+        Ok(o) if o.status.success() => Ok((dest, true)),
+        Ok(o) => {
+            let msg = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            Err(if msg.is_empty() { "git worktree add failed".to_string() } else { msg })
+        }
+        Err(e) => Err(format!("git worktree add: {e}")),
+    }
+}
+
+// resolve_repo_branch is the shared entry point for branch-aware routes
+// (contract 3): resolves `name` to its main tree, then — if `branch` is
+// non-empty — to that branch's worktree. An empty branch (older clients, or
+// a conversation with no repo_branch) returns exactly what resolve_repo
+// returned before this feature existed, so nothing breaks for them. Never
+// creates a branch (create=false); that is the dedicated worktree route's job.
+async fn resolve_repo_branch(data_dir: &Path, name: &str, branch: &str) -> Result<PathBuf, (StatusCode, String)> {
+    let main = match resolve_repo(data_dir, name) {
+        Some(p) => p,
+        None => return Err((StatusCode::NOT_FOUND, "not found locally".to_string())),
+    };
+    if branch.trim().is_empty() {
+        return Ok(main);
+    }
+    ensure_worktree(data_dir, name, &main, branch, false)
+        .await
+        .map(|(p, _created)| p)
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e))
+}
+
 // --- git helpers: remote, ahead/behind, commit, push ----------------------
 
 async fn git_toplevel(path: &Path) -> Option<PathBuf> {
@@ -708,6 +867,10 @@ struct CloneBody {
 #[derive(Deserialize)]
 struct NameBody {
     name: String,
+    // Optional per-chat branch (contract 3). Empty/absent preserves the
+    // pre-worktree behaviour exactly: act on the repo's shared main tree.
+    #[serde(default)]
+    branch: String,
 }
 
 // --- handlers --------------------------------------------------------------
@@ -1061,9 +1224,9 @@ async fn repos_checkout(State(st): State<AppState>, Json(body): Json<CheckoutBod
 // user can review agent-made edits in the Working changes panel.
 async fn repos_diff(State(st): State<AppState>, Json(body): Json<NameBody>) -> Response {
     let name = body.name.trim().to_string();
-    let dest = match resolve_repo(&st.data_dir, &name) {
-        Some(p) => p,
-        None => return json_err("not found locally", StatusCode::NOT_FOUND),
+    let dest = match resolve_repo_branch(&st.data_dir, &name, &body.branch).await {
+        Ok(p) => p,
+        Err((status, e)) => return json_err(&e, status),
     };
     let out = tokio::process::Command::new("git")
         .arg("-C").arg(&dest)
@@ -1085,9 +1248,9 @@ async fn repos_diff(State(st): State<AppState>, Json(body): Json<NameBody>) -> R
 // patch without a terminal. Returns the git status after reverting.
 async fn repos_revert(State(st): State<AppState>, Json(body): Json<NameBody>) -> Response {
     let name = body.name.trim().to_string();
-    let dest = match resolve_repo(&st.data_dir, &name) {
-        Some(p) => p,
-        None => return json_err("not found locally", StatusCode::NOT_FOUND),
+    let dest = match resolve_repo_branch(&st.data_dir, &name, &body.branch).await {
+        Ok(p) => p,
+        Err((status, e)) => return json_err(&e, status),
     };
     let _ = tokio::process::Command::new("git")
         .arg("-C").arg(&dest)
@@ -1111,6 +1274,11 @@ struct ExecBody {
     args: String,
     #[serde(default)]
     approved: bool,
+    // Optional per-chat branch (contract 3): sourced from the toolExec SSE
+    // payload's `branch` field. Empty/absent means "use the repo's main tree",
+    // matching today's exact behaviour for older clients and branchless chats.
+    #[serde(default)]
+    branch: String,
 }
 
 #[derive(Serialize, Default)]
@@ -1131,7 +1299,7 @@ struct ExecResult {
 // observation. All tools are scoped to the repo root with path-traversal guards.
 async fn repos_exec(State(st): State<AppState>, Json(body): Json<ExecBody>) -> Response {
     let repo_name = body.repo.trim().to_string();
-    let dest = match resolve_repo(&st.data_dir, &repo_name) {
+    let main = match resolve_repo(&st.data_dir, &repo_name) {
         Some(p) => p,
         None => return json_ok(&ExecResult {
             observation: format!("Repository {repo_name} is not available locally."),
@@ -1139,6 +1307,23 @@ async fn repos_exec(State(st): State<AppState>, Json(body): Json<ExecBody>) -> R
             is_error: true,
             ..Default::default()
         }),
+    };
+    // branch (contract 3): resolve to that chat's worktree so its tool calls
+    // never land in another chat's checkout. Never auto-creates the branch
+    // (create=false) — by the time a toolExec call carries a branch, the
+    // renderer has already ensured the worktree exists via /repos/worktree.
+    let dest = if body.branch.trim().is_empty() {
+        main
+    } else {
+        match ensure_worktree(&st.data_dir, &repo_name, &main, &body.branch, false).await {
+            Ok((p, _created)) => p,
+            Err(e) => return json_ok(&ExecResult {
+                observation: format!("Branch worktree unavailable: {e}"),
+                preview: "worktree error".into(),
+                is_error: true,
+                ..Default::default()
+            }),
+        }
     };
     let root = match std::fs::canonicalize(&dest) {
         Ok(r) => r,
@@ -1789,9 +1974,9 @@ async fn repos_scan_local(Json(body): Json<ScanBody>) -> Response {
 // pre-fill and gate the Push button (Push only makes sense with a remote).
 async fn repos_changelog(State(st): State<AppState>, Json(body): Json<NameBody>) -> Response {
     let name = body.name.trim().to_string();
-    let dest = match resolve_repo(&st.data_dir, &name) {
-        Some(p) => p,
-        None => return json_err("not found locally", StatusCode::NOT_FOUND),
+    let dest = match resolve_repo_branch(&st.data_dir, &name, &body.branch).await {
+        Ok(p) => p,
+        Err((status, e)) => return json_err(&e, status),
     };
     let remote = git_remote_url(&dest).await;
     let branch = git_branch(&dest).await;
@@ -1831,6 +2016,8 @@ struct ShipBody {
     message: String,
     #[serde(default)]
     push: bool,
+    #[serde(default)]
+    branch: String,
 }
 
 // repos_ship is the "final version" action: append a Keep-a-Changelog entry to
@@ -1840,9 +2027,9 @@ struct ShipBody {
 // configured origin. The token is scrubbed from any captured output.
 async fn repos_ship(State(st): State<AppState>, Json(body): Json<ShipBody>) -> Response {
     let name = body.repo.trim().to_string();
-    let dest = match resolve_repo(&st.data_dir, &name) {
-        Some(p) => p,
-        None => return json_err("not found locally", StatusCode::NOT_FOUND),
+    let dest = match resolve_repo_branch(&st.data_dir, &name, &body.branch).await {
+        Ok(p) => p,
+        Err((status, e)) => return json_err(&e, status),
     };
     let version = body.version.trim().to_string();
     if version.is_empty() {
@@ -2050,6 +2237,8 @@ async fn repos_branch(State(st): State<AppState>, Json(body): Json<BranchBody>) 
 #[derive(Deserialize)]
 struct StateQuery {
     name: String,
+    #[serde(default)]
+    branch: String,
 }
 
 // repos_state returns the live git state for a repo in one call: current
@@ -2057,9 +2246,9 @@ struct StateQuery {
 // remote is configured. ahead/behind are 0/0 when the upstream ref is absent.
 async fn repos_state(State(st): State<AppState>, Query(q): Query<StateQuery>) -> Response {
     let name = q.name.trim().to_string();
-    let dest = match resolve_repo(&st.data_dir, &name) {
-        Some(p) => p,
-        None => return json_err("not found locally", StatusCode::NOT_FOUND),
+    let dest = match resolve_repo_branch(&st.data_dir, &name, &q.branch).await {
+        Ok(p) => p,
+        Err((status, e)) => return json_err(&e, status),
     };
     let branch = git_branch(&dest).await;
     let dirty = git_dirty_count(&dest).await;
@@ -2089,6 +2278,8 @@ struct CommitBody {
     message: String,
     #[serde(default)]
     push: bool,
+    #[serde(default)]
+    branch: String,
 }
 
 // repos_commit is a lightweight commit (+ optional push) with no version or
@@ -2096,9 +2287,9 @@ struct CommitBody {
 // but the repo has no remote, returns {ok:false, error:"no remote configured"}.
 async fn repos_commit(State(st): State<AppState>, Json(body): Json<CommitBody>) -> Response {
     let name = body.repo.trim().to_string();
-    let dest = match resolve_repo(&st.data_dir, &name) {
-        Some(p) => p,
-        None => return json_err("not found locally", StatusCode::NOT_FOUND),
+    let dest = match resolve_repo_branch(&st.data_dir, &name, &body.branch).await {
+        Ok(p) => p,
+        Err((status, e)) => return json_err(&e, status),
     };
     let message = body.message.trim().to_string();
     if message.is_empty() {
@@ -2156,6 +2347,8 @@ struct CreatePrBody {
     head: Option<String>,
     #[serde(default)]
     base: Option<String>,
+    #[serde(default)]
+    branch: String,
 }
 
 // repos_create_pr opens a GitHub PR for the repo's current (or specified) head
@@ -2164,9 +2357,9 @@ struct CreatePrBody {
 // no remote, or the push/PR call fails.
 async fn repos_create_pr(State(st): State<AppState>, Json(body): Json<CreatePrBody>) -> Response {
     let name = body.repo.trim().to_string();
-    let dest = match resolve_repo(&st.data_dir, &name) {
-        Some(p) => p,
-        None => return json_err("not found locally", StatusCode::NOT_FOUND),
+    let dest = match resolve_repo_branch(&st.data_dir, &name, &body.branch).await {
+        Ok(p) => p,
+        Err((status, e)) => return json_err(&e, status),
     };
     let title = body.title.trim().to_string();
     if title.is_empty() {
@@ -2185,6 +2378,47 @@ async fn repos_create_pr(State(st): State<AppState>, Json(body): Json<CreatePrBo
     match create_pr_for_repo(&st.client, &dest, &title, &body.body, &head, base.as_deref()).await {
         Ok(url) => json_ok(&serde_json::json!({ "ok": true, "url": url })),
         Err(e) => json_ok(&serde_json::json!({ "ok": false, "url": null, "error": e })),
+    }
+}
+
+#[derive(Deserialize)]
+struct WorktreeBody {
+    name: String,
+    branch: String,
+    #[serde(default)]
+    create: bool,
+}
+
+// repos_worktree ensures a (repo, branch) worktree exists (contract 3). The
+// renderer calls this when a chat is re-pointed at a branch, before any
+// toolExec/session-panel call carries that branch — those calls resolve with
+// create=false, so by the time they arrive the worktree this route created
+// (or reused) is already there.
+async fn repos_worktree(State(st): State<AppState>, Json(body): Json<WorktreeBody>) -> Response {
+    let name = body.name.trim().to_string();
+    let branch = body.branch.trim().to_string();
+    if branch.is_empty() {
+        return json_ok(&serde_json::json!({
+            "ok": false, "branch": "", "path": null, "created": false, "error": "branch is required",
+        }));
+    }
+    let main = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_ok(&serde_json::json!({
+            "ok": false, "branch": branch, "path": null, "created": false, "error": "not found locally",
+        })),
+    };
+    match ensure_worktree(&st.data_dir, &name, &main, &branch, body.create).await {
+        Ok((path, created)) => json_ok(&serde_json::json!({
+            "ok": true,
+            "branch": branch,
+            "path": path.display().to_string(),
+            "created": created,
+            "error": null,
+        })),
+        Err(e) => json_ok(&serde_json::json!({
+            "ok": false, "branch": branch, "path": null, "created": false, "error": e,
+        })),
     }
 }
 
@@ -2214,6 +2448,7 @@ pub fn router(state: AppState) -> Router {
         .route("/__sidecar/repos/checkout", post(repos_checkout))
         .route("/__sidecar/repos/commit", post(repos_commit))
         .route("/__sidecar/repos/create-pr", post(repos_create_pr))
+        .route("/__sidecar/repos/worktree", post(repos_worktree))
         .with_state(state)
 }
 

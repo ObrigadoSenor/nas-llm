@@ -50,6 +50,22 @@ type config struct {
 	macURL             string
 	macRamGB           float64
 	macSystemReserveGB float64
+	// maxConcurrentJobs sizes the generation worker pool (jobManager). A
+	// browser-relay job blocks its worker while it awaits the user's browser, so
+	// with a single worker one local-model chat used to stall every other chat.
+	maxConcurrentJobs int
+	// browserRelayGrace is how long a browser-bound job (local inference, or a
+	// repo-bound agent run relaying file tools) is kept alive after its
+	// connection-of-record drops, waiting for a reattach (chat switch, reload)
+	// before being cancelled. See job.scheduleGraceCancel.
+	browserRelayGrace time.Duration
+	// agentJobTimeout bounds an agent-mode generation. Longer than genTimeout
+	// because apply_patch/run_command/git_* block on a user approval dialog.
+	agentJobTimeout time.Duration
+	// toolExecTimeout bounds a single toolExec relay round-trip (the browser
+	// running a file tool and POSTing the observation back). Longer than a
+	// plain tool call because several of these tools also wait on approval.
+	toolExecTimeout time.Duration
 }
 
 type server struct {
@@ -65,6 +81,11 @@ type server struct {
 	modelsProxies map[string]http.Handler
 	jobs          *jobManager
 	pulls         *pullManager
+	// hub is the per-user multiplexed stream backing GET /api/events. Jobs
+	// publish modelCall/toolExec/phase/done/joberror events to it so a
+	// backgrounded chat's browser relay and sidebar/notification UI keep
+	// working without a dedicated per-conversation tail.
+	hub *eventHub
 }
 
 type ctxKey int
@@ -93,6 +114,10 @@ func main() {
 		macURL:             env("OLLAMA_MAC_URL", ""),
 		macRamGB:           envFloat("MAC_RAM_GB", 16),
 		macSystemReserveGB: envFloat("MAC_SYSTEM_RESERVE_GB", 2),
+		maxConcurrentJobs:  envInt("MAX_CONCURRENT_JOBS", 4),
+		browserRelayGrace:  envDuration("BROWSER_RELAY_GRACE", 45*time.Second),
+		agentJobTimeout:    envDuration("AGENT_JOB_TIMEOUT", 30*time.Minute),
+		toolExecTimeout:    envDuration("TOOL_EXEC_TIMEOUT", 15*time.Minute),
 	}
 	cfg.cookieSecure = strings.HasPrefix(cfg.appBaseURL, "https://")
 	cfg.allowedEmails = parseAllowed(os.Getenv("ALLOWED_EMAILS"))
@@ -122,6 +147,7 @@ func main() {
 		hosts:         hostReg,
 		chatProxies:   map[string]http.Handler{},
 		modelsProxies: map[string]http.Handler{},
+		hub:           newEventHub(),
 	}
 	for _, h := range hostReg.all() {
 		srv.chatProxies[h.name] = buildProxy(h.url, "/v1/chat/completions")
@@ -173,6 +199,19 @@ func envBool(k string, def bool) bool {
 	return def
 }
 
+// envDuration parses a Go duration string (e.g. "45s", "30m") from the named
+// env var, falling back to def on empty/invalid input. Used for the
+// human-in-the-loop timeouts (contract 6), which need units coarser than
+// envInt's bare seconds.
+func envDuration(k string, def time.Duration) time.Duration {
+	if v := os.Getenv(k); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return def
+}
+
 func mustEnv(k string) string {
 	v := os.Getenv(k)
 	if v == "" {
@@ -217,6 +256,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /api/models/{name}/info", s.requireAuth(s.handleModelInfo))
 	mux.HandleFunc("POST /api/chat/completions", s.requireAuth(s.handleChat))
 	mux.HandleFunc("GET /api/jobs/active", s.requireAuth(s.handleActiveJobs))
+	mux.HandleFunc("GET /api/events", s.requireAuth(s.handleUserEvents))
 	mux.HandleFunc("GET /api/conversations", s.requireAuth(s.handleListConversations))
 	mux.HandleFunc("GET /api/conversations/{id}", s.requireAuth(s.handleGetConversation))
 	mux.HandleFunc("POST /api/conversations", s.requireAuth(s.handleCreateConversation))

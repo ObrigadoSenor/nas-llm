@@ -68,12 +68,19 @@ function el(tag, cls, text) {
   if (!OrigES) return;
   function patched(url) {
     const es = new OrigES(url);
-    // Extract the conversation ID from the /api/conversations/:id/events URL.
-    let convId = null;
-    try { const m = String(url).match(/\/api\/conversations\/([^/]+)\/events/); if (m) convId = decodeURIComponent(m[1]); } catch {}
+    // Extract the conversation ID from the /api/conversations/:id/events URL,
+    // as a fallback for streams that don't carry convId in every payload.
+    let urlConvId = null;
+    try { const m = String(url).match(/\/api\/conversations\/([^/]+)\/events/); if (m) urlConvId = decodeURIComponent(m[1]); } catch {}
     es.addEventListener("toolExec", async (e) => {
       let d = {}; try { d = JSON.parse(e.data); } catch { return; }
       if (!d.jobId || !d.tool) return;
+      // The global /api/events stream (multiple concurrent chats) tags every
+      // payload with convId; fall back to the id parsed from the per-conv
+      // stream's URL. toolExec is owned exclusively by this shim — never by
+      // www/app.js — so this is the only path a background chat's tool calls
+      // get routed correctly, whichever stream they arrive on.
+      const convId = d.convId || urlConvId;
       await runToolExec(convId, d);
     });
     return es;
@@ -313,13 +320,28 @@ function addUpdatesSection(card) {
   };
 }
 
+// Resolve a conversation's display title for the approval dialog and
+// notifications. Uses the branch rail's cached workspace maps; refreshes once
+// if the id isn't found (e.g. a chat created after boot).
+async function titleForConv(convId) {
+  if (!convId) return "";
+  let conv = railMaps.convById.get(convId);
+  if (!conv) { await loadWorkspaceMaps(); conv = railMaps.convById.get(convId); }
+  return (conv && conv.title) || "";
+}
+
 // Run one file-tool call via the sidecar. Write tools (apply_patch, run_command)
 // require per-invocation approval: the sidecar returns {needs_approval:true} with
 // a preview; we show an approval dialog and only re-POST with approved:true once
 // the user clicks Approve. On Reject, we post a rejection as the observation so
 // the agent loop can adjust. Read tools run immediately.
+// d.branch (from the toolExec payload, sourced from conversations.repo_branch)
+// is passed straight through to the sidecar so the tool runs in THIS chat's
+// worktree, not whichever tree happens to be checked out — dropping it would
+// silently send a background chat's edits into the wrong tree.
 async function runToolExec(convId, d) {
   const execBody = { repo: d.repo, tool: d.tool, args: d.args || "" };
+  if (d.branch) execBody.branch = d.branch;
   let execRes;
   try {
     const r = await fetch("/__sidecar/repos/exec", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(execBody) });
@@ -329,7 +351,9 @@ async function runToolExec(convId, d) {
   }
   // Write tools need approval — show a dialog and await the user's decision.
   if (execRes && execRes.needs_approval) {
-    const approved = await showApprovalDialog(execRes.approval_kind || d.tool, execRes.approval_preview || "", { repo: d.repo, branch: await branchForRepo(d.repo) });
+    const branch = d.branch || (await branchForRepo(d.repo));
+    const title = await titleForConv(convId);
+    const approved = await showApprovalDialog(execRes.approval_kind || d.tool, execRes.approval_preview || "", { repo: d.repo, branch, title });
     if (!approved) {
       // Rejected: tell the agent so it can adjust.
       execRes = { observation: "The user rejected this " + d.tool + " call. Do not retry it; adjust your approach.", preview: "rejected", is_error: true };
@@ -350,55 +374,98 @@ async function runToolExec(convId, d) {
       body: JSON.stringify({ jobId: d.jobId, observation: execRes.observation || "", preview: execRes.preview || "", isError: !!execRes.is_error })
     });
   } catch {}
-  // A write tool may have changed the working tree — refresh the branch rail.
-  refreshRailState();
+  // A write tool may have changed the working tree — refresh the branch rail,
+  // but only when it's for the chat currently on screen; a background chat's
+  // tool call shouldn't repaint the foreground rail with unrelated state.
+  if (!convId || convId === activeConvIdFromDOM()) refreshRailState();
 }
 
 // showApprovalDialog returns a Promise<boolean> — true if the user clicks
-// Approve, false if Reject. Renders an overlay with the tool kind, a
-// scrollable <pre> preview (diff or command), and the two buttons.
+// Approve, false if Reject.
+//
+// Concurrent chats can each hit an approval-gated tool at the same time, so
+// requests are queued FIFO and shown one at a time — sharing a single overlay
+// across simultaneous requests would let a click meant for one approve/reject
+// the other. dsApprovalQueue holds pending {kind, preview, ctx, resolve}
+// entries; dsApprovalBusy is true while one is on screen.
+let dsApprovalQueue = [];
+let dsApprovalBusy = false;
+
 function showApprovalDialog(kind, preview, ctx) {
   return new Promise((resolve) => {
-    let overlay = $("dsApprovalOverlay");
-    if (!overlay) {
-      overlay = el("div", "ds-overlay");
-      overlay.id = "dsApprovalOverlay";
-      overlay.setAttribute("role", "dialog");
-      overlay.setAttribute("aria-modal", "true");
-      overlay.setAttribute("aria-label", "Approve tool call");
-      const card = el("div", "ds-card ds-card-wide");
-      const head = el("div", "ds-head");
-      head.appendChild(el("h2", null, "Approve tool call"));
-      const x = el("button", "ds-x"); x.textContent = "×"; x.title = "Reject"; x.setAttribute("aria-label", "Reject");
-      x.onclick = () => { closeApproval(false); };
-      head.appendChild(x);
-      card.appendChild(head);
-      const kindLabel = el("div", "ds-label", "Tool");
-      card.appendChild(kindLabel);
-      const kindVal = el("div", "ds-approval-kind", kind);
-      card.appendChild(kindVal);
-      const preWrap = el("div", "ds-approval-pre-wrap");
-      card.appendChild(preWrap);
-      const row = el("div", "ds-row ds-approval-row");
-      const approve = el("button", "ds-btn ds-btn-approve", "Approve");
-      const reject = el("button", "ds-btn ds-btn-ghost", "Reject");
-      row.appendChild(reject); row.appendChild(approve);
-      card.appendChild(row);
-      overlay.appendChild(card);
-      document.body.appendChild(overlay);
-      overlay._close = (val) => { overlay.classList.remove("open"); resolve(val); };
-      const closeApproval = (val) => { if (overlay._close) overlay._close(val); };
-      approve.onclick = () => closeApproval(true);
-      reject.onclick = () => closeApproval(false);
-      overlay.addEventListener("click", (e) => { if (e.target === overlay) closeApproval(false); });
-    overlay._kind = kindVal;
-      overlay._content = preWrap; // the scrollable container
-    }
-    const kindText = (ctx && ctx.repo) ? (kind + " → " + ctx.repo + (ctx.branch ? " @ " + ctx.branch : "")) : kind;
-    overlay._kind.textContent = kindText;
-    renderApprovalContent(overlay._content, kind, preview);
-    overlay.classList.add("open");
+    dsApprovalQueue.push({ kind, preview, ctx, resolve });
+    pumpApprovalQueue();
   });
+}
+
+function pumpApprovalQueue() {
+  if (dsApprovalBusy) return;
+  const next = dsApprovalQueue.shift();
+  if (!next) return;
+  dsApprovalBusy = true;
+  renderApprovalDialog(next.kind, next.preview, next.ctx, (val) => {
+    dsApprovalBusy = false;
+    next.resolve(val);
+    pumpApprovalQueue();
+  });
+}
+
+// Builds the overlay once and reuses it for every subsequent approval — but
+// re-wires the resolver AND both button handlers on EVERY call. The previous
+// version wired overlay._close, approve.onclick and reject.onclick only
+// inside the `if (!overlay)` branch, so the second approval of a session
+// resolved the FIRST (already-settled) promise through the stale closure and
+// its own promise never settled — the agent then hung until the tool-exec
+// timeout. dsConfirm hit the identical bug and was fixed the same way: never
+// trust a resolver captured at dialog-creation time once the dialog is reused.
+// Renders the requesting chat's title (when known) above the existing
+// `tool → owner/repo @ branch` line, so a concurrent second chat's approval
+// doesn't get mistaken for the one you were expecting.
+function renderApprovalDialog(kind, preview, ctx, done) {
+  let overlay = $("dsApprovalOverlay");
+  if (!overlay) {
+    overlay = el("div", "ds-overlay");
+    overlay.id = "dsApprovalOverlay";
+    overlay.setAttribute("role", "dialog");
+    overlay.setAttribute("aria-modal", "true");
+    overlay.setAttribute("aria-label", "Approve tool call");
+    const card = el("div", "ds-card ds-card-wide");
+    const head = el("div", "ds-head");
+    head.appendChild(el("h2", null, "Approve tool call"));
+    const x = el("button", "ds-x"); x.id = "dsApprovalClose"; x.textContent = "×"; x.title = "Reject"; x.setAttribute("aria-label", "Reject");
+    head.appendChild(x);
+    card.appendChild(head);
+    const chatLabel = el("div", "ds-approval-chat"); chatLabel.id = "dsApprovalChat";
+    card.appendChild(chatLabel);
+    card.appendChild(el("div", "ds-label", "Tool"));
+    const kindVal = el("div", "ds-approval-kind"); kindVal.id = "dsApprovalKind";
+    card.appendChild(kindVal);
+    const preWrap = el("div", "ds-approval-pre-wrap"); preWrap.id = "dsApprovalPre";
+    card.appendChild(preWrap);
+    const row = el("div", "ds-row ds-approval-row");
+    const reject = el("button", "ds-btn ds-btn-ghost", "Reject"); reject.id = "dsApprovalReject";
+    const approve = el("button", "ds-btn ds-btn-approve", "Approve"); approve.id = "dsApprovalApprove";
+    row.appendChild(reject); row.appendChild(approve);
+    card.appendChild(row);
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+  }
+  // Re-wire on every call — onclick/overlay.onclick assignment replaces the
+  // previous handler (no accumulation), so repeated calls never leak
+  // listeners while always resolving THIS call's promise.
+  overlay._close = (val) => { overlay.classList.remove("open"); done(val); };
+  $("dsApprovalClose").onclick = () => overlay._close(false);
+  $("dsApprovalReject").onclick = () => overlay._close(false);
+  $("dsApprovalApprove").onclick = () => overlay._close(true);
+  overlay.onclick = (e) => { if (e.target === overlay) overlay._close(false); };
+  const chatLabel = $("dsApprovalChat");
+  const chatText = (ctx && ctx.title) ? ("Chat: " + ctx.title) : "";
+  chatLabel.textContent = chatText;
+  chatLabel.classList.toggle("hidden", !chatText);
+  const kindText = (ctx && ctx.repo) ? (kind + " → " + ctx.repo + (ctx.branch ? " @ " + ctx.branch : "")) : kind;
+  $("dsApprovalKind").textContent = kindText;
+  renderApprovalContent($("dsApprovalPre"), kind, preview);
+  overlay.classList.add("open");
 }
 
 // renderApprovalContent fills the scrollable container with either a
@@ -476,6 +543,60 @@ function tauriListen(event, cb) {
   if (!listen) return Promise.resolve(() => {});
   return Promise.resolve(listen(event, (e) => cb(e && e.payload))).then((un) => (typeof un === "function" ? un : (() => {})));
 }
+
+// --- Native completion notifications (tauri-plugin-notification) ---
+// www/app.js dispatches nasllm:jobDone ({convId, title, status, error}) on
+// EVERY terminal job event, watched chat or not — this is the only way a
+// backgrounded chat's completion is visible without staring at it. We turn
+// that into a native OS notification, called through tauriInvoke exactly
+// like the existing plugin:dialog|open pattern. Permission is requested
+// once, lazily, on the first completion rather than eagerly on boot, so the
+// OS prompt only appears once the feature is actually used. Notification
+// actions are mobile-only in Tauri, so there's no click-to-open here — the
+// in-app badge (www/app.js) is the way back to the chat. Fails silently
+// outside the desktop app: tauriInvoke rejects when there's no Tauri IPC,
+// and the in-app toast already covers that case.
+let dsNotifyPermChecked = false;
+let dsNotifyPermGranted = false;
+
+async function ensureNotifyPermission() {
+  if (dsNotifyPermChecked) return dsNotifyPermGranted;
+  dsNotifyPermChecked = true;
+  try {
+    dsNotifyPermGranted = !!(await tauriInvoke("plugin:notification|is_permission_granted"));
+    if (!dsNotifyPermGranted) {
+      const perm = await tauriInvoke("plugin:notification|request_permission");
+      dsNotifyPermGranted = perm === "granted";
+    }
+  } catch {
+    dsNotifyPermGranted = false;
+  }
+  return dsNotifyPermGranted;
+}
+
+// Suppress the notification only when the user is both looking at AND
+// focused on the chat that just finished — they've already seen the result.
+// A backgrounded or unfocused window still notifies even for the "active"
+// chat, since that's exactly when a completion would otherwise go unnoticed.
+function isConvOnScreen(convId) {
+  if (!convId) return false;
+  if (document.visibilityState !== "visible" || !document.hasFocus()) return false;
+  return activeConvIdFromDOM() === convId;
+}
+
+window.addEventListener("nasllm:jobDone", async (e) => {
+  const d = (e && e.detail) || {};
+  if (isConvOnScreen(d.convId)) return;
+  const title = d.status === "error" ? "Chat failed" : (d.status === "cancelled" ? "Chat cancelled" : "Chat finished");
+  const body = (d.title || "Chat") + (d.status === "error" && d.error ? ": " + d.error : "");
+  try {
+    if (!(await ensureNotifyPermission())) return;
+    await tauriInvoke("plugin:notification|notify", { options: { title, body } });
+  } catch {
+    // Outside the desktop app, or IPC unavailable — the in-app toast/badge
+    // from www/app.js already surfaces this.
+  }
+});
 
 // Open the native directory picker; returns a single absolute path, or null
 // if the user cancelled. Unlike the previous version, this does NOT swallow a
@@ -686,6 +807,8 @@ async function ensureWorkspaceFolder(name) {
 // re-derive it. The rail then polls /__sidecar/repos/state for the bound repo.
 let railRepo = null;       // full_name of the repo the active repo-bound chat is on
 let railState = null;      // last repos/state result for railRepo
+let railConvId = null;     // id of the active conversation the rail is bound to
+let railConv = null;       // that conversation's record (for its own repoBranch)
 let railTimer = null;      // the ~5s repos/state poll interval
 let railMaps = { convById: new Map(), repoById: new Map(), repoByFullName: new Map() };
 let railSyncTimer = null;  // debounce for syncBranchRail
@@ -723,10 +846,15 @@ function activeConvIdFromDOM() {
   return t.id.slice(3);
 }
 
-// Resolve the branch for a repo: prefer the rail's cached state, else a quick
-// repos/state call. Used to prefix the approval dialog header.
+// Resolve the branch for a repo: prefer the ACTIVE CHAT's own branch (its
+// worktree) when this is the rail's bound repo — that's the isolation unit,
+// and the repo's live checkout is only a meaningful fallback for a chat
+// created before branches were per-chat. Falls back further to a quick
+// repos/state call. Used to prefix the approval dialog header when a
+// toolExec event doesn't carry its own branch.
 async function branchForRepo(name) {
   if (!name) return "";
+  if (railRepo === name && railConv && railConv.repoBranch) return railConv.repoBranch;
   if (railRepo === name && railState && railState.branch) return railState.branch;
   try { const r = await sid("repos/state?name=" + encodeURIComponent(name)); if (r.ok && r.data && r.data.branch) return r.data.branch; } catch {}
   return "";
@@ -748,23 +876,34 @@ function ensureComposerStatus() {
 }
 
 // renderComposerStatus fills the below-input line with the repo + branch + git
-// state. Hidden for non-repo chats / login view.
+// state. Hidden for non-repo chats / login view. The branch segment is its
+// own clickable chip (openChatBranchPicker) — separate from the rest of the
+// line, which opens the repo session panel — and shows THIS CHAT's branch
+// (conversation.repoBranch), falling back to the repo's live branch for
+// chats created before branches were per-chat.
 function renderComposerStatus() {
   const status = $("dsComposerStatus");
   if (!status) return;
   if (!railRepo) { status.classList.add("hidden"); status.textContent = ""; return; }
   const s = railState || {};
-  const parts = [railRepo];
-  if (s.branch) parts.push("⎇ " + s.branch);
-  if (s.dirty) parts.push("●" + s.dirty + " dirty");
-  if (s.ahead) parts.push("↑" + s.ahead);
-  if (s.behind) parts.push("↓" + s.behind);
-  if (s.hasRemote === false) parts.push("no remote");
-  status.textContent = parts.join(" · ");
+  const chatBranch = (railConv && railConv.repoBranch) || s.branch || "";
+  status.innerHTML = "";
+  status.appendChild(document.createTextNode(railRepo));
+  if (chatBranch) {
+    status.appendChild(document.createTextNode(" · "));
+    const chip = el("span", "ds-branch-chip", "⎇ " + chatBranch);
+    chip.title = "Change this chat's branch";
+    chip.onclick = (e) => { e.stopPropagation(); if (railConvId) openChatBranchPicker(railConvId, railRepo, chatBranch); };
+    status.appendChild(chip);
+  }
+  if (s.dirty) status.appendChild(document.createTextNode(" · ●" + s.dirty + " dirty"));
+  if (s.ahead) status.appendChild(document.createTextNode(" · ↑" + s.ahead));
+  if (s.behind) status.appendChild(document.createTextNode(" · ↓" + s.behind));
+  if (s.hasRemote === false) status.appendChild(document.createTextNode(" · no remote"));
   // Hover popup: explain the symbols (● = uncommitted files, ⎇ = branch, ↑/↓ =
   // ahead/behind) and that clicking opens the review/commit session panel.
   const tip = [railRepo];
-  if (s.branch) tip.push("branch: " + s.branch);
+  if (chatBranch) tip.push("branch: " + chatBranch + " (click ⎇ to change)");
   if (s.dirty) tip.push(s.dirty + " uncommitted/modified files (●)");
   if (s.ahead) tip.push(s.ahead + " commits ahead of origin (↑)");
   if (s.behind) tip.push(s.behind + " commits behind origin (↓)");
@@ -784,7 +923,7 @@ async function refreshRailState() {
 }
 
 function hideBranchRail() {
-  railRepo = null; railState = null; stopRailPoll();
+  railRepo = null; railState = null; railConvId = null; railConv = null; stopRailPoll();
   const status = $("dsComposerStatus");
   if (status) { status.classList.add("hidden"); status.textContent = ""; }
 }
@@ -808,14 +947,16 @@ async function actualSyncBranchRail() {
   if (!repo || !repo.fullName) { hideBranchRail(); return; }
   const changed = railRepo !== repo.fullName;
   railRepo = repo.fullName;
+  railConvId = convId;
+  railConv = conv;
   ensureComposerStatus();
   if (changed) { await refreshRailState(); startRailPoll(); }
   renderComposerStatus();
 }
 
-// Create a repo-bound agent chat on its own agent/<slug> branch, place it in
-// the workspace folder, enable agent mode with file + git tools, and navigate
-// to it without a full page reload. Reused by "+ New chat".
+// Create a repo-bound agent chat in its own git worktree on its own branch,
+// place it in the workspace folder, enable agent mode with file + git tools,
+// and navigate to it without a full page reload. Reused by "+ New chat".
 //
 // Order matters: we register the repo with the backend and confirm its id
 // BEFORE creating any conversation. If registration fails we surface the real
@@ -862,34 +1003,59 @@ async function createRepoChat(r) {
     return;
   }
 
-  // 5. Repo confirmed — NOW create the conversation.
-  const title = fullName + " (agent)";
+  // 5. Repo confirmed — NOW create the conversation. The id only exists after
+  //    this call, and the id is what makes the chat distinguishable, so the
+  //    real title is applied in the PATCH below rather than here.
   const model = localStorage.getItem("nas-llm-model") || "";
-  const cr = await fetch("/api/conversations", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title, model }) });
+  const cr = await fetch("/api/conversations", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: fullName + " (agent)", model }) });
   const cj = await cr.json().catch(() => ({}));
   const convId = cj && cj.id;
   if (!convId) { flashDsErr("Could not create conversation."); return; }
   // Workspace folder so chats group in the sidebar.
   const folderId = await ensureWorkspaceFolder(fullName);
 
-  // Create/switch to a dedicated agent branch so edits never land on main.
+  // Every chat on a repo used to be titled exactly "owner/repo (agent)", so a
+  // sidebar full of them was unreadable — and now that the approval dialog and
+  // the completion notification both identify a chat by its title, identical
+  // titles actively cost you ("which chat wants to run this command?"). Tag
+  // each chat with a short slice of its conversation id. The branch below uses
+  // the same slice, so a chat, its title, and its worktree all carry one handle
+  // you can match by eye.
+  const shortId = String(convId).slice(0, 7);
+  const title = fullName + " (agent " + shortId + ")";
+
+  // Give this chat its own branch in its own git worktree.
+  //
+  // Two things matter here. First, the name must be unique per chat. Branch
+  // names used to come from a slug of the chat title, and since every chat on a
+  // repo shared one title, every chat shared ONE branch — "a branch per chat"
+  // was really a branch per repo. The conversation-id slice fixes that.
+  //
+  // Second, we provision a worktree rather than `git switch`-ing the repo
+  // folder. Switching moved the branch of the checkout the user has open in
+  // their editor, and carried any uncommitted changes there onto the new
+  // branch. A worktree is a separate directory, so the repo folder is left
+  // exactly as it was and two chats can hold two branches at once.
+  const shortName = (fullName.split("/").pop() || fullName);
+  const branchName = "agent/" + slugifyTitle(shortName) + "-" + shortId;
   let branch = "";
   let branchErr = "";
   try {
-    const br = await sid("repos/branch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: fullName, title }) });
-    const bd = (br && br.data) || {};
-    if (br.ok && bd.ok && bd.branch) branch = bd.branch;
-    else branchErr = bd.error || br.status || "unknown error";
+    const wr = await sid("repos/worktree", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: fullName, branch: branchName, create: true }) });
+    const wd = (wr && wr.data) || {};
+    if (wr.ok && wd.ok && wd.branch) branch = wd.branch;
+    else branchErr = wd.error || wr.status || "unknown error";
   } catch (e) { branchErr = String((e && e.message) || e); }
 
   if (!branch) {
-    // Checkout failed (e.g. dirty tree) — surface the git error and let the
-    // user choose to continue on the current branch instead of silently
-    // landing the agent's edits on main. Never force.
-    flashDsErr("Could not create agent branch: " + branchErr);
+    // Provisioning failed (unwritable worktrees dir, a stale directory git no
+    // longer tracks, a repo that moved). Surface the real git error and let the
+    // user fall back to the repo folder's current branch rather than silently
+    // landing the agent's edits somewhere they don't expect. Never force.
+    flashDsErr("Could not create this chat's worktree: " + branchErr);
     const cont = await dsConfirm(
-      "Continue on the current branch instead?",
-      "The agent's edits will land on the repo's current branch, not a new agent/<slug> branch."
+      "Continue on the repo's current branch instead?",
+      "The agent's edits will land in the repo folder on whatever branch it has checked out, shared with anything else using it."
     );
     if (!cont) return; // aborted — do not navigate
     try {
@@ -899,9 +1065,11 @@ async function createRepoChat(r) {
     } catch {}
   }
 
-  // PATCH repoId + agentTools (file + git) + folder + repoBranch in one go.
+  // PATCH title + repoId + agentTools (file + git) + folder + repoBranch in one
+  // go — no extra round trip for the rename. A title set this way is marked
+  // custom server-side, which is correct: it is deliberate, not auto-derived.
   const agentTools = "read_file,list_files,glob,grep,git_status,apply_patch,run_command,ask_user,get_time,git_commit,git_push,create_pr";
-  const patchBody = { repoId, agentTools };
+  const patchBody = { title, repoId, agentTools };
   if (folderId) patchBody.folderId = folderId;
   if (branch) patchBody.repoBranch = branch;
   try {
@@ -1095,6 +1263,125 @@ async function openBranchPicker(r) {
     }
     list.appendChild(row);
   });
+}
+
+// Turn a chat title into a short, git-safe branch-name fragment: lowercase,
+// non-alphanumeric runs collapsed to a single "-", trimmed. Mirrors the
+// agent/<slug> convention the sidecar already uses for createRepoChat.
+function slugifyTitle(title) {
+  const slug = String(title || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40);
+  return slug || "chat";
+}
+
+// openChatBranchPicker lets the user move THIS CHAT (not the repo's shared
+// checkout) onto a different git worktree: pick an existing branch, or create
+// a new one (defaulting to agent/<slug of the chat title>, but editable).
+// Either path ends in POST /__sidecar/repos/worktree to ensure the worktree
+// exists, then PATCHes the conversation's repoBranch — the pair that makes
+// this chat's tools actually run in that tree (see runToolExec). Distinct
+// from openBranchPicker, which switches the repo's single shared checkout.
+async function openChatBranchPicker(convId, repoName, currentBranch) {
+  const title = await titleForConv(convId);
+  let overlay = $("dsChatBranchOverlay");
+  let list, newInput, createBtn;
+  if (!overlay) {
+    overlay = el("div", "ds-overlay");
+    overlay.id = "dsChatBranchOverlay";
+    overlay.setAttribute("role", "dialog");
+    overlay.setAttribute("aria-modal", "true");
+    overlay.setAttribute("aria-label", "Chat branch");
+    const card = el("div", "ds-card");
+    const head = el("div", "ds-head");
+    head.appendChild(el("h2", null, "Chat branch"));
+    const x = el("button", "ds-x"); x.textContent = "×"; x.title = "Close"; x.setAttribute("aria-label", "Close");
+    head.appendChild(x);
+    card.appendChild(head);
+    const sub = el("div", "ds-note"); sub.id = "dsChatBranchSub";
+    card.appendChild(sub);
+    card.appendChild(el("div", "ds-note", "Each chat gets its own git worktree, isolated from other chats on this repo — switching here never touches another chat's branch."));
+    card.appendChild(el("div", "ds-label", "Existing branches"));
+    list = el("div", "ds-branch-list"); list.id = "dsChatBranchList";
+    card.appendChild(list);
+    card.appendChild(el("div", "ds-label", "Or create a new branch"));
+    const row = el("div", "ds-row");
+    newInput = document.createElement("input"); newInput.id = "dsChatBranchNew"; newInput.type = "text";
+    createBtn = el("button", "ds-btn", "Create & switch"); createBtn.id = "dsChatBranchCreateBtn";
+    row.appendChild(newInput); row.appendChild(createBtn);
+    card.appendChild(row);
+    card.appendChild(el("div", "ds-note", "A new worktree starts clean — no node_modules, .env, or build caches — so the first run may need an install step."));
+    const out = el("div", "ds-note"); out.id = "dsChatBranchOut";
+    card.appendChild(out);
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+    const close = () => overlay.classList.remove("open");
+    x.onclick = close;
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+  } else {
+    list = $("dsChatBranchList");
+    newInput = $("dsChatBranchNew");
+    createBtn = $("dsChatBranchCreateBtn");
+  }
+  $("dsChatBranchSub").textContent = title ? (repoName + " · " + title) : repoName;
+  const out = $("dsChatBranchOut"); if (out) out.textContent = "";
+  newInput.value = "agent/" + slugifyTitle(title);
+  overlay._ctx = { convId, repoName, currentBranch };
+  createBtn.onclick = () => switchChatBranch(overlay, newInput.value.trim(), true);
+  list.innerHTML = "";
+  list.appendChild(el("div", "ds-note", "Loading branches…"));
+  overlay.classList.add("open");
+  const res = await sid("repos/branches", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: repoName }) });
+  const d = (res && res.data) || {};
+  list.innerHTML = "";
+  if (!res.ok || !d.ok) { list.appendChild(el("div", "ds-note", "Could not load branches: " + (d.error || res.status || "unknown"))); return; }
+  const branches = d.branches || [];
+  if (!branches.length) { list.appendChild(el("div", "ds-note", "No branches found.")); }
+  branches.forEach((b) => {
+    const bname = typeof b === "string" ? b : (b.name || "");
+    if (!bname) return;
+    const isCur = bname === currentBranch;
+    const row = el("div", "ds-branch-item" + (isCur ? " current" : ""));
+    row.title = isCur ? "This chat's current branch" : "Switch this chat to " + bname;
+    row.appendChild(el("span", "ds-branch-name", bname));
+    if (isCur) row.appendChild(el("span", "ds-branch-badge ds-branch-cur", "current"));
+    if (!isCur) row.onclick = () => switchChatBranch(overlay, bname, false);
+    list.appendChild(row);
+  });
+}
+
+// Ensures the worktree exists (creating the branch too when `create`), then
+// PATCHes the conversation's repoBranch so runToolExec/branchForRepo pick it
+// up immediately — that PATCH, not the worktree itself, is what actually
+// isolates this chat's future tool calls.
+async function switchChatBranch(overlay, branchName, create) {
+  const out = $("dsChatBranchOut");
+  if (!branchName) { if (out) out.textContent = "Enter a branch name."; return; }
+  const ctx = overlay._ctx || {};
+  const { convId, repoName } = ctx;
+  if (!convId || !repoName) return;
+  if (out) out.textContent = create ? "Creating worktree…" : "Switching…";
+  const wr = await sid("repos/worktree", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: repoName, branch: branchName, create }) });
+  const wd = (wr && wr.data) || {};
+  if (!wr.ok || !wd.ok) { if (out) out.textContent = "Failed: " + (wd.error || wr.status || "unknown error"); return; }
+  const finalBranch = wd.branch || branchName;
+  try {
+    await fetch("/api/conversations/" + encodeURIComponent(convId), { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repoBranch: finalBranch }) });
+  } catch (e) {
+    if (out) out.textContent = "Worktree ready, but could not update the chat: " + String((e && e.message) || e);
+    return;
+  }
+  // Update the cached conversation record so the composer chip and sidebar
+  // reflect the new branch immediately, without waiting on a full re-fetch.
+  const conv = railMaps.convById.get(convId);
+  if (conv) conv.repoBranch = finalBranch;
+  if (railConvId === convId) renderComposerStatus();
+  refreshLocal();
+  refreshRailState();
+  overlay.classList.remove("open");
+  flashDsOk("Chat now on ⎇ " + finalBranch);
 }
 
 // localRow renders one connected repo as a dropdown: a header with the repo

@@ -1,6 +1,6 @@
 // nas-llm chat UI — app logic, split out of the old single-file index.html.
 // Imports UI helpers (icons, markdown rendering) from lib.js. No build step.
-import { icon, setIcon, renderMessage, escapeHtml, StreamRenderer, thinkingDots, renderSearchBlock, appendSearchEntry, showSearchPending, clearSearchPending, renderSourceLinks, appendSourceLinks, renderClarifyCard, renderAgentSteps, appendAgentStep, buildThoughtsWrap, renderThoughts, appendThought, setThoughtsSummary } from './lib.js?v=27';
+import { icon, setIcon, renderMessage, escapeHtml, StreamRenderer, thinkingDots, renderSearchBlock, appendSearchEntry, showSearchPending, clearSearchPending, renderSourceLinks, appendSourceLinks, renderClarifyCard, renderAgentSteps, appendAgentStep, buildThoughtsWrap, renderThoughts, appendThought, setThoughtsSummary } from './lib.js?v=28';
 
 const $ = id => document.getElementById(id);
 const app=$("app"), loginView=$("login");
@@ -55,6 +55,7 @@ function webSearchOn(){ return activeExtras.has("web"); }
 function clarifyOn(){ return activeExtras.has("clarify"); }
 function agentOn(){ return activeExtras.has("agent"); }
 let generatingIds = new Set(); // conversation IDs with an active background job
+let finishedIds = new Set();   // conversation IDs with an unseen completion badge (cleared on open)
 let activeES = null;           // the current EventSource tail (active conversation)
 let activeJobConvId = null;    // conversation whose tail is currently open
 let pendingClarifyAnswer = null; // option clicked while a question was still finalizing
@@ -72,7 +73,22 @@ let localModelNames = loadLocalModelNames();
 let localModels = [];                  // [{name,sizeGB,details}] from the last successful probe
 let modelEntries = [];                 // merged server+local entries driving the selector
 let lastServerModels = [];             // raw /api/models data, cached for re-merges after a probe
-let activeLocalAbort = null;           // AbortController for the in-flight localhost inference
+// Per-conversation AbortControllers for in-flight localhost inference, keyed by
+// convId. A map (not a singleton) so stopping or switching away from one chat
+// can never abort a different chat's local-model relay — that used to be the
+// bug that made a second chat kill the first. Set when a modelCall round
+// starts (foreground tailJob or the headless global-stream path), cleared when
+// the round finishes/fails/aborts.
+const localAborts = new Map();
+// jobIds already turned into a "finished" toast/badge/CustomEvent, so a job
+// whose terminal event arrives on both the foreground tail and the global
+// stream (a real race — see openGlobalStream) is never notified twice.
+const notifiedJobIds = new Set();
+// convIds the user explicitly Stopped from the foreground. tailJob's "done"
+// handler can't otherwise tell a clean finish from a user-requested stop (the
+// backend's per-conversation "done" event carries no payload), so stopActive
+// marks it here just before calling /cancel.
+const stoppedByUser = new Set();
 let localDiscoverMsg = null;           // last discovery error string (shown in the Local section)
 function loadLocalModelNames(){ try{ return JSON.parse(localStorage.getItem("nas-llm-local-models")||"[]")||[]; }catch{ return []; } }
 function saveLocalModelNames(){ localStorage.setItem("nas-llm-local-models", JSON.stringify(localModelNames)); }
@@ -301,12 +317,19 @@ function renderSend(){
 }
 async function stopActive(){
   if(activeJobConvId !== activeId) return;
+  const id=activeId;
   send.disabled=true;
   // For a local-model job, abort the in-flight localhost inference immediately
-  // so Stop is responsive — don't wait for the SSE "done" round-trip. The
-  // backend /cancel still finalizes the connection-bound job.
-  if(activeLocalAbort){ activeLocalAbort.abort(); activeLocalAbort=null; }
-  try{ await fetch("/api/conversations/"+encodeURIComponent(activeId)+"/cancel",{method:"POST"}); }catch{}
+  // so Stop is responsive — don't wait for the SSE "done" round-trip. Looked
+  // up by convId (not a singleton) so this can never abort a different chat's
+  // relay. The backend /cancel still finalizes the connection-bound job.
+  const ctrl=localAborts.get(id);
+  if(ctrl){ ctrl.abort(); localAborts.delete(id); }
+  // The per-conversation "done" event carries no payload, so tailJob can't
+  // otherwise distinguish a clean finish from a user-requested stop — stash
+  // the intent here so it can report "cancelled" instead of "done".
+  stoppedByUser.add(id);
+  try{ await fetch("/api/conversations/"+encodeURIComponent(id)+"/cancel",{method:"POST"}); }catch{}
   // The SSE "done" event from the cancelled job finalizes the UI; if it never
   // arrives (e.g. the job already finished), fall back after a short delay.
   setTimeout(()=>{ if(activeJobConvId === activeId){ activeJobConvId=null; renderSend(); } }, 4000);
@@ -369,6 +392,10 @@ async function showApp(){
   resumeLocalPull();              // re-drive a local pull that was mid-download before the reload
   await loadConversations();
   await loadActiveJobs();
+  // The global stream is user-scoped and multiplexed (contract 1), so opening
+  // it once here already covers every active job — including ones that were
+  // mid-run before this reload — with no per-conversation reattachment needed.
+  openGlobalStream();
   if(conversations.length) await openConversation(conversations[0].id);
   else newChat();
   input.focus();
@@ -393,6 +420,9 @@ loginEmail.addEventListener("keydown", e=>{ if(e.key==="Enter"){ e.preventDefaul
 
 async function logout(){
   closeTail(); activeJobConvId=null; generatingIds=new Set();
+  closeGlobalStream();
+  localAborts.forEach(ctrl=>ctrl.abort()); localAborts.clear();
+  notifiedJobIds.clear(); stoppedByUser.clear(); finishedIds=new Set();
   try{ await fetch("/api/auth/logout",{method:"POST"}); }catch{}
   me=null; activeId=null; messages=[]; conversations=[]; selectedModel="";
   showLogin(); renderSend();
@@ -786,7 +816,7 @@ function renderFolder(f, convs){
   return wrap;
 }
 function renderConv(c){
-  const row=document.createElement("div"); row.className="conv"+(c.id===activeId?" active":"")+(generatingIds.has(c.id)?" generating":""); row.draggable=true;
+  const row=document.createElement("div"); row.className="conv"+(c.id===activeId?" active":"")+(generatingIds.has(c.id)?" generating":"")+(finishedIds.has(c.id)?" finished":""); row.draggable=true;
   const main=document.createElement("div"); main.className="conv-main";
   const t=document.createElement("div"); t.className="conv-title"; t.id="ct-"+c.id; t.textContent=c.title||"New chat";
   const tm=document.createElement("div"); tm.className="conv-time"; tm.textContent=absTime(c.updatedAt); tm.title=relTime(c.updatedAt);
@@ -933,6 +963,7 @@ async function openConversation(id){
   closeTail();
   activeJobConvId=null; renderSend();
   pendingImages=[]; renderImgPills();
+  finishedIds.delete(id); // the user is looking at it now — clear its badge
   try{
     const r=await fetch("/api/conversations/" + encodeURIComponent(id));
     if(!r.ok) return;
@@ -983,7 +1014,14 @@ async function syncGenerating(){
   if(!same) renderSidebar();
 }
 
-function closeTail(){ if(activeLocalAbort){ activeLocalAbort.abort(); activeLocalAbort=null; } if(activeES){ activeES.close(); activeES=null; } }
+// Closing the foreground tail only detaches the EventSource — it must NOT
+// abort any in-flight local-model relay (localAborts). That was the original
+// bug: switching chats aborted the OTHER chat's still-running localhost
+// inference because both shared one activeLocalAbort singleton. A relay's
+// fetch is independent of the tail's EventSource, so it keeps streaming after
+// this closes; the global stream (openGlobalStream) picks up any further
+// modelCall rounds for that job once nothing is listening on its own tail.
+function closeTail(){ if(activeES){ activeES.close(); activeES=null; } }
 
 // If the conversation has an active background job, render its partial content
 // and reopen the SSE tail so switching back resumes live.
@@ -1008,7 +1046,7 @@ async function resumeIfGenerating(id){
   // A generating job with no reasoning yet collapses the empty drawer; one with
   // reasoning stays open and tailJob sets the streaming summary/elapsed timer.
   if(thoughtsDet && (!job.thoughts || !job.thoughts.length)) thoughtsDet.open = false;
-  tailJob(id, bubble, hasQ ? "" : (job.content||""), searchWrap, srcLinks, job.questions||null, stepsWrap, job.steps||null, thoughtsWrap, thoughtsDet, job.thoughts||null);
+  tailJob(id, job.id, bubble, hasQ ? "" : (job.content||""), searchWrap, srcLinks, job.questions||null, stepsWrap, job.steps||null, thoughtsWrap, thoughtsDet, job.thoughts||null);
 }
 
 // --- Local-model relay (browser -> visitor's Ollama, results back to NAS) ---
@@ -1048,16 +1086,22 @@ async function postModelResponse(convId, jobId, content, toolCalls, error){
 // {jobId, error} so the backend finalizes the connection-bound job as an
 // error (the message survives the done/reload) instead of an empty success;
 // returns null.
+// renderer/bubble are optional: a background chat the user isn't watching has
+// no StreamRenderer or bubble to paint into (relayModelCallHeadless passes
+// null for both), so content is still assembled and returned/posted, but
+// nothing is rendered live and a failure surfaces as a toast instead of
+// bubbleError (which would throw on a null bubble).
 async function relayLocalModelCall(convId, call, renderer, bubble, signal){
   const body={ model:call.model, messages:call.messages, stream:true };
   if(call.tools && call.tools.length) body.tools=call.tools;
+  const reportErr=(msg)=>{ if(bubble) bubbleError(bubble, msg); else showToast(msg, "err"); };
   let resp;
   // text/plain (not application/json) to keep this a CORS "simple request" with
   // no preflight — same Private Network Access dodge as startLocalPull. Ollama's
   // /v1/chat/completions decodes the JSON body regardless of Content-Type.
   try{ resp=await fetch("http://localhost:11434/v1/chat/completions",{ method:"POST", headers:{"Content-Type":"text/plain"}, body:JSON.stringify(body), signal }); }
-  catch(e){ if(signal.aborted) return null; const msg=localFetchErrMsg(String(e&&e.message||e)); bubbleError(bubble, msg); postModelResponse(convId, call.jobId, null, null, msg); return null; }
-  if(!resp.ok){ const msg=localStatusErrMsg(resp.status); bubbleError(bubble, msg); postModelResponse(convId, call.jobId, null, null, msg); return null; }
+  catch(e){ if(signal.aborted) return null; const msg=localFetchErrMsg(String(e&&e.message||e)); reportErr(msg); postModelResponse(convId, call.jobId, null, null, msg); return null; }
+  if(!resp.ok){ const msg=localStatusErrMsg(resp.status); reportErr(msg); postModelResponse(convId, call.jobId, null, null, msg); return null; }
   let content=""; const calls=[];
   const reader=resp.body.getReader(); const dec=new TextDecoder(); let buf=""; let finished=false;
   try{
@@ -1074,7 +1118,7 @@ async function relayLocalModelCall(convId, call, renderer, bubble, signal){
         let j; try{ j=JSON.parse(data); }catch{ continue; }
         const delta=j.choices && j.choices[0] && j.choices[0].delta;
         if(!delta) continue;
-        if(delta.content){ content+=delta.content; renderer.append(delta.content); }
+        if(delta.content){ content+=delta.content; if(renderer) renderer.append(delta.content); }
         if(delta.tool_calls){
           // Accumulate by id-presence (mirrors the backend streamOllamaChatWithTools):
           // a delta carrying a new id starts a new call; one with no id continues
@@ -1103,6 +1147,139 @@ async function relayLocalModelCall(convId, call, renderer, bubble, signal){
   return { content, toolCalls };
 }
 
+// --- Toasts (background job completions / headless relay failures) --------
+// Unlike slashNote (one message at a time, for command feedback), toasts stack
+// since multiple background chats can finish or error around the same time.
+// Clicking a toast (when a handler is given) jumps to that chat.
+function showToast(text, cls, onClick){
+  let wrap=document.getElementById("toasts");
+  if(!wrap){ wrap=document.createElement("div"); wrap.id="toasts"; document.body.appendChild(wrap); }
+  const t=document.createElement("div"); t.className="toast"+(cls?" "+cls:"")+(onClick?" clickable":"");
+  t.textContent=String(text||"");
+  if(onClick) t.addEventListener("click",onClick);
+  wrap.appendChild(t);
+  requestAnimationFrame(()=>t.classList.add("show"));
+  setTimeout(()=>{ t.classList.remove("show"); setTimeout(()=>t.remove(),200); }, 6000);
+}
+function toastText(status, title, error){
+  if(status==="error") return title+" \u2014 "+(error||"generation failed");
+  if(status==="cancelled") return title+" stopped";
+  return title+" finished";
+}
+// Central terminal-event handler for BOTH the foreground tail and the global
+// stream (contract 4): dispatches nasllm:jobDone unconditionally, then
+// suppresses the in-app toast/badge for the chat the user is currently
+// viewing ("they can already see it"). Deduped by jobId since the same
+// terminal event can legitimately arrive on both streams — see
+// openGlobalStream's modelCall/done/joberror handlers.
+function finishJob(convId, jobId, status, error){
+  if(jobId){
+    if(notifiedJobIds.has(jobId)) return;
+    notifiedJobIds.add(jobId);
+    if(notifiedJobIds.size>500) notifiedJobIds.delete(notifiedJobIds.values().next().value); // bounded
+  }
+  generatingIds.delete(convId);
+  const conv=conversations.find(c=>c.id===convId);
+  const title=(conv&&conv.title)||"Chat";
+  window.dispatchEvent(new CustomEvent("nasllm:jobDone",{detail:{convId, title, status, error:error||null}}));
+  if(convId!==activeId){
+    finishedIds.add(convId);
+    showToast(toastText(status, title, error), status==="error"?"err":"", ()=>{ openConversation(convId); closeSidebar(); });
+  }
+  renderSidebar();
+}
+// Refresh the open chat's messages from the server when a terminal event for
+// it arrives on a path other than its own foreground tail (e.g. the global
+// stream saw it finish before resumeIfGenerating's tail attached).
+async function reloadIfOpen(convId){
+  if(convId!==activeId) return;
+  try{
+    const r=await fetch("/api/conversations/"+encodeURIComponent(convId));
+    if(r.ok){ const c=await r.json(); messages=c.messages||[]; rerenderChat(); updateHeader(); }
+  }catch{}
+}
+
+// Run one local-model round with no renderer/bubble (relayLocalModelCall
+// already tolerates both being null), tracking the abort controller in
+// localAborts by convId so a later Stop/leave can target just this round.
+async function relayModelCallHeadless(convId, call){
+  const ctrl=new AbortController(); localAborts.set(convId, ctrl);
+  try{
+    const res=await relayLocalModelCall(convId, call, null, null, ctrl.signal);
+    if(res===null) return; // fetch failed or aborted: error already posted / nothing to post
+    await postModelResponse(convId, call.jobId, res.content, res.toolCalls);
+  }catch(err){
+    if(ctrl.signal.aborted) return;
+    const msg=localFetchErrMsg(String(err&&err.message||err));
+    showToast(msg, "err");
+    postModelResponse(convId, call.jobId, null, null, msg);
+  }finally{
+    if(localAborts.get(convId)===ctrl) localAborts.delete(convId);
+  }
+}
+
+// --- Global job stream (drives chats the user isn't looking at) -----------
+// GET /api/events is a user-scoped, multiplexed SSE stream carrying modelCall/
+// toolExec/phase/done/joberror for EVERY active job the caller owns, each
+// payload tagged with convId+jobId (contract 1). We open it once after auth
+// and use it only to (a) keep a backgrounded local-model relay running and
+// (b) fire completion toasts/badges for jobs finishing off-screen. toolExec is
+// intentionally not handled here — it belongs exclusively to the desktop
+// renderer's EventSource shim (contract 5), which wraps window.EventSource and
+// therefore already receives this same stream. If the route is missing (older
+// backend) or the connection keeps failing, back off and keep retrying: the
+// rest of the app already works with no background progress/notifications.
+let globalES=null;
+let globalRetryDelay=1000;
+let globalRetryTimer=null;
+const GLOBAL_RETRY_MAX=30000;
+function openGlobalStream(){
+  if(globalES || globalRetryTimer) return;
+  const es=new EventSource("/api/events");
+  globalES=es;
+  let openedOnce=false;
+  es.addEventListener("open", ()=>{ openedOnce=true; globalRetryDelay=1000; });
+  es.addEventListener("modelCall", e=>{
+    let d={}; try{ d=JSON.parse(e.data); }catch{ return; }
+    if(!d.convId || !d.jobId || !d.model) return;
+    if(d.convId===activeJobConvId) return;    // the foreground tail already owns this round
+    if(localAborts.has(d.convId)) return;     // a relay for this conversation is already in flight
+    relayModelCallHeadless(d.convId, d);
+  });
+  es.addEventListener("done", e=>{
+    let d={}; try{ d=JSON.parse(e.data); }catch{ d={}; }
+    if(!d.convId) return;
+    if(d.convId===activeJobConvId) return;    // tailJob's own "done" handler already covers this
+    finishJob(d.convId, d.jobId, d.status==="cancelled"?"cancelled":"done", null);
+    reloadIfOpen(d.convId);
+    loadConversations();
+  });
+  es.addEventListener("joberror", e=>{
+    let d={}; try{ d=JSON.parse(e.data); }catch{ d={}; }
+    if(!d.convId) return;
+    if(d.convId===activeJobConvId) return;    // tailJob's own "joberror" handler already covers this
+    finishJob(d.convId, d.jobId, "error", d.error||null);
+    reloadIfOpen(d.convId);
+    loadConversations();
+  });
+  es.onerror=()=>{
+    es.close();
+    if(globalES===es) globalES=null;
+    // Never got a working connection (older backend without this route, or a
+    // network drop) — back off exponentially instead of hammering it; a
+    // native EventSource's default retry is a fixed ~3s, which is too eager
+    // for a route that may simply not exist yet.
+    const delay=globalRetryDelay;
+    globalRetryDelay=Math.min(GLOBAL_RETRY_MAX, globalRetryDelay*2);
+    globalRetryTimer=setTimeout(()=>{ globalRetryTimer=null; openGlobalStream(); }, delay);
+  };
+}
+function closeGlobalStream(){
+  if(globalRetryTimer){ clearTimeout(globalRetryTimer); globalRetryTimer=null; }
+  if(globalES){ globalES.close(); globalES=null; }
+  globalRetryDelay=1000;
+}
+
 // tailJob opens an EventSource to /events and renders into bubble via a
 // StreamRenderer (one markdown re-parse per animation frame). On reconnect the
 // server sends a "reset" with the full prefix, which re-anchors acc so
@@ -1110,7 +1287,7 @@ async function relayLocalModelCall(convId, call, renderer, bubble, signal){
 // bubble to a clickable option card and suspends the renderer so a queued
 // flush can't wipe it. "done" reloads the conversation from the server
 // (source of truth — the assistant reply is persisted there).
-function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarify, stepsWrap, initialSteps, thoughtsWrap, thoughtsDet, initialThoughts){
+function tailJob(convId, jobId, bubble, initialAcc, searchWrap, srcLinks, initialClarify, stepsWrap, initialSteps, thoughtsWrap, thoughtsDet, initialThoughts){
   closeTail();
   const renderer = new StreamRenderer(bubble);
   const onAnswer=(value)=>sendClarifyAnswer(value, bubble);
@@ -1153,7 +1330,7 @@ function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarif
   es.addEventListener("modelCall", async e=>{
     let d={}; try{ d=JSON.parse(e.data); }catch{ return; }
     if(!d.jobId || !d.model) return;
-    const ctrl=new AbortController(); activeLocalAbort=ctrl;
+    const ctrl=new AbortController(); localAborts.set(convId, ctrl);
     try{
       const res=await relayLocalModelCall(convId, d, renderer, bubble, ctrl.signal);
       if(res===null) return;                  // fetch failed or aborted: error shown / nothing to post
@@ -1166,7 +1343,7 @@ function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarif
       bubbleError(bubble, msg);
       postModelResponse(convId, d.jobId, null, null, msg);
     }finally{
-      if(activeLocalAbort===ctrl) activeLocalAbort=null;
+      if(localAborts.get(convId)===ctrl) localAborts.delete(convId);
     }
   });
   es.addEventListener("phase", e=>{
@@ -1177,29 +1354,41 @@ function tailJob(convId, bubble, initialAcc, searchWrap, srcLinks, initialClarif
     else if(p==="answering") clearSearchPending(searchWrap);
   });
   es.addEventListener("chunk", e=>{ let d=""; try{ d=JSON.parse(e.data); }catch{} renderer.append(d); });
-  es.addEventListener("done", ()=>{ esClosed=true; if(activeLocalAbort){ activeLocalAbort.abort(); activeLocalAbort=null; } es.close(); activeES=null; if(thoughtsDet){ if(thoughtStart){ const secs=((Date.now()-thoughtStart)/1000).toFixed(1); setThoughtsSummary(thoughtsDet,"Thought for "+secs+"s",{streaming:false}); } else setThoughtsSummary(thoughtsDet,"Thinking",{streaming:false}); thoughtsDet.open=false; } onGenerationDone(convId); });
+  es.addEventListener("done", ()=>{
+    esClosed=true; es.close(); if(activeES===es) activeES=null;
+    const ctrl=localAborts.get(convId); if(ctrl){ ctrl.abort(); localAborts.delete(convId); }
+    if(thoughtsDet){ if(thoughtStart){ const secs=((Date.now()-thoughtStart)/1000).toFixed(1); setThoughtsSummary(thoughtsDet,"Thought for "+secs+"s",{streaming:false}); } else setThoughtsSummary(thoughtsDet,"Thinking",{streaming:false}); thoughtsDet.open=false; }
+    // The per-conversation "done" event carries no payload, so a user-requested
+    // stop is distinguished via stoppedByUser (set by stopActive) rather than
+    // anything on this event.
+    const status = stoppedByUser.has(convId) ? "cancelled" : "done";
+    stoppedByUser.delete(convId);
+    finishJob(convId, jobId, status, null);
+    onGenerationDone(convId);
+  });
   es.addEventListener("joberror", e=>{
-    esClosed=true; if(activeLocalAbort){ activeLocalAbort.abort(); activeLocalAbort=null; } es.close(); activeES=null;
+    esClosed=true; es.close(); if(activeES===es) activeES=null;
+    const ctrl=localAborts.get(convId); if(ctrl){ ctrl.abort(); localAborts.delete(convId); }
     let msg=e.data; try{ msg=JSON.parse(e.data); }catch{}
     const acc = renderer.acc;
     if(acc) renderer.finalize(acc);
     else bubbleError(bubble, msg);
     if(thoughtsDet){ setThoughtsSummary(thoughtsDet,"Thinking",{streaming:false}); thoughtsDet.open=false; } // collapse thinking on terminal
-    generatingIds.delete(convId); renderSidebar();
+    stoppedByUser.delete(convId);
+    finishJob(convId, jobId, "error", msg);
     activeJobConvId=null; renderSend(); input.focus();
   });
   es.onerror=()=>{ if(esClosed) return; /* transport drop: EventSource auto-reconnects; reset re-anchors acc */ };
 }
 
 async function onGenerationDone(convId){
-  generatingIds.delete(convId); activeJobConvId=null;
+  // generatingIds/sidebar/badge/toast/CustomEvent are already handled by
+  // finishJob, called just before this from tailJob's "done" handler.
+  if(activeJobConvId===convId) activeJobConvId=null;
   if(convId===activeId){
     renderSend();
     // Reload from the server: the assistant reply is persisted there now.
-    try{
-      const r=await fetch("/api/conversations/"+encodeURIComponent(convId));
-      if(r.ok){ const c=await r.json(); messages=c.messages||[]; rerenderChat(); updateHeader(); }
-    }catch{}
+    await reloadIfOpen(convId);
   }
   await loadConversations();
   // If the user clicked a clarifying option while the question was still
@@ -1464,7 +1653,7 @@ async function stream(){
 
   // Tail the job. Generation keeps running on the NAS even if the user switches
   // chats; "done" reloads this conversation from the server (source of truth).
-  tailJob(activeId, bubble, job.content||"", searchWrap, srcLinks, null, stepsWrap, null, thoughtsWrap, thoughtsDet, null);
+  tailJob(activeId, job.id, bubble, job.content||"", searchWrap, srcLinks, null, stepsWrap, null, thoughtsWrap, thoughtsDet, null);
   renderSend();
 }
 

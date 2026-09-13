@@ -65,6 +65,11 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        // Native completion notifications (Phase: multi-agent concurrency):
+        // the renderer fires one when a background chat's job finishes, since
+        // notification actions are mobile-only in Tauri and the in-app badge
+        // is the way to jump to the chat.
+        .plugin(tauri_plugin_notification::init())
         .manage(state.clone())
         .setup(move |app| {
             // Run the sidecar HTTP server on the Tauri async runtime (tokio).
