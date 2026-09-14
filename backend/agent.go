@@ -445,6 +445,26 @@ func agentSystemNudge() string {
 		"returns an error, read it and adjust — do not retry blindly. Keep answers concise."
 }
 
+// toolCallDiscipline is the anti-narration guardrail appended to every
+// tool-calling system prompt (agent / web-search / clarify / ask_user). Some
+// local models report a "tools" capability yet fail to emit structured
+// tool_calls, and instead narrate the call — and a fabricated result or error
+// ("Error: Function get_time not found.") — as plain text, which the loop
+// then streams to the user as if it were a real answer. This rule states the
+// only valid way to use a tool is a structured tool call, forbids writing tool
+// calls / results / errors as prose, and steers the model to answer directly
+// when no tool is needed. It does not override a model's native tool-call
+// format (Ollama's chat template governs that), but it sharply reduces the
+// narration failure mode. Keep the anchor phrase "never invent a tool result"
+// stable — agent_test.go asserts on it.
+func toolCallDiscipline() string {
+	return "Tools run only through structured tool calls, never as text. " +
+		"Do not narrate a tool call, do not write a tool's name or arguments in prose, and " +
+		"never invent a tool result or tool error (for example \"Error: Function X not found\"). " +
+		"A tool executes only when you emit a structured tool call. If a tool is genuinely " +
+		"needed, emit that tool call; otherwise answer directly and do not mention tools at all."
+}
+
 // runAgentLoop drives a bounded ReAct loop over the given tool allowlist. The
 // model's text is streamed via emit (for a server backend) or by the browser
 // directly (for a relay); each tool call is executed server-side and emitted as
@@ -475,6 +495,13 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 	if strings.TrimSpace(sys) == "" {
 		sys = agentSystemNudge()
 	}
+	// Append the tool-call discipline guardrail so it always applies in agent
+	// mode, even when a custom per-conversation/global system prompt is set —
+	// agentConfig only resolves which prompt to use; the guardrail is a safety
+	// rule, not a style preference. This block is scoped to the tools-present
+	// path (the no-tools degenerate path returned above), so the rule is never
+	// added to a round that doesn't actually send tools.
+	sys = sys + "\n\n" + toolCallDiscipline()
 	messages := append([]oaiMessage{{Role: "system", Content: jsonString(sys)}}, msgs...)
 	seen := map[string]int{}
 	for step := 0; step < s.cfg.maxAgentSteps; step++ {

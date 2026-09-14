@@ -102,7 +102,8 @@ func clarifyNudgeText() string {
 	return "You have an ask_user tool to clarify ambiguous requests. " +
 		"If the user's task is unclear or missing a key detail, call ask_user with a clear question and concrete, distinct options. " +
 		"Ask only what you truly need, and at most a couple of questions across the conversation, then answer directly. " +
-		"Do not call ask_user if the request is already clear enough to answer."
+		"Do not call ask_user if the request is already clear enough to answer. " +
+		"\n\n" + toolCallDiscipline()
 }
 
 // askUserLightNudgeText is the lighter system nudge used for plain-chat turns
@@ -111,7 +112,8 @@ func clarifyNudgeText() string {
 // to limit the token overhead added to every plain turn on the N100.
 func askUserLightNudgeText() string {
 	return "You have an ask_user tool. If the user's request is ambiguous or missing a key detail you need before you can help, " +
-		"call ask_user with a clear question and concrete, distinct options. Otherwise answer directly — do not ask unnecessary questions."
+		"call ask_user with a clear question and concrete, distinct options. Otherwise answer directly — do not ask unnecessary questions. " +
+		"\n\n" + toolCallDiscipline()
 }
 
 // runAskUserPass runs one tool-calling pass with the ask_user tool. If the
