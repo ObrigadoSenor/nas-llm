@@ -391,7 +391,7 @@ func runCommandTool() oaiTool {
 func gitCommitTool() oaiTool {
 	return oaiTool{Type: "function", Function: oaiToolFunction{
 		Name:        "git_commit",
-		Description: "Stage all changes and commit on the current branch with the given message.",
+		Description: "Stage all changes and commit on the current branch with the given message. Make ALL your edits first, then call this ONCE when the work is complete — do not commit after each individual change.",
 		Parameters: map[string]any{"type": "object", "properties": map[string]any{
 			"message": map[string]any{"type": "string", "description": "The commit message."},
 		}, "required": []string{"message"}},
@@ -401,7 +401,7 @@ func gitCommitTool() oaiTool {
 func gitPushTool() oaiTool {
 	return oaiTool{Type: "function", Function: oaiToolFunction{
 		Name:        "git_push",
-		Description: "Push the current branch to its remote.",
+		Description: "Push the current branch to its remote. Only push when the user explicitly asks you to push.",
 		Parameters:  map[string]any{"type": "object", "properties": map[string]any{}},
 	}}
 }
@@ -409,7 +409,7 @@ func gitPushTool() oaiTool {
 func createPrTool() oaiTool {
 	return oaiTool{Type: "function", Function: oaiToolFunction{
 		Name:        "create_pr",
-		Description: "Open a pull request from the current branch into the repo's default branch.",
+		Description: "Open a pull request from the current branch into the repo's default branch. Only use this when the user explicitly asks for a pull request — do not open one automatically after committing.",
 		Parameters: map[string]any{"type": "object", "properties": map[string]any{
 			"title": map[string]any{"type": "string", "description": "The pull request title."},
 			"body":  map[string]any{"type": "string", "description": "The pull request body/description."},
@@ -456,7 +456,7 @@ func injectRepoContext(sys string, r *Repo, convBranch string) string {
 	} else {
 		b.WriteString("(empty)")
 	}
-	b.WriteString(". Use the read_file, list_files, glob, grep, and git_status tools to explore the codebase and discover what you need yourself — do NOT ask the user about the codebase (which files, where something is, how it works); look it up. Make changes directly with apply_patch, run commands with run_command, and when the work is done commit with git_commit, push with git_push, and open a pull request with create_pr. Paths are repository-relative. Do not write diffs or commands as prose — call the tool so the change is actually applied. Keep answers grounded in what you read — do not guess at file contents.\n\n")
+	b.WriteString(". Use the read_file, list_files, glob, grep, and git_status tools to explore the codebase and discover what you need yourself — do NOT ask the user about the codebase (which files, where something is, how it works); look it up. Make ALL the changes needed with apply_patch first, then commit ONCE with git_commit when the work is complete — do NOT commit after each individual edit. Do not push with git_push and do not open a pull request with create_pr unless the user explicitly asks you to. Paths are repository-relative. Do not write diffs or commands as prose — call the tool so the change is actually applied. Keep answers grounded in what you read — do not guess at file contents.\n\n")
 	b.WriteString(sys)
 	return b.String()
 }
