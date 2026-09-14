@@ -361,51 +361,76 @@ async function titleForConv(convId) {
 // backend says auto-approve is on for this chat. create_pr is never in this set —
 // opening a PR is external/irreversible, so it always prompts regardless.
 const AUTO_APPROVE_TOOLS = new Set(["apply_patch", "run_command", "git_commit", "git_push"]);
+// Command-shaped tools render a Warp-style block; run_command additionally streams.
+const COMMAND_TOOLS = new Set(["run_command", "apply_patch", "git_commit", "git_push", "create_pr"]);
+// Keep last ~64KB of streamed command output for the observation / block body.
+const STREAM_OUTPUT_CAP = 65536;
+function capStreamOutput(s){ s = String(s||""); return s.length > STREAM_OUTPUT_CAP ? s.slice(-STREAM_OUTPUT_CAP) : s; }
+// sidExec is the buffered POST to /__sidecar/repos/exec (the non-streaming path,
+// used for every tool except an approved run_command).
+async function sidExec(execBody) {
+  try {
+    const r = await fetch("/__sidecar/repos/exec", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(execBody) });
+    return await r.json();
+  } catch (err) {
+    return { observation: String(err && err.message || err), preview: "exec error", is_error: true };
+  }
+}
+
 async function runToolExec(convId, d) {
   const autoApproved = !!(d.autoApprove && AUTO_APPROVE_TOOLS.has(d.tool));
+  const key = d.jobId + ":" + (d.step ?? 0);
   const execBody = { repo: d.repo, tool: d.tool, args: d.args || "" };
   if (d.branch) execBody.branch = d.branch;
   if (autoApproved) execBody.approved = true;
+
   let execRes;
-  try {
-    const r = await fetch("/__sidecar/repos/exec", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(execBody) });
-    execRes = await r.json();
-  } catch (err) {
-    execRes = { observation: String(err && err.message || err), preview: "exec error", is_error: true };
-  }
-  // Write tools need approval — show a dialog and await the user's decision.
-  if (execRes && execRes.needs_approval) {
-    const branch = d.branch || (await branchForRepo(d.repo));
-    const title = await titleForConv(convId);
-    const approved = await showApprovalDialog(execRes.approval_kind || d.tool, execRes.approval_preview || "", { repo: d.repo, branch, title });
-    if (!approved) {
-      // Rejected: tell the agent so it can adjust.
-      execRes = { observation: "The user rejected this " + d.tool + " call. Do not retry it; adjust your approach.", preview: "rejected", is_error: true };
-    } else {
-      // Approved: re-POST with approved:true to actually execute.
-      try {
-        const r = await fetch("/__sidecar/repos/exec", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...execBody, approved: true }) });
-        execRes = await r.json();
-      } catch (err) {
-        execRes = { observation: String(err && err.message || err), preview: "exec error", is_error: true };
+  if (autoApproved && d.tool === "run_command") {
+    // Auto-approved run_command: stream output straight into the block.
+    execRes = await runStreamingExec(convId, d, key, { ...execBody, approved: true });
+  } else {
+    // First (buffered) call — returns needs_approval + preview for write tools.
+    execRes = await sidExec(execBody);
+    if (execRes && execRes.needs_approval) {
+      const branch = d.branch || (await branchForRepo(d.repo));
+      const title = await titleForConv(convId);
+      const ctx = { repo: d.repo, branch, title };
+      const kind = execRes.approval_kind || d.tool;
+      const preview = execRes.approval_preview || "";
+      // Inline approval in the command block when it's on screen; fall back to
+      // the FIFO modal for background chats whose block isn't in the DOM.
+      const approved = await requestApprovalInlineOrModal(key, kind, preview, ctx);
+      if (!approved) {
+        execRes = { observation: "The user rejected this " + d.tool + " call. Do not retry it; adjust your approach.", preview: "rejected", is_error: true };
+      } else if (d.tool === "run_command") {
+        execRes = await runStreamingExec(convId, d, key, { ...execBody, approved: true });
+      } else {
+        execRes = await sidExec({ ...execBody, approved: true });
       }
     }
   }
+
+  // Derive exit code + output for buffered command tools (the streaming path
+  // already carries them) so the Warp-style block shows a proper exit chip +
+  // output body on reload.
+  if (execRes && COMMAND_TOOLS.has(d.tool)) {
+    if (execRes.exit_code == null) execRes.exit_code = execRes.is_error ? 1 : 0;
+    if (!execRes.output && execRes.observation) execRes.output = capStreamOutput(execRes.observation);
+  }
+
   // Post the observation back to the backend so the agent loop continues.
-  // When auto-approve fired, tag the preview so the trace step shows the tool
-  // ran without an approval dialog — a visible signal that auto-approve worked
-  // (and a diagnostic when it doesn't).
   const preview = execRes.preview || "";
   const postedPreview = autoApproved && preview ? preview + " (auto-approved)" : preview;
+  const body = { jobId: d.jobId, observation: execRes.observation || "", preview: postedPreview, isError: !!execRes.is_error };
+  if (execRes.exit_code != null) body.exitCode = execRes.exit_code;
+  if (execRes.output) body.output = execRes.output;
+  if (d.branch) body.branch = d.branch;
   try {
     await fetch("/api/conversations/" + encodeURIComponent(convId) + "/tool-response", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ jobId: d.jobId, observation: execRes.observation || "", preview: postedPreview, isError: !!execRes.is_error })
+      body: JSON.stringify(body)
     });
   } catch {}
-  // A write tool may have changed the working tree — refresh the branch rail,
-  // but only when it's for the chat currently on screen; a background chat's
-  // tool call shouldn't repaint the foreground rail with unrelated state.
   if (!convId || convId === getActiveConvId()) refreshRailState();
 }
 
@@ -549,6 +574,101 @@ function renderDiff(diff) {
       wrap.appendChild(ln);
     }
   }
+  return wrap;
+}
+
+// --- Streaming exec (run_command) + inline approval -------------------------
+// runStreamingExec POSTs the approved run_command to the sidecar's streaming
+// route and pipes stdout+stderr to the UI as nasllm:toolOutput chunks, then a
+// terminal nasllm:toolExit with the exit code + duration — so the Warp-style
+// command block fills live. Returns a buffered ExecResult-shaped object
+// (observation/output/exit_code/is_error) so runToolExec can post it to
+// /tool-response exactly like the buffered path.
+async function runStreamingExec(convId, d, key, execBody) {
+  let output = "", exitCode = -1, durationMs = 0;
+  try {
+    const r = await fetch("/__sidecar/repos/exec/stream", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(execBody),
+    });
+    await readSseStream(r, (event, data) => {
+      if (event === "chunk") {
+        let text = ""; try { text = (JSON.parse(data) || {}).text || ""; } catch {}
+        output += text;
+        if (output.length > STREAM_OUTPUT_CAP) output = output.slice(-STREAM_OUTPUT_CAP);
+        window.dispatchEvent(new CustomEvent("nasllm:toolOutput", { detail: { convId, jobId: d.jobId, step: d.step, text } }));
+      } else if (event === "exit") {
+        let ex = {}; try { ex = JSON.parse(data); } catch {}
+        exitCode = ex.code != null ? ex.code : -1;
+        durationMs = ex.durationMs || 0;
+        window.dispatchEvent(new CustomEvent("nasllm:toolExit", { detail: { convId, jobId: d.jobId, step: d.step, code: exitCode, durationMs } }));
+      }
+    });
+  } catch (err) {
+    return { observation: String(err && err.message || err), preview: "exec error", is_error: true };
+  }
+  const isErr = exitCode !== 0;
+  return {
+    observation: capStreamOutput(output) || (isErr ? "Command failed." : "Command completed."),
+    preview: isErr ? ("exit " + exitCode) : "command completed",
+    is_error: isErr,
+    exit_code: exitCode,
+    output: capStreamOutput(output),
+  };
+}
+
+// readSseStream parses an SSE text/event-stream response body into (event,data)
+// frames and calls onEvent for each. Used by runStreamingExec (fetch can't be
+// an EventSource, which is GET-only — the streaming route is POST).
+async function readSseStream(response, onEvent) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf("\n\n")) >= 0) {
+      const frame = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      let event = "message", data = "";
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event:")) event = line.replace(/^event:\s?/, "").trim();
+        else if (line.startsWith("data:")) data += line.replace(/^data:\s?/, "");
+      }
+      onEvent(event, data);
+    }
+  }
+}
+
+// requestApprovalInlineOrModal renders Approve/Reject in the command block when
+// it's on screen (window.nasllm.blocks.requestApproval, with the diff for
+// apply_patch rendered into the block via the same renderDiff the modal uses),
+// and falls back to the FIFO modal for background chats whose block isn't in
+// the DOM. Returns a Promise<boolean> — true on Approve, false on Reject.
+async function requestApprovalInlineOrModal(key, kind, preview, ctx) {
+  const blocks = window.nasllm && window.nasllm.blocks;
+  if (blocks) {
+    const previewEl = buildApprovalPreviewEl(kind, preview);
+    let resolveInline;
+    const inlinePromise = new Promise(res => { resolveInline = res; });
+    const accepted = blocks.requestApproval(key, {
+      kind, previewEl,
+      onApprove: () => resolveInline(true),
+      onReject: () => resolveInline(false),
+    });
+    if (accepted) return inlinePromise;
+  }
+  return showApprovalDialog(kind, preview, ctx);
+}
+
+// buildApprovalPreviewEl builds the scrollable preview node the inline approval
+// renders in the block — reusing renderApprovalContent (which renders the
+// diff for apply_patch via renderDiff) so the inline block and the modal share
+// one diff renderer.
+function buildApprovalPreviewEl(kind, preview) {
+  const wrap = el("div", "ds-approval-pre-wrap");
+  renderApprovalContent(wrap, kind, preview);
   return wrap;
 }
 

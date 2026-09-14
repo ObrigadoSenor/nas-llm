@@ -279,8 +279,8 @@ func TestAgentNarrationGuard(t *testing.T) {
 
 		mb := &fakeBackend{responses: []oaiMessage{
 			narrationMsg("I'll edit foo.go to add a comment."), // round 1: narrates
-			toolCallMsg("call_1", "get_time", "{}"),           // round 2: real tool call
-			finalAnswerMsg("Done - added the comment."),      // round 3: synthesized answer
+			toolCallMsg("call_1", "get_time", "{}"),            // round 2: real tool call
+			finalAnswerMsg("Done - added the comment."),        // round 3: synthesized answer
 		}}
 
 		var (
@@ -330,7 +330,7 @@ func TestAgentNarrationGuard(t *testing.T) {
 
 		mb := &fakeBackend{responses: []oaiMessage{
 			narrationMsg("I'll edit foo.go to add a comment."), // round 1: re-prompted
-			narrationMsg("I'll change bar.go too."),          // round 2: budget exhausted -> accept
+			narrationMsg("I'll change bar.go too."),            // round 2: budget exhausted -> accept
 		}}
 
 		var steps []agentStep
@@ -413,8 +413,8 @@ func TestAgentProseToolCallRecovery(t *testing.T) {
 		// call is even duplicated, as small models often do.
 		narrated := "Sure, let's check the time.\n\n```\n{ \"name\": \"get_time\", \"arguments\": {} }\n```\n{\"name\":\"get_time\",\"arguments\":{}}"
 		mb := &fakeBackend{responses: []oaiMessage{
-			narrationMsg(narrated),                  // round 1: narrates the call as JSON prose
-			finalAnswerMsg("It's 3pm."),             // round 2: synthesizes after the real observation
+			narrationMsg(narrated),      // round 1: narrates the call as JSON prose
+			finalAnswerMsg("It's 3pm."), // round 2: synthesizes after the real observation
 		}}
 
 		var (
@@ -468,7 +468,7 @@ func TestAgentProseToolCallRecovery(t *testing.T) {
 		// the narration guard re-prompts once, then accepts the second narration.
 		mb := &fakeBackend{responses: []oaiMessage{
 			narrationMsg("I'll check the time for you."), // round 1: no JSON -> re-prompt
-			narrationMsg("I'll check it now."),          // round 2: budget exhausted -> accept
+			narrationMsg("I'll check it now."),           // round 2: budget exhausted -> accept
 		}}
 
 		var steps []agentStep
@@ -577,8 +577,8 @@ func TestAgentAwaitingToolResultFallback(t *testing.T) {
 
 		mb := &fakeBackend{responses: []oaiMessage{
 			narrationMsg("Please provide the output from the tool response so I can proceed."), // round 1: re-prompt
-			toolCallMsg("call_1", "get_time", "{}"),                                              // round 2: real tool call
-			finalAnswerMsg("Done — updated the settings menu."),                                  // round 3: synthesized
+			toolCallMsg("call_1", "get_time", "{}"),                                            // round 2: real tool call
+			finalAnswerMsg("Done — updated the settings menu."),                                // round 3: synthesized
 		}}
 
 		var (
@@ -632,4 +632,144 @@ func TestAgentAwaitingToolResultFallback(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestJob_EmitToolStartAndCommandFields covers the Warp-style command-block
+// contract: emitToolStart stashes the pending cue (so a reconnect reopens the
+// running block) and broadcasts a toolStart event carrying the frozen payload
+// {convId, jobId, step, tool, args}; emitToolExec fires toolStart BEFORE the
+// relay cue so the block exists before streamed output lands; emitTool clears
+// the stash once the result step lands; and the tool event marshals the command
+// fields (ExitCode/Output/Cwd/Branch) so a reload re-paints the block body.
+func TestJob_EmitToolStartAndCommandFields(t *testing.T) {
+	j := newJob("conv-ts", "user@example.com", "local:1b", false, false, true)
+	ch, _ := j.subscribe()
+	defer j.unsubscribe(ch)
+
+	// emitToolExec fires toolStart first, then the relay cue.
+	j.emitToolExec(2, "run_command", `{"command":"go test ./..."}`, "owner/repo", "main", true)
+
+	first := nextEvent(t, ch, time.Second)
+	if first.kind != "toolStart" {
+		t.Fatalf("first event kind = %q, want toolStart (block must open before the relay cue)", first.kind)
+	}
+	var ts toolStartPayload
+	if err := json.Unmarshal([]byte(first.text), &ts); err != nil {
+		t.Fatalf("unmarshal toolStart: %v", err)
+	}
+	if ts.ConvID != j.convID || ts.JobID != j.id || ts.Step != 2 || ts.Tool != "run_command" || ts.Args != `{"command":"go test ./..."}` {
+		t.Errorf("toolStart payload = %+v, want {convId:%q jobId:%q step:2 tool:run_command args:{...}}", ts, j.convID, j.id)
+	}
+	second := nextEvent(t, ch, time.Second)
+	if second.kind != "toolExec" {
+		t.Fatalf("second event kind = %q, want toolExec", second.kind)
+	}
+
+	// Both cues are stashed for SSE replay on reconnect.
+	if got := j.toolStartSnapshot(); got == nil || got.Step != 2 {
+		t.Errorf("pendingToolStart should be stashed after emitToolExec, got %+v", got)
+	}
+	if got := j.toolExecSnapshot(); got == nil || got.Step != 2 {
+		t.Errorf("pendingToolExecPayload should be stashed after emitToolExec, got %+v", got)
+	}
+
+	// emitTool (the result step) clears the stashed toolStart and carries the
+	// command fields on the tool event for reload parity.
+	j.emitTool(agentStep{Step: 2, Tool: "run_command", Preview: "command completed", DurationMs: 12, ExitCode: 0, Output: "ok\n", Cwd: "/repo", Branch: "main"})
+	if got := j.toolStartSnapshot(); got != nil {
+		t.Errorf("pendingToolStart should be cleared after emitTool, got %+v", got)
+	}
+	ev := nextEvent(t, ch, time.Second)
+	if ev.kind != "tool" {
+		t.Fatalf("third event kind = %q, want tool", ev.kind)
+	}
+	var step agentStep
+	if err := json.Unmarshal([]byte(ev.text), &step); err != nil {
+		t.Fatalf("unmarshal tool: %v", err)
+	}
+	if step.ExitCode != 0 || step.Output != "ok\n" || step.Cwd != "/repo" || step.Branch != "main" {
+		t.Errorf("tool event command fields = {exit:%d output:%q cwd:%q branch:%q}, want all carried", step.ExitCode, step.Output, step.Cwd, step.Branch)
+	}
+}
+
+// TestJob_EmitToolStartOmitsEmptyCommandFields confirms a read-only tool's
+// toolStart/agentStep do not synthesize command fields: a grep call emits a
+// toolStart with the contract payload but an agentStep with zero/empty
+// ExitCode/Output/Cwd/Branch, so omitempty drops them and old rows stay
+// byte-identical on reload.
+func TestJob_EmitToolStartOmitsEmptyCommandFields(t *testing.T) {
+	j := newJob("conv-ro", "user@example.com", "local:1b", false, false, true)
+	ch, _ := j.subscribe()
+	defer j.unsubscribe(ch)
+
+	j.emitToolExec(1, "grep", `{"pattern":"foo"}`, "owner/repo", "main", true)
+	ev := nextEvent(t, ch, time.Second)
+	if ev.kind != "toolStart" {
+		t.Fatalf("event kind = %q, want toolStart", ev.kind)
+	}
+	// Drain the toolExec cue so it does not block later reads.
+	if ev := nextEvent(t, ch, time.Second); ev.kind != "toolExec" {
+		t.Fatalf("expected toolExec after toolStart, got %q", ev.kind)
+	}
+
+	j.emitTool(agentStep{Step: 1, Tool: "grep", Preview: "2 matches", DurationMs: 3})
+	if got := j.toolStartSnapshot(); got != nil {
+		t.Errorf("pendingToolStart should be cleared after emitTool, got %+v", got)
+	}
+	ev = nextEvent(t, ch, time.Second)
+	if ev.kind != "tool" {
+		t.Fatalf("event kind = %q, want tool", ev.kind)
+	}
+	// A read-only tool's tool event must not carry command fields.
+	if strings.Contains(ev.text, "exitCode") || strings.Contains(ev.text, "\"output\"") || strings.Contains(ev.text, "\"cwd\"") || strings.Contains(ev.text, "\"branch\"") {
+		t.Errorf("read-only tool event should omit command fields, got %s", ev.text)
+	}
+}
+
+// TestStripProseToolCallText confirms the raw JSON tool-call blob a small model
+// wrote as prose is stripped from the thinking text (along with its fenced
+// code-block wrapper), so the thinking drawer shows the model's reasoning
+// preamble, not the {"name":"...","arguments":{...}} syntax that
+// extractProseToolCall recovers into a real tool call.
+func TestStripProseToolCallText(t *testing.T) {
+	offred := map[string]bool{"run_command": true, "get_time": true}
+	cases := []struct {
+		name string
+		text string
+		want string
+	}{
+		{
+			name: "fenced blob with preamble",
+			text: "I'll create the file.\n```\n{ \"name\": \"run_command\", \"arguments\": {\"command\": \"echo hi\"} }\n```\nDone.",
+			want: "I'll create the file.\n\nDone.",
+		},
+		{
+			name: "raw blob no fence",
+			text: "Let me check {\"name\":\"get_time\",\"arguments\":{}} now",
+			want: "Let me check  now",
+		},
+		{
+			name: "duplicated blob both stripped",
+			text: "{\"name\":\"run_command\",\"arguments\":{\"command\":\"ls\"}}\n{\"name\":\"run_command\",\"arguments\":{\"command\":\"ls\"}}",
+			want: "",
+		},
+		{
+			name: "non-tool JSON left alone",
+			text: "The config is {\"key\":\"value\"} and that's fine",
+			want: "The config is {\"key\":\"value\"} and that's fine",
+		},
+		{
+			name: "fenced with language tag",
+			text: "```json\n{\"name\":\"get_time\",\"arguments\":{}}\n```",
+			want: "",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := stripProseToolCallText(c.text, offred)
+			if got != c.want {
+				t.Errorf("stripProseToolCallText = %q, want %q", got, c.want)
+			}
+		})
+	}
 }

@@ -415,3 +415,9 @@
 .ds-pr-open { color: #8ab4f8; text-decoration: none; font-weight: 600; }
 .ds-pr-open:hover { text-decoration: underline; }
 .ds-pr-url { color: #6b707a; font-size: 11px; word-break: break-all; }
+
+/* --- Inline approval inside a Warp-style command block ---
+   The block's diff preview reuses the modal's .ds-diff-* styles; just bound
+   its height so a large diff doesn't push the block off the page. */
+.tool-block .ds-approval-pre-wrap { max-height: 240px; overflow: auto; }
+.tool-block .ds-diff { font-size: 12px; }

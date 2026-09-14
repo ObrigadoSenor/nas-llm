@@ -1,6 +1,19 @@
 // nas-llm chat UI — app logic, split out of the old single-file index.html.
 // Imports UI helpers (icons, markdown rendering) from lib.js. No build step.
-import { icon, setIcon, renderMessage, escapeHtml, StreamRenderer, thinkingDots, renderSearchBlock, appendSearchEntry, showSearchPending, clearSearchPending, renderSourceLinks, appendSourceLinks, renderClarifyCard, renderAgentSteps, appendAgentStep, buildThoughtsWrap, renderThoughts, appendThought, setThoughtsSummary } from './lib.js?v=28';
+import { icon, setIcon, renderMessage, escapeHtml, StreamRenderer, thinkingDots, renderSearchBlock, appendSearchEntry, showSearchPending, clearSearchPending, renderSourceLinks, appendSourceLinks, renderClarifyCard, renderAgentSteps, appendAgentStep, buildThoughtsWrap, renderThoughts, appendThought, setThoughtsSummary, isCommandTool, openBlock, appendBlock, closeBlock, isBlockStep, resetBlocks, installBlocksHook } from './lib.js?v=34';
+
+installBlocksHook();
+// Streamed command output + exit, forwarded by the desktop renderer (the
+// only desktop-aware code) as nasllm:toolOutput/nasllm:toolExit CustomEvents.
+// Only act for the active job so a backgrounded chat's stream doesn't bleed in.
+window.addEventListener("nasllm:toolOutput", e=>{
+  const d=(e&&e.detail)||{}; if(!d.jobId || d.convId!==activeJobConvId) return;
+  appendBlock(d.jobId+":"+d.step, d.text);
+});
+window.addEventListener("nasllm:toolExit", e=>{
+  const d=(e&&e.detail)||{}; if(!d.jobId || d.convId!==activeJobConvId) return;
+  closeBlock(d.jobId+":"+d.step, { exitCode:d.code, durationMs:d.durationMs, isError:(d.code!=null && d.code!==0) });
+});
 
 const $ = id => document.getElementById(id);
 const app=$("app"), loginView=$("login");
@@ -1295,6 +1308,7 @@ function closeGlobalStream(){
 // (source of truth — the assistant reply is persisted there).
 function tailJob(convId, jobId, bubble, initialAcc, searchWrap, srcLinks, initialClarify, stepsWrap, initialSteps, thoughtsWrap, thoughtsDet, initialThoughts){
   closeTail();
+  resetBlocks();
   const renderer = new StreamRenderer(bubble);
   const onAnswer=(value)=>sendClarifyAnswer(value, bubble);
   if(initialClarify){
@@ -1324,7 +1338,8 @@ function tailJob(convId, jobId, bubble, initialAcc, searchWrap, srcLinks, initia
   es.addEventListener("search", e=>{ let entry=null; try{ entry=JSON.parse(e.data); }catch{} appendSearchEntry(searchWrap, entry); appendSourceLinks(srcLinks, entry); });
   es.addEventListener("questions", e=>{ let q=null; try{ q=JSON.parse(e.data); }catch{} renderer.suspend(); renderClarifyCard(bubble, q, false, onAnswer, null); });
   es.addEventListener("steps", e=>{ let arr=[]; try{ arr=JSON.parse(e.data)||[]; }catch{} renderAgentSteps(stepsWrap, arr); });
-  es.addEventListener("tool", e=>{ let st=null; try{ st=JSON.parse(e.data); }catch{} appendAgentStep(stepsWrap, st); });
+  es.addEventListener("toolStart", e=>{ let d={}; try{ d=JSON.parse(e.data); }catch{ return; } if(!d.jobId || !d.tool) return; if(!isCommandTool(d.tool)) return; openBlock(d.jobId+":"+d.step, { step:d.step, tool:d.tool, args:d.args, container:stepsWrap }); });
+  es.addEventListener("tool", e=>{ let st=null; try{ st=JSON.parse(e.data); }catch{} if(!st) return; const key=st.step!=null?(jobId+":"+st.step):null; if(key && isBlockStep(key)){ closeBlock(key, { exitCode:st.exitCode, durationMs:st.durationMs, isError:st.isError, output:st.output, preview:st.preview }); } else { appendAgentStep(stepsWrap, st); } });
   es.addEventListener("thoughts", e=>{ let arr=[]; try{ arr=JSON.parse(e.data)||[]; }catch{} renderThoughts(thoughtsWrap, arr); if(arr&&arr.length){ if(!thoughtStart) thoughtStart=Date.now(); setThoughtsSummary(thoughtsDet,"Thinking",{streaming:true}); if(thoughtsDet) thoughtsDet.open=true; } });
   es.addEventListener("thought", e=>{ let t=""; try{ t=JSON.parse(e.data); }catch{} appendThought(thoughtsWrap, t); if(t!=null&&t!==""){ if(!thoughtStart) thoughtStart=Date.now(); setThoughtsSummary(thoughtsDet,"Thinking",{streaming:true}); if(thoughtsDet) thoughtsDet.open=true; } });
   es.addEventListener("clear", ()=>{ renderer.set(""); });
@@ -1472,11 +1487,15 @@ function addMsg(role, text, ts, searches, images, clarify, answered, steps, thou
     if(thoughtsDet) thoughtsDet.open=false;
   } else thoughtsWrap.classList.add("hidden");
   d.appendChild(thoughtsWrap);
+  // Steps drawer: inline for both live and finalized turns — command-shaped
+  // tools render as Warp-style blocks (collapsed on success), read-only tools
+  // keep the compact row. (Previously finalized steps were hidden behind the
+  // tool-badge popup; they now render inline.)
+  stepsWrap=document.createElement("div"); stepsWrap.className="msg-steps";
+  if(steps && steps.length) renderAgentSteps(stepsWrap, steps);
+  else stepsWrap.classList.add("hidden");
+  d.appendChild(stepsWrap);
   if(live){
-    stepsWrap=document.createElement("div"); stepsWrap.className="msg-steps";
-    if(steps && steps.length) renderAgentSteps(stepsWrap, steps);
-    else stepsWrap.classList.add("hidden");
-    d.appendChild(stepsWrap);
     searchWrap=document.createElement("div"); searchWrap.className="msg-search";
     if(searches && searches.length) renderSearchBlock(searchWrap, searches);
     else searchWrap.classList.add("hidden");
@@ -1499,8 +1518,8 @@ function addMsg(role, text, ts, searches, images, clarify, answered, steps, thou
   if(searches && searches.length) renderSourceLinks(srcLinks, searches);
   meta.appendChild(srcLinks);
   if(!live && !hasClarify){
-    const badge=toolBadgeFor({searches, steps});
-    if(badge){ badge.addEventListener("click",e=>{ e.stopPropagation(); openToolPopup(badge, {searches, steps}); }); meta.appendChild(badge); }
+    const badge=toolBadgeFor({searches});
+    if(badge){ badge.addEventListener("click",e=>{ e.stopPropagation(); openToolPopup(badge, {searches}); }); meta.appendChild(badge); }
   }
   if(text && !hasClarify) addCopyMsg(meta, text);
   d.appendChild(meta);
@@ -1534,8 +1553,7 @@ function makeToolBadge(iconName, title){
   btn.innerHTML=icon(iconName,14);
   return btn;
 }
-function toolBadgeFor({searches, steps}){
-  if(steps && steps.length) return makeToolBadge("sparkles","Agent mode");
+function toolBadgeFor({searches}){
   if(searches && searches.length){
     const b=makeToolBadge("globe","Web search");
     if(searches.every(e=>e && e.skipped)) b.classList.add("dim");
@@ -1551,7 +1569,6 @@ function openToolPopup(anchor, data){
   closeMenu();
   const m=document.createElement("div"); m.className="tool-popup";
   if(data.searches && data.searches.length){ const sw=document.createElement("div"); sw.className="msg-search"; renderSearchBlock(sw, data.searches); m.appendChild(sw); }
-  if(data.steps && data.steps.length){ const st=document.createElement("div"); st.className="msg-steps"; renderAgentSteps(st, data.steps); m.appendChild(st); }
   if(!m.children.length) return;
   document.body.appendChild(m);
   const r=anchor.getBoundingClientRect();

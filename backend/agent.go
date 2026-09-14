@@ -31,6 +31,7 @@ import (
 
 const (
 	agentObsMaxChars      = 4000 // cap a tool observation fed back to the model
+	agentOutputMaxChars   = 4096 // cap a command's display-only output stored on the step (reload parity)
 	agentDupLimit         = 3    // same tool+args this many times -> nudge to answer
 	agentNarrationRetries = 1    // re-prompt a narrating model this many times before accepting prose
 
@@ -55,6 +56,17 @@ type agentStep struct {
 	DurationMs int64        `json:"durationMs,omitempty"`
 	Search     *searchMeta  `json:"search,omitempty"`
 	Clarify    *clarifyMeta `json:"clarify,omitempty"`
+	// ExitCode/Output carry a command's exit status and (capped) output for the
+	// Warp-style command block: live runs stream via nasllm:toolOutput, and on
+	// reload the block body re-paints from Output. Output is display-only and
+	// capped (~4 KB); it is NOT fed to the model (the observation is). Cwd/Branch
+	// record where the command ran so the block header can show it. All omitempty
+	// so old persisted steps round-trip byte-identical. Populated for command-
+	// shaped tools (run_command/apply_patch/git_commit/git_push/create_pr).
+	ExitCode int    `json:"exitCode,omitempty"`
+	Output   string `json:"output,omitempty"`
+	Cwd      string `json:"cwd,omitempty"`
+	Branch   string `json:"branch,omitempty"`
 }
 
 // toolOutcome is the result of executing one tool call.
@@ -65,6 +77,10 @@ type toolOutcome struct {
 	isError     bool         // mark the step red in the trace
 	search      *searchMeta  // web_search evidence (UI)
 	clarify     *clarifyMeta // ask_user questions (UI)
+	exitCode    int          // command exit status (run_command); 0/absent for non-command tools
+	output      string       // capped display-only command output (run_command/apply_patch/...)
+	cwd         string       // working directory the command ran in (relayed tools)
+	branch      string       // branch the command ran on (relayed tools)
 }
 
 // agentTool is one tool the agent may call: an OpenAI tool schema + an executor.
@@ -573,6 +589,12 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 			// narration guard / final-answer path.
 			if tc, ok := extractProseToolCall(roundText, added); ok {
 				msg.ToolCalls = []oaiToolCall{tc}
+				// Strip the recovered JSON tool-call blob (and any fenced code-block
+				// wrapper around it) from the thinking text so the raw
+				// {"name":"...","arguments":{...}} syntax never reaches the thinking
+				// drawer — the user sees the model's reasoning, then the command
+				// block, not the raw tool-call JSON in between.
+				roundText = stripProseToolCallText(roundText, added)
 				// Fall through to the tool-execution path below (do not return):
 				// the preamble is moved to thinking and the recovered call runs
 				// exactly like a real one.
@@ -590,32 +612,32 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 				// final answer (no first-person intention phrasing) returns as
 				// before. This runs only when prose-recovery found nothing to
 				// execute — pure intention prose with no JSON tool call.
-			// Also catch second-person "hand me the tool output / run this for
-			// me" prose (looksLikeAwaitingToolResult) — the dead-end that
-			// neither prose-recovery nor the intention-narration guard matches.
-			awaiting := looksLikeAwaitingToolResult(roundText)
-			if step == 0 && (looksLikeNarration(roundText) || awaiting) && narrationRetries < agentNarrationRetries {
-				narrationRetries++
-				if roundText != "" {
-					emitThought(roundText)
+				// Also catch second-person "hand me the tool output / run this for
+				// me" prose (looksLikeAwaitingToolResult) — the dead-end that
+				// neither prose-recovery nor the intention-narration guard matches.
+				awaiting := looksLikeAwaitingToolResult(roundText)
+				if step == 0 && (looksLikeNarration(roundText) || awaiting) && narrationRetries < agentNarrationRetries {
+					narrationRetries++
+					if roundText != "" {
+						emitThought(roundText)
+					}
+					emitClear()
+					messages = append(messages, msg, oaiMessage{Role: "system", Content: jsonString(awaitingToolNudge(awaiting))})
+					continue
 				}
-				emitClear()
-				messages = append(messages, msg, oaiMessage{Role: "system", Content: jsonString(awaitingToolNudge(awaiting))})
-				continue
-			}
-			// Interactive fallback: the model asked the user to hand it a tool
-			// output or run a command for it even after the re-prompt, or on a
-			// later step. Don't stream that dead-end prose as the answer —
-			// surface a clickable "proceed" clarify card (reusing the ask_user
-			// card UI + answer path) so the user can nudge the agent back to
-			// running its tools itself. Pure narration that exhausted the guard
-			// falls through to the normal final-answer path below, unchanged.
-			if awaiting {
-				emitClear()
-				emitQuestions(synthesizeProceedCard(roundText))
-				emitPhase("clarifying")
-				return nil
-			}
+				// Interactive fallback: the model asked the user to hand it a tool
+				// output or run a command for it even after the re-prompt, or on a
+				// later step. Don't stream that dead-end prose as the answer —
+				// surface a clickable "proceed" clarify card (reusing the ask_user
+				// card UI + answer path) so the user can nudge the agent back to
+				// running its tools itself. Pure narration that exhausted the guard
+				// falls through to the normal final-answer path below, unchanged.
+				if awaiting {
+					emitClear()
+					emitQuestions(synthesizeProceedCard(roundText))
+					emitPhase("clarifying")
+					return nil
+				}
 				// Final answer — its content was already streamed (server backend)
 				// or rendered by the browser (relay), and stays in the bubble +
 				// j.content (the answer, not thinking).
@@ -680,7 +702,7 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 				out = toolOutcome{observation: "Local tool " + tc.Function.Name + " has no executor and no relay is configured.", preview: "no executor", isError: true}
 			}
 			dur := time.Since(start).Milliseconds()
-			st := agentStep{Step: step + 1, Tool: tc.Function.Name, Args: tc.Function.Arguments, Preview: out.preview, IsError: out.isError, DurationMs: dur}
+			st := agentStep{Step: step + 1, Tool: tc.Function.Name, Args: tc.Function.Arguments, Preview: out.preview, IsError: out.isError, DurationMs: dur, ExitCode: out.exitCode, Output: out.output, Cwd: out.cwd, Branch: out.branch}
 			if out.search != nil {
 				st.Search = out.search
 			}
@@ -779,6 +801,65 @@ func extractProseToolCall(text string, offered map[string]bool) (oaiToolCall, bo
 	}
 	return oaiToolCall{}, false
 }
+
+// stripProseToolCallText removes JSON tool-call blobs (the raw
+// {"name":"...","arguments":{...}} a small model wrote as prose) and any
+// fenced code-block wrapper around them from text, so the thinking drawer shows
+// the model's reasoning rather than the recovered tool-call syntax. offered
+// matches extractProseToolCall so only a real recovered call is stripped — a
+// JSON object that isn't a tool call is left alone.
+func stripProseToolCallText(text string, offered map[string]bool) string {
+	for i := 0; i < len(text); i++ {
+		if text[i] != '{' {
+			continue
+		}
+		end := findJSONEnd(text, i)
+		if end < 0 {
+			break
+		}
+		blob := text[i : end+1]
+		var parsed struct {
+			Name      string          `json:"name"`
+			Arguments json.RawMessage `json:"arguments"`
+		}
+		if json.Unmarshal([]byte(blob), &parsed) != nil || !offered[parsed.Name] {
+			i = end
+			continue
+		}
+		// Found a tool-call blob — strip it, absorbing a fenced code-block
+		// wrapper (```json\n{...}\n``` or ```\n{...}\n```) if present.
+		lo, hi := i, end+1
+		if rest := strings.TrimLeft(text[hi:], " \t"); strings.HasPrefix(rest, "```") {
+			hi += len(text) - hi - len(rest) + 3
+			if hi < len(text) && text[hi] == '\n' {
+				hi++
+			}
+		}
+		prefix := text[:lo]
+		if trimmed := strings.TrimRight(prefix, " \t"); strings.HasSuffix(trimmed, "```") {
+			lineStart := strings.LastIndex(prefix, "\n")
+			if lineStart < 0 {
+				lineStart = 0
+			}
+			if fenceLine := strings.TrimSpace(prefix[lineStart:]); fenceLine == "```" || strings.HasPrefix(fenceLine, "```") {
+				lo = lineStart
+			}
+		}
+		text = text[:lo] + text[hi:]
+		i = lo
+		if i > 0 {
+			i--
+		}
+	}
+	text = emptyFenceRe.ReplaceAllString(text, "")
+	text = blankRunRe.ReplaceAllString(text, "\n\n")
+	return strings.TrimSpace(text)
+}
+
+var (
+	emptyFenceRe = regexp.MustCompile("```[a-zA-Z]*\\n\\s*```")
+	blankRunRe   = regexp.MustCompile(`\n{3,}`)
+)
 
 // findJSONEnd returns the index of the closing '}' that balances the '{' at
 // start, accounting for nested objects and string literals. Returns -1 if the
