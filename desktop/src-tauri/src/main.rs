@@ -31,6 +31,23 @@ fn bind_listener(start: u16) -> std::net::TcpListener {
     std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind sidecar port")
 }
 
+// Fallback resource resolver for when Tauri's `resource_dir()` / `resolve(..,
+// Resource)` fail to locate the bundled files. Both of those canonicalize the
+// exe-relative path (`${exe_dir}/../Resources`), and `canonicalize` has been
+// observed to return Err on CI-built release binaries even though the files
+// exist at that path — which made the app fall through to the compile-time
+// `CARGO_MANIFEST_DIR` default (nonexistent on a user's machine) and serve a
+// blank window. We compute the path directly from the running executable and
+// probe it with `.exists()`, which resolves `..` without needing `canonicalize`
+// to succeed. `leaf` is "www" or "renderer"; `sentinel` is the file whose
+// presence confirms the directory (index.html / desktop.js).
+fn exe_relative_resource(leaf: &str, sentinel: &str) -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.join("../Resources").join(leaf)))
+        .filter(|p| p.join(sentinel).exists())
+}
+
 fn main() {
     let _ = env_logger::try_init();
 
@@ -85,6 +102,7 @@ fn main() {
                             .filter(|r| r.join("www").join("index.html").exists())
                             .map(|r| r.join("www"))
                     })
+                    .or_else(|| exe_relative_resource("www", "index.html"))
                     .unwrap_or_else(sidecar::default_www);
                 let renderer = std::env::var("NASLLM_RENDERER")
                     .ok()
@@ -105,9 +123,15 @@ fn main() {
                             .filter(|r| r.join("renderer").join("desktop.js").exists())
                             .map(|r| r.join("renderer"))
                     })
+                    .or_else(|| exe_relative_resource("renderer", "desktop.js"))
                     .unwrap_or_else(sidecar::default_renderer);
                 (www, renderer)
             };
+            log::info!(
+                "resolved resource dirs: www={} renderer={}",
+                www_path.display(),
+                renderer_path.display()
+            );
 
             let state = sidecar::AppState::new(
                 backend_url.clone(),
