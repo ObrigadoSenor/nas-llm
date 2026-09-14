@@ -1,3 +1,10 @@
+# Project Overview
+
+## Planning and Code Changes
+
+- **Initial Planning:** Refer to the `README.md` file for an overview of the project structure and key components.
+- **Code Changes:** Ensure the `README.md` is updated with new instructions or changes as needed.
+
 # nas-llm
 
 A single secure **public OpenAI-compatible HTTPS API endpoint** running on a
