@@ -103,7 +103,7 @@ func defaultAgentTools() []string {
 	return []string{
 		"web_search", "ask_user", "get_time", "calculator",
 		"read_file", "list_files", "glob", "grep", "git_status",
-		"apply_patch", "run_command", "git_commit", "git_push", "create_pr",
+		"apply_patch", "run_command", "git_commit", "git_push", "create_pr", "merge_pr",
 	}
 }
 
@@ -310,6 +310,7 @@ func (s *server) toolRegistry(email string) map[string]agentTool {
 		"git_commit":  gitCommitTool(),
 		"git_push":    gitPushTool(),
 		"create_pr":   createPrTool(),
+		"merge_pr":    mergePrTool(),
 	} {
 		reg[name] = agentTool{schema: schema, local: true}
 	}
@@ -413,6 +414,17 @@ func createPrTool() oaiTool {
 			"title": map[string]any{"type": "string", "description": "The pull request title."},
 			"body":  map[string]any{"type": "string", "description": "The pull request body/description."},
 		}, "required": []string{"title", "body"}},
+	}}
+}
+
+func mergePrTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "merge_pr",
+		Description: "Merge a GitHub pull request by its number. The user tells you which PR number to merge; merge only when the user asks. Approval-gated and irreversible — the user must approve the merge action. method defaults to \"merge\" (merge commit); \"squash\" and \"rebase\" are alternatives.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"number": map[string]any{"type": "integer", "description": "The pull request number to merge."},
+			"method": map[string]any{"type": "string", "enum": []string{"merge", "squash", "rebase"}, "description": "Merge method. Defaults to \"merge\"."},
+		}, "required": []string{"number"}},
 	}}
 }
 
@@ -1098,6 +1110,7 @@ func availableTools(fetchPage bool) []toolMeta {
 		toolMeta{Name: "git_commit", Label: "Git commit", Description: "Stage and commit changes on the current branch (desktop only)."},
 		toolMeta{Name: "git_push", Label: "Git push", Description: "Push the current branch to its remote (desktop only)."},
 		toolMeta{Name: "create_pr", Label: "Create PR", Description: "Open a pull request from the current branch (desktop only)."},
+		toolMeta{Name: "merge_pr", Label: "Merge PR", Description: "Merge a GitHub pull request by number (desktop only). Approval-gated."},
 	)
 	return out
 }

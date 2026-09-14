@@ -2067,6 +2067,17 @@ function openSessionPanel(repoName) {
     card.appendChild(prRow);
     const prOut = el("div", "ds-note"); prOut.id = "dsSessionPrOut";
     card.appendChild(prOut);
+    card.appendChild(el("div", "ds-label", "Merge pull request"));
+    const prSelect = document.createElement("select"); prSelect.id = "dsSessionPrSelect";
+    card.appendChild(prSelect);
+    const mergeRow = el("div", "ds-row ds-approval-row");
+    const mergeMethod = document.createElement("select"); mergeMethod.id = "dsSessionMergeMethod";
+    ["merge", "squash", "rebase"].forEach((m) => { const o = document.createElement("option"); o.value = m; o.textContent = m; mergeMethod.appendChild(o); });
+    const mergeBtn = el("button", "ds-btn ds-btn-approve", "Merge PR"); mergeBtn.id = "dsSessionMergeBtn";
+    mergeRow.appendChild(mergeMethod); mergeRow.appendChild(mergeBtn);
+    card.appendChild(mergeRow);
+    const mergeOut = el("div", "ds-note"); mergeOut.id = "dsSessionMergeOut";
+    card.appendChild(mergeOut);
     const actRow = el("div", "ds-row ds-approval-row");
     const revertBtn = el("button", "ds-btn ds-btn-ghost", "Revert");
     const shipBtn = el("button", "ds-btn ds-btn-ghost", "Ship…");
@@ -2079,12 +2090,14 @@ function openSessionPanel(repoName) {
       overlay._repo = name;
       overlay._commit = (push) => sessionCommit(name, push);
       overlay._createPR = () => sessionCreatePR(name);
+      overlay._mergePR = () => sessionMergePR(name);
       overlay._revert = () => sessionRevert(name);
       overlay._ship = () => { overlay.classList.remove("open"); openShipChanges({ name }); };
     };
     commitBtn.onclick = () => overlay._commit(false);
     pushBtn.onclick = () => overlay._commit(true);
     prBtn.onclick = () => overlay._createPR();
+    mergeBtn.onclick = () => overlay._mergePR();
     revertBtn.onclick = () => overlay._revert();
     shipBtn.onclick = () => overlay._ship();
   }
@@ -2097,6 +2110,7 @@ function openSessionPanel(repoName) {
   }
   const co = $("dsSessionCommitOut"); if (co) co.textContent = "";
   const po = $("dsSessionPrOut"); if (po) po.textContent = "";
+  const mo = $("dsSessionMergeOut"); if (mo) mo.textContent = "";
   overlay.classList.add("open");
   loadSessionPanel(repoName);
 }
@@ -2130,6 +2144,7 @@ async function loadSessionPanel(repoName) {
     if (!hasRemote) { b.disabled = true; b.title = "No remote configured for this repo."; }
     else { b.disabled = false; b.title = ""; }
   });
+  loadSessionPRs(repoName);
 }
 
 async function sessionCommit(repoName, push) {
@@ -2185,6 +2200,65 @@ async function sessionRevert(repoName) {
   loadSessionPanel(repoName);
   refreshRailState();
   refreshLocal();
+}
+
+// loadSessionPRs populates the session panel's Merge PR picker from the
+// /__sidecar/repos/prs route (shared with the agent's list_prs tool). Each
+// option is "#N title [draft] · CI=state". The Merge button is disabled when
+// there are no PRs or the list can't be loaded.
+async function loadSessionPRs(repoName) {
+  const sel = $("dsSessionPrSelect"); if (!sel) return;
+  const mergeBtn = $("dsSessionMergeBtn");
+  sel.innerHTML = "";
+  const r = await sid("repos/prs?name=" + encodeURIComponent(repoName));
+  const d = (r && r.data) || {};
+  if (!r.ok || !Array.isArray(d.prs)) {
+    const o = document.createElement("option");
+    o.value = ""; o.textContent = d.error ? "Couldn't load PRs: " + d.error : "Couldn't load PRs";
+    sel.appendChild(o);
+    sel.disabled = true;
+    if (mergeBtn) { mergeBtn.disabled = true; mergeBtn.title = ""; }
+    return;
+  }
+  if (!d.prs.length) {
+    const o = document.createElement("option"); o.value = ""; o.textContent = "No open PRs"; sel.appendChild(o);
+    sel.disabled = true;
+    if (mergeBtn) { mergeBtn.disabled = true; mergeBtn.title = "No open PRs"; }
+    return;
+  }
+  sel.disabled = false;
+  d.prs.forEach((pr) => {
+    const o = document.createElement("option");
+    o.value = String(pr.number);
+    const draft = pr.draft ? " [draft]" : "";
+    const ci = pr.ci_state ? " · CI=" + pr.ci_state : "";
+    o.textContent = `#${pr.number} ${pr.title}${draft}${ci}`;
+    sel.appendChild(o);
+  });
+  if (mergeBtn) { mergeBtn.disabled = false; mergeBtn.title = ""; }
+}
+
+// sessionMergePR merges the PR selected in the picker via /__sidecar/repos/merge-pr.
+// Confirms first (merge is irreversible), then refreshes the PR list + rail.
+async function sessionMergePR(repoName) {
+  const out = $("dsSessionMergeOut");
+  const sel = $("dsSessionPrSelect");
+  const number = sel && sel.value ? parseInt(sel.value, 10) : 0;
+  if (!number) { if (out) out.textContent = "Select a PR to merge."; return; }
+  const method = ($("dsSessionMergeMethod") && $("dsSessionMergeMethod").value) || "merge";
+  const ok = await dsConfirm("Merge PR #" + number + "?", "This merges PR #" + number + " in " + repoName + " via " + method + ". This is irreversible.");
+  if (!ok) return;
+  if (out) out.textContent = "Merging…";
+  const res = await sid("repos/merge-pr", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repo: repoName, number, method }) });
+  const d = (res && res.data) || {};
+  if (d.ok) {
+    const sha = (d.sha || "").slice(0, 7);
+    if (out) out.textContent = "Merged ✓ PR #" + number + (sha ? " (sha " + sha + ")" : "");
+    loadSessionPRs(repoName);
+    refreshRailState();
+  } else {
+    if (out) out.textContent = "Failed: " + (d.error || res.status || "unknown");
+  }
 }
 
 function makeReposBtn() {
