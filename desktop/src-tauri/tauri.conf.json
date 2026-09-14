@@ -21,7 +21,11 @@
     "category": "DeveloperTool",
     "shortDescription": "Local-LLM codebase agent",
     "longDescription": "A Copilot-style desktop app that connects GitHub, clones repos, and runs a local agent against a codebase using local LLMs.",
-    "createUpdaterArtifacts": true
+    "createUpdaterArtifacts": true,
+    "resources": {
+      "../../www/": "www/",
+      "../renderer/": "renderer/"
+    }
   },
   "plugins": {
     "updater": {

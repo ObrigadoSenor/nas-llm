@@ -14,7 +14,7 @@ mod sidecar;
 mod updater;
 
 use std::path::PathBuf;
-use tauri::{WebviewUrl, WebviewWindowBuilder};
+use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 const DEFAULT_PORT: u16 = 17543;
 
@@ -38,6 +38,7 @@ fn main() {
     std::fs::create_dir_all(&data_dir).ok();
 
     let cfg = sidecar::load_config(&data_dir);
+    let backend_url = cfg.backend_url.unwrap_or_default();
 
     // Bind first so we know the real port before building the window URL. The
     // std bind needs no runtime; the conversion to a tokio listener happens
@@ -47,21 +48,6 @@ fn main() {
     std_listener.set_nonblocking(true).ok();
     let origin = format!("http://127.0.0.1:{port}");
 
-    let www_path = std::env::var("NASLLM_WWW")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| sidecar::default_www());
-    let renderer_path = std::env::var("NASLLM_RENDERER")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| sidecar::default_renderer());
-
-    let state = sidecar::AppState::new(
-        cfg.backend_url.unwrap_or_default(),
-        &data_dir,
-        www_path,
-        renderer_path,
-        origin.clone(),
-    );
-
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -70,8 +56,68 @@ fn main() {
         // notification actions are mobile-only in Tauri and the in-app badge
         // is the way to jump to the chat.
         .plugin(tauri_plugin_notification::init())
-        .manage(state.clone())
         .setup(move |app| {
+            // Resolve the www/ and renderer/ dirs the sidecar serves from disk.
+            // Release builds bundle them as Tauri resources (tauri.conf.json
+            // `bundle.resources`), resolved here via the runtime resource dir so
+            // the app never depends on the compile-time CARGO_MANIFEST_DIR path
+            // baked into the binary (which only exists on the build machine).
+            // `tauri dev` falls back to the live source tree. NASLLM_WWW /
+            // NASLLM_RENDERER override everything for local debugging.
+            let (www_path, renderer_path) = {
+                let handle = app.handle();
+                let www = std::env::var("NASLLM_WWW")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from)
+                    .or_else(|| {
+                        handle
+                            .path()
+                            .resolve("www", tauri::path::BaseDirectory::Resource)
+                            .ok()
+                            .filter(|p| p.join("index.html").exists())
+                    })
+                    .or_else(|| {
+                        handle
+                            .path()
+                            .resource_dir()
+                            .ok()
+                            .filter(|r| r.join("www").join("index.html").exists())
+                            .map(|r| r.join("www"))
+                    })
+                    .unwrap_or_else(sidecar::default_www);
+                let renderer = std::env::var("NASLLM_RENDERER")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from)
+                    .or_else(|| {
+                        handle
+                            .path()
+                            .resolve("renderer", tauri::path::BaseDirectory::Resource)
+                            .ok()
+                            .filter(|p| p.join("desktop.js").exists())
+                    })
+                    .or_else(|| {
+                        handle
+                            .path()
+                            .resource_dir()
+                            .ok()
+                            .filter(|r| r.join("renderer").join("desktop.js").exists())
+                            .map(|r| r.join("renderer"))
+                    })
+                    .unwrap_or_else(sidecar::default_renderer);
+                (www, renderer)
+            };
+
+            let state = sidecar::AppState::new(
+                backend_url.clone(),
+                &data_dir,
+                www_path,
+                renderer_path,
+                origin.clone(),
+            );
+            app.manage(state.clone());
+
             // Run the sidecar HTTP server on the Tauri async runtime (tokio).
             // Merge the core sidecar router with the GitHub/repos router so all
             // /__sidecar/* routes are served from one axum app.
