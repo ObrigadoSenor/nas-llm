@@ -26,9 +26,7 @@ https://chat.selected.systems):
   the partial text is saved; send again → works normally.
 
 Optional: set `MAX_SEARCH_ROUNDS=2` in `.env` + redeploy if single-round answers
-feel too shallow for multi-part questions. Note that `MAX_SEARCH_ROUNDS` is not
-currently passed through `docker-compose.yml` to the backend container — see the
-header note in `.env.example`.
+feel too shallow for multi-part questions.
 
 ## PR #4 — streamed web_search tool-call pass (merged to `main`)
 

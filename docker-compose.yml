@@ -78,6 +78,28 @@ services:
       OLLAMA_MAC_URL: ${OLLAMA_MAC_URL:-}
       MAC_RAM_GB: ${MAC_RAM_GB:-16}
       MAC_SYSTEM_RESERVE_GB: ${MAC_SYSTEM_RESERVE_GB:-2}
+      # Everything below is read by backend/main.go but used to be absent from
+      # this block, so setting it in .env silently did nothing and the backend
+      # fell back to its compiled default. Each default here mirrors the
+      # corresponding default in the `config` struct in backend/main.go — keep
+      # the two in sync, or .env will appear to lie again.
+      #
+      # Web search.
+      MAX_SEARCH_ROUNDS: ${MAX_SEARCH_ROUNDS:-1}
+      # Clarifying questions / ask_user.
+      MAX_CLARIFY_ROUNDS: ${MAX_CLARIFY_ROUNDS:-3}
+      ASK_USER_IN_PLAIN_CHAT: "${ASK_USER_IN_PLAIN_CHAT:-true}"
+      CLARIFY_PROSE_DETECT: "${CLARIFY_PROSE_DETECT:-true}"
+      # Agent harness. FETCH_PAGE_ENABLED stays off unless explicitly set: it
+      # lets the model read untrusted web pages, which raises the
+      # prompt-injection surface. See .env.example for the full rationale.
+      MAX_AGENT_STEPS: ${MAX_AGENT_STEPS:-6}
+      FETCH_PAGE_ENABLED: "${FETCH_PAGE_ENABLED:-false}"
+      # Concurrent chats + human-in-the-loop timeouts (Go duration syntax).
+      MAX_CONCURRENT_JOBS: ${MAX_CONCURRENT_JOBS:-4}
+      BROWSER_RELAY_GRACE: ${BROWSER_RELAY_GRACE:-45s}
+      AGENT_JOB_TIMEOUT: ${AGENT_JOB_TIMEOUT:-30m}
+      TOOL_EXEC_TIMEOUT: ${TOOL_EXEC_TIMEOUT:-15m}
     volumes:
       - ${DOCKER_VOLUME}/docker/nas-llm/backend/data:/data
     networks:
