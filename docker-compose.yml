@@ -93,7 +93,7 @@ services:
       # Agent harness. FETCH_PAGE_ENABLED stays off unless explicitly set: it
       # lets the model read untrusted web pages, which raises the
       # prompt-injection surface. See .env.example for the full rationale.
-      MAX_AGENT_STEPS: ${MAX_AGENT_STEPS:-6}
+      MAX_AGENT_STEPS: ${MAX_AGENT_STEPS:-24}
       FETCH_PAGE_ENABLED: "${FETCH_PAGE_ENABLED:-false}"
       # Concurrent chats + human-in-the-loop timeouts (Go duration syntax).
       MAX_CONCURRENT_JOBS: ${MAX_CONCURRENT_JOBS:-4}

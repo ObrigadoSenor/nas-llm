@@ -84,29 +84,29 @@ Unblocks the reported failure on its own. Sections 1 & 2 of the spec.
 - [x] Manual pass (desktop app, not covered by `make check`): a repo-bound chat
   creates a file in a new directory, edits it, renames it, deletes it.
 
-## Phase 2 — Step budget, observation wording, tool-list dedupe 🚧
+## Phase 2 — Step budget, observation wording, tool-list dedupe ✅
 
 Section 3 of the spec.
 
-- [ ] Raise `MAX_AGENT_STEPS` default 6 → 24 in `backend/main.go`,
+- [x] Raise `MAX_AGENT_STEPS` default 6 → 24 in `backend/main.go`,
   `docker-compose.yml`, `.env.example`, and the README env table.
-- [ ] `runAgentLoop`: at 80% of the budget append a system message telling the
+- [x] `runAgentLoop`: at 80% of the budget append a system message telling the
   model how many steps remain and to finish outstanding edits then summarize.
-- [ ] `runAgentLoop`: emit a trace `agentStep` (`Tool: "(budget)"`) when the
+- [x] `runAgentLoop`: emit a trace `agentStep` (`Tool: "(budget)"`) when the
   budget forces the final tools-removed answer, so the truncation is visible in
   the UI instead of silent.
-- [ ] `runAgentLoop`: a narration re-prompt round does not consume a step.
-- [ ] Strengthen the failed-write observation: state that the file is
+- [x] `runAgentLoop`: a narration re-prompt round does not consume a step.
+- [x] Strengthen the failed-write observation: state that the file is
   unchanged, that repeating the identical call will fail again, and which tool
   to use instead.
-- [ ] Collapse the duplicated local tool lists into one `localRepoTools()`
+- [x] Collapse the duplicated local tool lists into one `localRepoTools()`
   helper used by `defaultAgentTools`, `availableTools`, and the repo-bound
   append in `jobs.go`; wire up `git_log` and `list_prs` (schemas + registry)
   while doing it so the model can finally call them.
-- [ ] Docs: `backend/AGENTS.md` (budget + tool list). Go tests: the 80%
+- [x] Docs: `backend/AGENTS.md` (budget + tool list). Go tests: the 80%
   warning firing, narration retry not consuming a step, `localRepoTools()`
   containing `git_log`/`list_prs`.
-- [ ] Validated: `make check` clean.
+- [x] Validated: `make check` clean.
 
 ## Phase 3 — Pause and resume 🚧
 

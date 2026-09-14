@@ -100,12 +100,10 @@ type agentTool struct {
 // when no sidecar relay is configured (a non-repo chat), so a plain chat never
 // offers tools it cannot execute.
 func defaultAgentTools() []string {
-	return []string{
-		"web_search", "ask_user", "get_time", "calculator",
-		"read_file", "list_files", "glob", "grep", "git_status",
-		"write_file", "edit_file", "move_path", "delete_path",
-		"apply_patch", "run_command", "git_commit", "git_push", "create_pr", "merge_pr",
-	}
+	return append(
+		[]string{"web_search", "ask_user", "get_time", "calculator"},
+		localRepoTools()...,
+	)
 }
 
 // agentConfig returns the (tool allowlist, system prompt) for an agent run.
@@ -306,6 +304,8 @@ func (s *server) toolRegistry(email string) map[string]agentTool {
 		"glob":        globTool(),
 		"grep":        grepTool(),
 		"git_status":  gitStatusTool(),
+		"git_log":     gitLogTool(),
+		"list_prs":    listPrsTool(),
 		"write_file":  writeFileTool(),
 		"edit_file":   editFileTool(),
 		"delete_path": deletePathTool(),
@@ -479,6 +479,63 @@ func mergePrTool() oaiTool {
 	}}
 }
 
+func gitLogTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "git_log",
+		Description: "List recent commits on the current branch (sha, author, date, subject). Use this to review history or find a prior change before editing. Optional count (default 20, max 100) and a repository-relative path to filter to a file/dir.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"count": map[string]any{"type": "integer", "description": "Number of commits to return (default 20, max 100)."},
+			"path":  map[string]any{"type": "string", "description": "Repository-relative path to filter commits to (optional)."},
+		}},
+	}}
+}
+
+func listPrsTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "list_prs",
+		Description: "List the repository's open pull requests with head→base, draft flag, CI state, and review state. Read-only. Use this before merge_pr to find a PR number and check whether it is safe to merge. GitHub.com repos only.",
+		Parameters:  map[string]any{"type": "object", "properties": map[string]any{}},
+	}}
+}
+
+// localRepoTools is the single ordered list of local (sidecar-relayed) agent
+// tool names, used by defaultAgentTools, availableTools, and the repo-bound
+// allow append in jobs.go so the three lists cannot drift. git_log and list_prs
+// are included here — they already had sidecar executors but were missing from
+// every backend list, so the model could never call them. Read-only tools first,
+// then write tools, then git workflow tools.
+func localRepoTools() []string {
+	return []string{
+		"read_file", "list_files", "glob", "grep", "git_status", "git_log", "list_prs",
+		"write_file", "edit_file", "move_path", "delete_path", "apply_patch", "run_command",
+		"git_commit", "git_push", "create_pr", "merge_pr",
+	}
+}
+
+// localToolMetas is the UI-facing metadata for localRepoTools, in the same
+// order, so availableTools stays in lockstep with the allowlist/registry.
+func localToolMetas() []toolMeta {
+	return []toolMeta{
+		{Name: "read_file", Label: "Read file", Description: "Read a file in the repository (desktop only)."},
+		{Name: "list_files", Label: "List files", Description: "List a directory in the repository (desktop only)."},
+		{Name: "glob", Label: "Glob", Description: "Find files by name pattern (desktop only)."},
+		{Name: "grep", Label: "Grep", Description: "Search file contents in the repository (desktop only)."},
+		{Name: "git_status", Label: "Git status", Description: "Show the working tree status (desktop only)."},
+		{Name: "git_log", Label: "Git log", Description: "List recent commits on the current branch (desktop only)."},
+		{Name: "list_prs", Label: "List PRs", Description: "List the repo's open pull requests with CI/review state (desktop only)."},
+		{Name: "write_file", Label: "Write file", Description: "Create or overwrite a file (desktop only)."},
+		{Name: "edit_file", Label: "Edit file", Description: "Exact string replacement in a file (desktop only)."},
+		{Name: "move_path", Label: "Move/rename", Description: "Rename or move a file/directory (desktop only)."},
+		{Name: "delete_path", Label: "Delete path", Description: "Delete a file/directory; always prompts (desktop only)."},
+		{Name: "apply_patch", Label: "Apply patch", Description: "Apply a unified diff to edit files (desktop only)."},
+		{Name: "run_command", Label: "Run command", Description: "Run a shell command in the repo (desktop only)."},
+		{Name: "git_commit", Label: "Git commit", Description: "Stage and commit changes on the current branch (desktop only)."},
+		{Name: "git_push", Label: "Git push", Description: "Push the current branch to its remote (desktop only)."},
+		{Name: "create_pr", Label: "Create PR", Description: "Open a pull request from the current branch (desktop only)."},
+		{Name: "merge_pr", Label: "Merge PR", Description: "Merge a GitHub pull request by number (desktop only). Approval-gated."},
+	}
+}
+
 // injectRepoContext prepends a repo context block to the agent system prompt
 // so the model knows which repository it's working against: the repo name,
 // current branch, HEAD, and the top-level file tree. This is injected only for
@@ -615,7 +672,21 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 	messages := append([]oaiMessage{{Role: "system", Content: jsonString(sys)}}, msgs...)
 	seen := map[string]int{}
 	narrationRetries := 0
-	for step := 0; step < s.cfg.maxAgentSteps; step++ {
+	budgetWarned := false
+	// step is a manual counter (not the for-loop counter) so a narration
+	// re-prompt round — which re-runs the model without making progress — does
+	// not consume a step of the budget. It increments only at the end of a real
+	// (tool-carrying or final-answer) round; the narration guard's continue
+	// skips the increment.
+	step := 0
+	for step < s.cfg.maxAgentSteps {
+		// Warn once at 80% of the budget so the model knows the cliff is near
+		// and finishes outstanding edits before synthesizing, instead of being
+		// silently cut off mid-task when the budget forces a final answer.
+		if !budgetWarned && step > 0 && step >= (s.cfg.maxAgentSteps*4)/5 {
+			budgetWarned = true
+			messages = append(messages, oaiMessage{Role: "system", Content: jsonString(fmt.Sprintf("Budget notice: %d tool-call step(s) remain before the run is forced to a final answer. Finish any outstanding edits now, then synthesize your final answer for the user.", s.cfg.maxAgentSteps-step))})
+		}
 		// Bound the running transcript before each model call so a long multi-step
 		// run can't overflow the context window (Tier 3 compaction). Only a
 		// server-side backend's context window is bounded by the server's config;
@@ -708,8 +779,12 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 				// If the model answered on its very first turn without ever calling a
 				// tool, surface that as a trace step so a tool-capable model
 				// declining to use tools reads as model behavior, not a silent
-				// "agent did nothing".
-				if step == 0 {
+				// "agent did nothing". Skip the marker when a narration re-prompt
+				// preceded the answer (narrationRetries > 0): that's a stalling
+				// model that exhausted the guard, not a genuine direct answer, and
+				// because narration no longer consumes a step the second narration
+				// still lands at step 0.
+				if step == 0 && narrationRetries == 0 {
 					emitTool(agentStep{Step: 1, Tool: "(direct)", Preview: "Answered directly — no tools were needed."})
 				}
 				if roundText == "" {
@@ -791,10 +866,14 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 			}
 			messages = append(messages, toolResultMsg(tc, capObservation(out.observation, agentObsMaxChars), out.isError))
 		}
+		step++
 	}
 	// Step budget exhausted: force one final answer with tools removed so the
 	// model must synthesize. Routed through the backend so a server backend
 	// streams it live and a browser relay has the browser stream it from localhost.
+	// Surface a trace step so the truncation is visible in the UI instead of a
+	// silent "agent stopped calling tools and answered".
+	emitTool(agentStep{Step: step + 1, Tool: "(budget)", Preview: fmt.Sprintf("step budget exhausted — forcing a final answer (%d steps).", s.cfg.maxAgentSteps)})
 	emitPhase("answering")
 	_, _, err := mb.Call(ctx, model, messages, nil)
 	return err
@@ -803,11 +882,30 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 // toolResultMsg builds an OpenAI tool-result message. Ollama's OpenAI shim does
 // not honor an is_error field, so errors are prefix-tagged so a model that
 // would otherwise treat a short failure string as a real observation sees it.
+// For a failed write tool, append that the file is unchanged and that repeating
+// the identical call will fail again — a small model often treats a short
+// "Could not write X" as if the edit landed and moves on (the "it skips steps"
+// symptom). Skipped when the observation already says "unchanged" (the sidecar's
+// edit_file/apply_patch failure messages do) to avoid duplicating it.
 func toolResultMsg(tc oaiToolCall, content string, isError bool) oaiMessage {
 	if isError {
 		content = "Error: " + content
+		if isWriteTool(tc.Function.Name) && !strings.Contains(content, "unchanged") {
+			content += "\nThe file is unchanged. Do not repeat the identical call — it will fail the same way; adjust the arguments or use a different file tool."
+		}
 	}
 	return oaiMessage{Role: "tool", ToolCallID: tc.ID, Name: tc.Function.Name, Content: jsonString(content)}
+}
+
+// isWriteTool reports whether a tool mutates the working tree, so a failed
+// observation can stress that the file is unchanged (vs. a read or command
+// failure, which doesn't carry that meaning).
+func isWriteTool(name string) bool {
+	switch name {
+	case "write_file", "edit_file", "move_path", "delete_path", "apply_patch":
+		return true
+	}
+	return false
 }
 
 func capObservation(s string, max int) string {
@@ -1150,23 +1248,7 @@ func availableTools(fetchPage bool) []toolMeta {
 	if fetchPage {
 		out = append(out, toolMeta{Name: "fetch_page", Label: "Fetch page", Description: "Download a web page and read its text. Off by default (injection risk)."})
 	}
-	out = append(out,
-		toolMeta{Name: "read_file", Label: "Read file", Description: "Read a file in the repository (desktop only)."},
-		toolMeta{Name: "list_files", Label: "List files", Description: "List a directory in the repository (desktop only)."},
-		toolMeta{Name: "glob", Label: "Glob", Description: "Find files by name pattern (desktop only)."},
-		toolMeta{Name: "grep", Label: "Grep", Description: "Search file contents in the repository (desktop only)."},
-		toolMeta{Name: "git_status", Label: "Git status", Description: "Show the working tree status (desktop only)."},
-		toolMeta{Name: "write_file", Label: "Write file", Description: "Create or overwrite a file (desktop only)."},
-		toolMeta{Name: "edit_file", Label: "Edit file", Description: "Exact string replacement in a file (desktop only)."},
-		toolMeta{Name: "move_path", Label: "Move/rename", Description: "Rename or move a file/directory (desktop only)."},
-		toolMeta{Name: "delete_path", Label: "Delete path", Description: "Delete a file/directory; always prompts (desktop only)."},
-		toolMeta{Name: "apply_patch", Label: "Apply patch", Description: "Apply a unified diff to edit files (desktop only)."},
-		toolMeta{Name: "run_command", Label: "Run command", Description: "Run a shell command in the repo (desktop only)."},
-		toolMeta{Name: "git_commit", Label: "Git commit", Description: "Stage and commit changes on the current branch (desktop only)."},
-		toolMeta{Name: "git_push", Label: "Git push", Description: "Push the current branch to its remote (desktop only)."},
-		toolMeta{Name: "create_pr", Label: "Create PR", Description: "Open a pull request from the current branch (desktop only)."},
-		toolMeta{Name: "merge_pr", Label: "Merge PR", Description: "Merge a GitHub pull request by number (desktop only). Approval-gated."},
-	)
+	out = append(out, localToolMetas()...)
 	return out
 }
 

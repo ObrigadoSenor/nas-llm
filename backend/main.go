@@ -111,7 +111,7 @@ func main() {
 		maxClarifyRounds:   envInt("MAX_CLARIFY_ROUNDS", 3),
 		askUserInPlainChat: envBool("ASK_USER_IN_PLAIN_CHAT", true),
 		clarifyProseDetect: envBool("CLARIFY_PROSE_DETECT", true),
-		maxAgentSteps:      envInt("MAX_AGENT_STEPS", 6),
+		maxAgentSteps:      envInt("MAX_AGENT_STEPS", 24),
 		fetchPageEnabled:   envBool("FETCH_PAGE_ENABLED", false),
 		contextLength:      envInt("OLLAMA_CONTEXT_LENGTH", 16384),
 		nasRamGB:           envFloat("NAS_RAM_GB", 8),

@@ -68,7 +68,7 @@
 - `DB_PATH` — defaults to `/data/nas-llm.db` (container path, `main.go:102`).
 - `OLLAMA_MAC_URL` — empty by default; setting it enables the optional Mac backend.
 - `OLLAMA_CONTEXT_LENGTH` — mirrors the Ollama container's context length for KV-cache RAM estimation.
-- `MAX_AGENT_STEPS` — per-run tool-calling round budget (default 6; a small model that loops is forced to a final answer).
+- `MAX_AGENT_STEPS` — per-run tool-calling round budget (default 24; the model is warned at 80% of the budget to finish outstanding edits, a narration re-prompt round does not consume a step, and exhausting the budget emits a `(budget)` trace step before forcing a tools-removed final answer).
 - `RUN_COMMAND_TIMEOUT` — per-`run_command` deadline (default 120s), carried on each `toolExec` payload so the sidecar kills a non-exiting command (exit 124) instead of parking the relay until `TOOL_EXEC_TIMEOUT`.
 
 ## Key architecture pointers

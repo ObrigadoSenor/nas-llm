@@ -1252,9 +1252,7 @@ func (s *server) runGeneration(j *job) error {
 		var toolExecRelay func(context.Context, int, string, string) toolOutcome
 		if repoID != "" {
 			if repo, err := s.store.getRepo(j.email, repoID); err == nil && repo != nil {
-				allow = append(allow, "read_file", "list_files", "glob", "grep", "git_status",
-					"write_file", "edit_file", "move_path", "delete_path",
-					"apply_patch", "run_command", "git_commit", "git_push", "create_pr", "merge_pr")
+				allow = append(allow, localRepoTools()...)
 				sys = injectRepoContext(sys, repo, conv.RepoBranch)
 				// Resolve the conversation's effective auto-approve once for this run;
 				// the renderer uses it to skip the approval dialog for write tools

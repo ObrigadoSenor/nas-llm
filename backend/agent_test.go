@@ -214,16 +214,22 @@ func TestAgentSystemPromptInjection_OnlyAppliesToAgentMode(t *testing.T) {
 // fakeBackend is a scripted modelBackend for runAgentLoop tests: it returns a
 // fixed sequence of assistant messages (one per Call), so a test can simulate a
 // model that narrates on round 1 and emits a real tool_call on round 2 without
-// any live Ollama. calls counts how many rounds were actually run.
+// any live Ollama. calls counts how many rounds were actually run. recorded
+// captures the messages handed to each Call so a test can inspect injected
+// system messages (e.g. the 80% budget warning).
 type fakeBackend struct {
 	mu        sync.Mutex
 	responses []oaiMessage
 	calls     int
+	recorded  [][]oaiMessage
 }
 
 func (f *fakeBackend) Call(ctx context.Context, model string, messages []oaiMessage, tools []oaiTool) (oaiMessage, agentUsage, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	cp := make([]oaiMessage, len(messages))
+	copy(cp, messages)
+	f.recorded = append(f.recorded, cp)
 	if f.calls >= len(f.responses) {
 		// Past the end of the script: return a clean terminal answer so the loop
 		// doesn't hang or loop forever on a test that under-scripted the rounds.
@@ -771,5 +777,160 @@ func TestStripProseToolCallText(t *testing.T) {
 				t.Errorf("stripProseToolCallText = %q, want %q", got, c.want)
 			}
 		})
+	}
+}
+
+// TestAgentBudgetWarning80Percent verifies the 80%-of-budget warning: with a
+// budget of 5, the loop appends a "Budget notice" system message before the
+// model call that crosses 80% (step 4), and not before. The notice tells the
+// model how many steps remain so it finishes outstanding edits before the cliff.
+func TestAgentBudgetWarning80Percent(t *testing.T) {
+	const email = "user@example.com"
+	msgs := []oaiMessage{{Role: "user", Content: jsonString("keep checking the time")}}
+	st, err := newStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	defer st.close()
+	srv := &server{cfg: config{contextLength: 8192, maxAgentSteps: 5}, store: st}
+
+	// Five tool-call rounds (each crosses one step) then the budget forces a
+	// final answer. 80% of 5 is 4, so the warning is injected before the 5th
+	// model call (recorded[4]) and absent before the 4th (recorded[3]).
+	script := []oaiMessage{
+		toolCallMsg("c1", "get_time", "{}"),
+		toolCallMsg("c2", "get_time", "{}"),
+		toolCallMsg("c3", "get_time", "{}"),
+		toolCallMsg("c4", "get_time", "{}"),
+		toolCallMsg("c5", "get_time", "{}"),
+		finalAnswerMsg("done"),
+	}
+	mb := &fakeBackend{responses: script}
+	var steps []agentStep
+	err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
+		func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
+		func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil)
+	if err != nil {
+		t.Fatalf("runAgentLoop: %v", err)
+	}
+	if got := mb.callCount(); got != len(script) {
+		t.Fatalf("model calls = %d, want %d", got, len(script))
+	}
+	if len(mb.recorded) <= 4 {
+		t.Fatalf("not enough recorded rounds: %d", len(mb.recorded))
+	}
+	sawNotice := false
+	for _, m := range mb.recorded[3] {
+		if m.Role == "system" && strings.Contains(contentText(m.Content), "Budget notice") {
+			sawNotice = true
+		}
+	}
+	if sawNotice {
+		t.Errorf("budget warning fired before 80%% (recorded[3]); should fire at step 4")
+	}
+	var saw bool
+	for _, m := range mb.recorded[4] {
+		if m.Role == "system" && strings.Contains(contentText(m.Content), "Budget notice") && strings.Contains(contentText(m.Content), "1 tool-call step(s) remain") {
+			saw = true
+		}
+	}
+	if !saw {
+		t.Errorf("budget warning missing from the 80%% crossing call (recorded[4]): %v", mb.recorded[4])
+	}
+	// A (budget) trace step must be emitted when the budget forces the final answer.
+	var budgetStep *agentStep
+	for i := range steps {
+		if steps[i].Tool == "(budget)" {
+			budgetStep = &steps[i]
+		}
+	}
+	if budgetStep == nil {
+		t.Errorf("no (budget) trace step emitted; steps = %+v", steps)
+	}
+}
+
+// TestAgentNarrationRetryDoesNotConsumeStep verifies that a narration re-prompt
+// round does not consume a step of the budget. With a budget of 1, the model
+// narrates on round 1 then emits a real tool call on round 2. Under the old
+// for-step counter the narration would burn the only step, the loop would exit
+// before the tool ever ran, and the model would be forced to a final answer.
+// Now the narration's continue skips the step increment, so the tool call still
+// runs within the budget and the forced answer only fires after it.
+func TestAgentNarrationRetryDoesNotConsumeStep(t *testing.T) {
+	const email = "user@example.com"
+	msgs := []oaiMessage{{Role: "user", Content: jsonString("Add a comment to foo.go")}}
+	st, err := newStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	defer st.close()
+	srv := &server{cfg: config{contextLength: 8192, maxAgentSteps: 1}, store: st}
+
+	mb := &fakeBackend{responses: []oaiMessage{
+		narrationMsg("I'll edit foo.go to add a comment."), // round 1: narrates (no step charged)
+		toolCallMsg("call_1", "get_time", "{}"),            // round 2: real tool call (step 0 -> 1)
+		finalAnswerMsg("Done — added the comment."),        // forced answer after the budget exit
+	}}
+	var steps []agentStep
+	err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
+		func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
+		func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil)
+	if err != nil {
+		t.Fatalf("runAgentLoop: %v", err)
+	}
+	// 3 calls: narration, tool call, forced answer. Under the old code this
+	// would be 2 (narration consumed the only step, tool never ran).
+	if got := mb.callCount(); got != 3 {
+		t.Fatalf("model calls = %d, want 3 (narration did not consume the budget)", got)
+	}
+	var ranTool *agentStep
+	for i := range steps {
+		if steps[i].Tool == "get_time" {
+			ranTool = &steps[i]
+		}
+	}
+	if ranTool == nil {
+		t.Fatalf("no get_time step; the narration must not have consumed the only step. steps = %+v", steps)
+	}
+}
+
+// TestLocalRepoToolsContainsGitLogAndListPrs guards the dedupe: git_log and
+// list_prs already had sidecar executors but were missing from every backend
+// list, so the model could never call them. localRepoTools() is now the single
+// source of truth shared by defaultAgentTools, availableTools, and the repo-bound
+// allow append — so all three surfaces must include them.
+func TestLocalRepoToolsContainsGitLogAndListPrs(t *testing.T) {
+	if !slicesContains(localRepoTools(), "git_log") {
+		t.Errorf("localRepoTools() does not include git_log")
+	}
+	if !slicesContains(localRepoTools(), "list_prs") {
+		t.Errorf("localRepoTools() does not include list_prs")
+	}
+	if !slicesContains(defaultAgentTools(), "git_log") || !slicesContains(defaultAgentTools(), "list_prs") {
+		t.Errorf("defaultAgentTools() does not include git_log/list_prs")
+	}
+	seen := map[string]bool{}
+	for _, tm := range availableTools(false) {
+		seen[tm.Name] = true
+	}
+	if !seen["git_log"] || !seen["list_prs"] {
+		t.Errorf("availableTools(false) does not include git_log/list_prs")
+	}
+	st, err := newStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	defer st.close()
+	srv := &server{cfg: config{contextLength: 8192}, store: st}
+	reg := srv.toolRegistry("")
+	for _, name := range []string{"git_log", "list_prs"} {
+		tool, ok := reg[name]
+		if !ok {
+			t.Errorf("toolRegistry does not register %s", name)
+			continue
+		}
+		if !tool.local {
+			t.Errorf("%s must be a local (sidecar-relayed) tool, got local=false", name)
+		}
 	}
 }

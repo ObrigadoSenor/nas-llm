@@ -290,8 +290,10 @@ Tools (each a schema + server-side executor):
   guardrails below).
 
 Small-model guardrails (the N100/8 GB runs a 3B–8B model): a hard step budget
-(`MAX_AGENT_STEPS`, default 6), duplicate-(tool,args) detection that nudges the
-model to stop and answer, **error-as-observation** (a tool failure or a bad
+(`MAX_AGENT_STEPS`, default 24; the model is warned at 80% of the budget to
+finish outstanding edits, and a narration re-prompt round does not consume a
+step), duplicate-(tool,args) detection that nudges the model to stop and answer,
+**error-as-observation** (a tool failure or a bad
 argument goes back to the model as an observation so it self-corrects instead of
 crashing the run), observation size capping, and **context compaction** (old tool
 results are truncated; when the transcript nears the context window, the oldest
@@ -342,7 +344,7 @@ light 3B plain-chat path as the default for simple Q&A; Agent mode is opt-in per
 turn. Any future file/workspace tools must be sandboxed to a dedicated NAS
 directory and per-invocation approved.
 
-Env (`.env`, with safe defaults): `MAX_AGENT_STEPS=6`, `FETCH_PAGE_ENABLED=false`.
+Env (`.env`, with safe defaults): `MAX_AGENT_STEPS=24`, `FETCH_PAGE_ENABLED=false`.
 
 ### Running several chats at once
 
