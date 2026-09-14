@@ -357,9 +357,14 @@ async function titleForConv(convId) {
 // is passed straight through to the sidecar so the tool runs in THIS chat's
 // worktree, not whichever tree happens to be checked out — dropping it would
 // silently send a background chat's edits into the wrong tree.
+// Write tools that auto-approve covers run immediately (no dialog) when the
+// backend says auto-approve is on for this chat. create_pr is never in this set —
+// opening a PR is external/irreversible, so it always prompts regardless.
+const AUTO_APPROVE_TOOLS = new Set(["apply_patch", "run_command", "git_commit", "git_push"]);
 async function runToolExec(convId, d) {
   const execBody = { repo: d.repo, tool: d.tool, args: d.args || "" };
   if (d.branch) execBody.branch = d.branch;
+  if (d.autoApprove && AUTO_APPROVE_TOOLS.has(d.tool)) execBody.approved = true;
   let execRes;
   try {
     const r = await fetch("/__sidecar/repos/exec", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(execBody) });
@@ -878,6 +883,35 @@ async function branchForRepo(name) {
   return "";
 }
 
+// Auto-approve: the global default is cached once on boot from /api/agent/config
+// (default ON to match the backend). Each repo chat can override it per-chat via
+// the composer status line toggle. The authoritative resolution lives backend-side
+// (convAutoApprove) and is carried on every toolExec payload, so the toggle's
+// display is best-effort while tool execution always uses the resolved value.
+let agentGlobalAutoApprove = true;
+async function loadAgentGlobalAutoApprove() {
+  try {
+    const r = await fetch("/api/agent/config");
+    if (r.ok) { const j = await r.json(); if (typeof j.autoApprove === "boolean") agentGlobalAutoApprove = j.autoApprove; }
+  } catch {}
+}
+function effectiveAutoApprove(conv) {
+  if (conv && typeof conv.agentAutoApprove === "boolean") return conv.agentAutoApprove;
+  return agentGlobalAutoApprove;
+}
+async function toggleConvAutoApprove(convId, conv) {
+  if (!convId) return;
+  const next = !effectiveAutoApprove(conv);
+  try {
+    const r = await fetch("/api/conversations/" + encodeURIComponent(convId), { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ agentAutoApprove: next }) });
+    if (!r.ok) return;
+    const updated = await r.json().catch(() => null);
+    if (updated && updated.id) { railMaps.convById.set(convId, updated); railConv = updated; }
+    else if (conv) { conv.agentAutoApprove = next; railConv = conv; }
+  } catch {}
+  renderComposerStatus();
+}
+
 // ensureComposerStatus creates the small repo/branch status line below the
 // composer input (desktop-only) if it isn't already present. Clicking it opens
 // the repo session panel. Lives inside .composer, after .input-wrap.
@@ -918,6 +952,16 @@ function renderComposerStatus() {
   if (s.ahead) status.appendChild(document.createTextNode(" · ↑" + s.ahead));
   if (s.behind) status.appendChild(document.createTextNode(" · ↓" + s.behind));
   if (s.hasRemote === false) status.appendChild(document.createTextNode(" · no remote"));
+  // Auto-approve toggle: reflects this chat's effective setting (per-chat
+  // override, else the global default). Click flips the per-chat override.
+  const aaOn = effectiveAutoApprove(railConv);
+  status.appendChild(document.createTextNode(" · "));
+  const aaChip = el("span", "ds-aa-chip " + (aaOn ? "on" : "off"), aaOn ? "✓ auto-approve" : "○ auto-approve off");
+  aaChip.title = aaOn
+    ? "Edits, commands, commit and push run without an approval dialog. create_pr still asks. Click to turn off for this chat."
+    : "Each edit/command/commit/push asks before running. Click to turn auto-approve on for this chat.";
+  aaChip.onclick = (e) => { e.stopPropagation(); toggleConvAutoApprove(railConvId, railConv); };
+  status.appendChild(aaChip);
   // Hover popup: explain the symbols (● = uncommitted files, ⎇ = branch, ↑/↓ =
   // ahead/behind) and that clicking opens the review/commit session panel.
   const tip = [railRepo];
@@ -926,6 +970,7 @@ function renderComposerStatus() {
   if (s.ahead) tip.push(s.ahead + " commits ahead of origin (↑)");
   if (s.behind) tip.push(s.behind + " commits behind origin (↓)");
   if (s.hasRemote === false) tip.push("no remote configured");
+  tip.push(aaOn ? "auto-approve on (edits/commands/commit/push run without asking)" : "auto-approve off (click ✓/○ to toggle for this chat)");
   tip.push("click to open the session panel (review changes, commit & push, open PR)");
   status.title = tip.join(" · ");
   status.classList.remove("hidden");
@@ -2160,6 +2205,7 @@ async function bootDesktop() {
   buildOverlay();
   buildReposOverlay();
   fillOverlay();
+  loadAgentGlobalAutoApprove();
   // syncAuthedUI places the gear/GitHub buttons and — once #app is actually
   // visible (authed) — builds the sidebar Repos section, populates it, and
   // (only the first time, with zero repos connected) shows the connect wizard.

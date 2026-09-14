@@ -2639,9 +2639,10 @@ function refreshLocalPreflightBadges(){
 }
 
 // --- Agent settings (global system prompt + tool allowlist) ----------------
-const agentModal=$("agentModal"), agentSystem=$("agentSystem"), agentToolsBox=$("agentTools"), agentSaved=$("agentSaved");
+const agentModal=$("agentModal"), agentSystem=$("agentSystem"), agentToolsBox=$("agentTools"), agentSaved=$("agentSaved"), agentAutoApproveBox=$("agentAutoApprove"), agentAutoApproveRow=$("agentAutoApproveRow");
 let agentAvailable=[];      // [{name,label,description}] from the server
 let agentSelectedTools=null; // null = not yet loaded; the checkbox set mirrors this
+if (agentAutoApproveBox) agentAutoApproveBox.addEventListener("change",()=>{ if(agentAutoApproveRow) agentAutoApproveRow.classList.toggle("on", agentAutoApproveBox.checked); });
 $("closeAgent").addEventListener("click", closeAgentPanel);
 agentModal.addEventListener("click", e=>{ if(e.target===agentModal) closeAgentPanel(); });
 document.addEventListener("keydown", e=>{ if(e.key==="Escape" && agentModal.classList.contains("open")) closeAgentPanel(); });
@@ -2656,6 +2657,7 @@ async function loadAgentConfig(){
     const selected=new Set(j.tools||[]);
     agentSelectedTools=selected;
     renderAgentTools();
+    if(agentAutoApproveBox){ agentAutoApproveBox.checked=!!j.autoApprove; if(agentAutoApproveRow) agentAutoApproveRow.classList.toggle("on", !!j.autoApprove); }
   }catch(e){ /* leave panel empty */ }
 }
 function renderAgentTools(){
@@ -2680,8 +2682,10 @@ function renderAgentTools(){
 $("saveAgent").addEventListener("click", async ()=>{
   const system=agentSystem.value||"";
   const tools=agentSelectedTools?[...agentSelectedTools]:[];
+  const body={system,tools};
+  if(agentAutoApproveBox) body.autoApprove=!!agentAutoApproveBox.checked;
   try{
-    await fetchRetry("/api/agent/config",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({system,tools})},{label:"Save agent config"});
+    await fetchRetry("/api/agent/config",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)},{label:"Save agent config"});
     agentSaved.classList.remove("hidden");
     setTimeout(()=>agentSaved.classList.add("hidden"), 1500);
   }catch(e){ flashAgentErr(String(e.message||e)); }

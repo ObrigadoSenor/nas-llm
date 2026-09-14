@@ -39,8 +39,8 @@ func TestAgentSystemPromptInjection(t *testing.T) {
 			want:      "You are a global test agent. Be terse.",
 		},
 		{
-			name:  "built-in default nudge when nothing configured",
-			want:  "You are a capable agent running on a small local server.",
+			name: "built-in default nudge when nothing configured",
+			want: "You are a capable agent running on a small local server.",
 		},
 	}
 	for _, c := range cases {
@@ -69,7 +69,7 @@ func TestAgentSystemPromptInjection(t *testing.T) {
 			}
 			if c.convSys != "" {
 				sys := c.convSys
-				if _, err := st.patchConversation(email, convID, nil, nil, nil, &sys, nil, nil, nil); err != nil {
+				if _, err := st.patchConversation(email, convID, nil, nil, nil, &sys, nil, nil, nil, nil); err != nil {
 					t.Fatalf("patchConversation: %v", err)
 				}
 			}
@@ -113,16 +113,16 @@ func TestAgentSystemPromptInjection(t *testing.T) {
 			if sysMsg.Role != "system" {
 				t.Fatalf("messages[0].Role = %q, want %q", sysMsg.Role, "system")
 			}
-		got := contentText(sysMsg.Content)
-		// The configured/default prompt is now a prefix: runAgentLoop appends the
-		// tool-call discipline guardrail, so check it as a substring rather than
-		// for byte equality, then assert the guardrail is present in every case.
-		if !strings.Contains(got, c.want) {
-			t.Errorf("system prompt = %q, want it to contain %q", got, c.want)
-		}
-		if !strings.Contains(got, "never invent a tool result") {
-			t.Errorf("system prompt missing the tool-call discipline guardrail: %q", got)
-		}
+			got := contentText(sysMsg.Content)
+			// The configured/default prompt is now a prefix: runAgentLoop appends the
+			// tool-call discipline guardrail, so check it as a substring rather than
+			// for byte equality, then assert the guardrail is present in every case.
+			if !strings.Contains(got, c.want) {
+				t.Errorf("system prompt = %q, want it to contain %q", got, c.want)
+			}
+			if !strings.Contains(got, "never invent a tool result") {
+				t.Errorf("system prompt missing the tool-call discipline guardrail: %q", got)
+			}
 
 			// Let the loop finish: the browser POSTs a final answer with no
 			// tool_calls, so the agent loop returns on step 0.

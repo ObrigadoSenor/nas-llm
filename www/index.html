@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="dark">
 <title>nas-llm</title>
 <link rel="stylesheet" href="vendor/highlight-github-dark.min.css">
-<link rel="stylesheet" href="styles.css?v=41">
+<link rel="stylesheet" href="styles.css?v=42">
 <script defer src="vendor/highlight.min.js"></script>
 </head>
 <body>
@@ -73,11 +73,15 @@
       <button id="closeAgent" title="Close"></button>
     </div>
     <div class="modal-body">
-      <div class="agent-cfg-note muted">These apply to every Agent-mode run (per-chat overrides come later). The model, tools, and budget make the agent — pick a small tool set for a small local model.</div>
+      <div class="agent-cfg-note muted">These apply to every Agent-mode run; each repo chat can override auto-approve in its composer. All tools are on by default so the agent can edit files, run commands, and commit/push — turn tools off here only if your model does better with a smaller set.</div>
       <label class="agent-label" for="agentSystem">System prompt</label>
       <textarea id="agentSystem" rows="5" placeholder="Leave blank to use the built-in agent prompt (injects today's date and steers toward few tool calls)."></textarea>
       <label class="agent-label">Tools</label>
       <div id="agentTools" class="agent-tools"></div>
+      <label class="agent-tool" id="agentAutoApproveRow" for="agentAutoApprove">
+        <input id="agentAutoApprove" type="checkbox">
+        <span class="agent-tool-text"><b>Auto-approve edits &amp; commands</b><span class="muted">Let apply_patch, run_command, git_commit and git_push run without an approval dialog. create_pr always asks. Each repo chat can override this in its composer.</span></span>
+      </label>
       <div class="agent-cfg-actions">
         <button id="saveAgent">Save</button>
       </div>
@@ -105,6 +109,6 @@
   </div>
 </div>
 
-<script type="module" src="app.js?v=46"></script>
+<script type="module" src="app.js?v=47"></script>
 </body>
 </html>

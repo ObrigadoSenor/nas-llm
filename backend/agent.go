@@ -77,10 +77,17 @@ type agentTool struct {
 }
 
 // defaultAgentTools is the tool allowlist used when agent mode is on and no
-// per-conversation/global config overrides it. Kept to four tools — small
-// models hallucinate less with a small, well-scoped tool surface.
+// per-conversation/global config overrides it. Every tool is on by default so
+// the agent can act directly (edit files, run commands, commit/push/PR) like a
+// Warp-style agent. Local (file/edit/git) tools are filtered out at run time
+// when no sidecar relay is configured (a non-repo chat), so a plain chat never
+// offers tools it cannot execute.
 func defaultAgentTools() []string {
-	return []string{"web_search", "ask_user", "get_time", "calculator"}
+	return []string{
+		"web_search", "ask_user", "get_time", "calculator",
+		"read_file", "list_files", "glob", "grep", "git_status",
+		"apply_patch", "run_command", "git_commit", "git_push", "create_pr",
+	}
 }
 
 // agentConfig returns the (tool allowlist, system prompt) for an agent run.
@@ -346,7 +353,7 @@ func gitStatusTool() oaiTool {
 func applyPatchTool() oaiTool {
 	return oaiTool{Type: "function", Function: oaiToolFunction{
 		Name:        "apply_patch",
-		Description: "Apply a unified diff to the repository. Each change must be a valid unified diff (git diff format) with --- and +++ headers and @@ hunks. The user must approve each application.",
+		Description: "Apply a unified diff to the repository to make file edits. Each change must be a valid unified diff (git diff format) with --- and +++ headers and @@ hunks. Call this tool to actually apply edits — do not write the diff as prose.",
 		Parameters: map[string]any{"type": "object", "properties": map[string]any{
 			"patch": map[string]any{"type": "string", "description": "The unified diff to apply, e.g. --- a/file.go\n+++ b/file.go\n@@ -1,3 +1,4 @@\n line1\n+new line\n line3"},
 		}, "required": []string{"patch"}},
@@ -356,7 +363,7 @@ func applyPatchTool() oaiTool {
 func runCommandTool() oaiTool {
 	return oaiTool{Type: "function", Function: oaiToolFunction{
 		Name:        "run_command",
-		Description: "Run a shell command in the repository root (e.g. go test, npm run lint, make build). The user must approve each command before it runs. Output is captured and returned.",
+		Description: "Run a shell command in the repository root (e.g. go test, npm run lint, make build) and return its output. Call this to actually run a command — do not write commands as prose.",
 		Parameters: map[string]any{"type": "object", "properties": map[string]any{
 			"command": map[string]any{"type": "string", "description": "The shell command to run, e.g. go test ./..."},
 		}, "required": []string{"command"}},
@@ -366,7 +373,7 @@ func runCommandTool() oaiTool {
 func gitCommitTool() oaiTool {
 	return oaiTool{Type: "function", Function: oaiToolFunction{
 		Name:        "git_commit",
-		Description: "Stage all changes and commit on the current branch with the given message. Requires user approval.",
+		Description: "Stage all changes and commit on the current branch with the given message.",
 		Parameters: map[string]any{"type": "object", "properties": map[string]any{
 			"message": map[string]any{"type": "string", "description": "The commit message."},
 		}, "required": []string{"message"}},
@@ -376,7 +383,7 @@ func gitCommitTool() oaiTool {
 func gitPushTool() oaiTool {
 	return oaiTool{Type: "function", Function: oaiToolFunction{
 		Name:        "git_push",
-		Description: "Push the current branch to its remote. Requires user approval.",
+		Description: "Push the current branch to its remote.",
 		Parameters:  map[string]any{"type": "object", "properties": map[string]any{}},
 	}}
 }
@@ -384,7 +391,7 @@ func gitPushTool() oaiTool {
 func createPrTool() oaiTool {
 	return oaiTool{Type: "function", Function: oaiToolFunction{
 		Name:        "create_pr",
-		Description: "Open a pull request from the current branch into the repo's default branch. Requires user approval.",
+		Description: "Open a pull request from the current branch into the repo's default branch.",
 		Parameters: map[string]any{"type": "object", "properties": map[string]any{
 			"title": map[string]any{"type": "string", "description": "The pull request title."},
 			"body":  map[string]any{"type": "string", "description": "The pull request body/description."},
@@ -420,7 +427,7 @@ func injectRepoContext(sys string, r *Repo, convBranch string) string {
 	} else {
 		b.WriteString("(empty)")
 	}
-	b.WriteString(". Use the read_file, list_files, glob, grep, and git_status tools to explore the codebase. Use apply_patch to make edits (each requires user approval) and run_command to run build/test commands (each requires approval). When the work is done, use git_commit to commit, git_push to push the branch, and create_pr to open a pull request (each requires approval). Paths are repository-relative. Keep answers grounded in what you read — do not guess at file contents.\n\n")
+	b.WriteString(". Use the read_file, list_files, glob, grep, and git_status tools to explore the codebase. Make changes directly with apply_patch, run commands with run_command, and when the work is done commit with git_commit, push with git_push, and open a pull request with create_pr. Paths are repository-relative. Do not write diffs or commands as prose — call the tool so the change is actually applied. Keep answers grounded in what you read — do not guess at file contents.\n\n")
 	b.WriteString(sys)
 	return b.String()
 }
@@ -440,9 +447,12 @@ func agentSystemNudge() string {
 	now := time.Now().Format("Monday, 2 January 2006, 15:04 MST")
 	return "You are a capable agent running on a small local server. Today is " + now + ". " +
 		"You have tools to help with tasks. Use a tool only when it is genuinely needed to make " +
-		"progress; otherwise answer directly. After one or two tool calls, synthesize a clear final " +
-		"answer for the user. Do not repeat the same tool call with the same arguments. If a tool " +
-		"returns an error, read it and adjust — do not retry blindly. Keep answers concise."
+		"progress; otherwise answer directly. When the user asks you to change code or run something, " +
+		"do it directly with the tools — do not just describe or quote the changes. Only call ask_user " +
+		"to clarify when the request is genuinely ambiguous and you cannot proceed without the answer; " +
+		"otherwise act. After one or two tool calls, synthesize a clear final answer for the user. " +
+		"Do not repeat the same tool call with the same arguments. If a tool returns an error, read " +
+		"it and adjust — do not retry blindly. Keep answers concise."
 }
 
 // toolCallDiscipline is the anti-narration guardrail appended to every
@@ -481,10 +491,25 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 	emitPhase("agent")
 	reg := s.toolRegistry(email)
 	tools := make([]oaiTool, 0, len(allow))
+	added := make(map[string]bool, len(allow))
 	for _, name := range allow {
-		if t, ok := reg[name]; ok {
-			tools = append(tools, t.schema)
+		if added[name] {
+			continue
 		}
+		t, ok := reg[name]
+		if !ok {
+			continue
+		}
+		// Local (file/edit/git) tools execute via the desktop sidecar relay.
+		// Without a relay (a non-repo chat) they cannot run, so don't offer them
+		// to the model — offering unusable tools makes the model call them and
+		// get a confusing "no relay" error instead of answering. added[] also
+		// dedupes when a repo-bound run appends the same tools to the allowlist.
+		if t.local && toolExecRelay == nil {
+			continue
+		}
+		added[name] = true
+		tools = append(tools, t.schema)
 	}
 	if len(tools) == 0 {
 		// No tools enabled: degenerate to a plain streamed pass.
@@ -757,11 +782,11 @@ func availableTools(fetchPage bool) []toolMeta {
 		toolMeta{Name: "glob", Label: "Glob", Description: "Find files by name pattern (desktop only)."},
 		toolMeta{Name: "grep", Label: "Grep", Description: "Search file contents in the repository (desktop only)."},
 		toolMeta{Name: "git_status", Label: "Git status", Description: "Show the working tree status (desktop only)."},
-		toolMeta{Name: "apply_patch", Label: "Apply patch", Description: "Apply a unified diff to the repo (desktop only, requires approval)."},
-		toolMeta{Name: "run_command", Label: "Run command", Description: "Run a shell command in the repo (desktop only, requires approval)."},
-		toolMeta{Name: "git_commit", Label: "Git commit", Description: "Stage and commit changes on the current branch (desktop only, requires approval)."},
-		toolMeta{Name: "git_push", Label: "Git push", Description: "Push the current branch to its remote (desktop only, requires approval)."},
-		toolMeta{Name: "create_pr", Label: "Create PR", Description: "Open a pull request from the current branch (desktop only, requires approval)."},
+		toolMeta{Name: "apply_patch", Label: "Apply patch", Description: "Apply a unified diff to edit files (desktop only)."},
+		toolMeta{Name: "run_command", Label: "Run command", Description: "Run a shell command in the repo (desktop only)."},
+		toolMeta{Name: "git_commit", Label: "Git commit", Description: "Stage and commit changes on the current branch (desktop only)."},
+		toolMeta{Name: "git_push", Label: "Git push", Description: "Push the current branch to its remote (desktop only)."},
+		toolMeta{Name: "create_pr", Label: "Create PR", Description: "Open a pull request from the current branch (desktop only)."},
 	)
 	return out
 }
