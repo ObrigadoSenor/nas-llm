@@ -66,6 +66,11 @@ type config struct {
 	// running a file tool and POSTing the observation back). Longer than a
 	// plain tool call because several of these tools also wait on approval.
 	toolExecTimeout time.Duration
+	// runCommandTimeout bounds a single run_command the agent executes via the
+	// sidecar, so a non-exiting command (dev server, watcher) can't park the
+	// relay until toolExecTimeout. Carried on each toolExec payload so the
+	// sidecar enforces the backend-authoritative value.
+	runCommandTimeout time.Duration
 }
 
 type server struct {
@@ -106,7 +111,7 @@ func main() {
 		maxClarifyRounds:   envInt("MAX_CLARIFY_ROUNDS", 3),
 		askUserInPlainChat: envBool("ASK_USER_IN_PLAIN_CHAT", true),
 		clarifyProseDetect: envBool("CLARIFY_PROSE_DETECT", true),
-		maxAgentSteps:      envInt("MAX_AGENT_STEPS", 6),
+		maxAgentSteps:      envInt("MAX_AGENT_STEPS", 24),
 		fetchPageEnabled:   envBool("FETCH_PAGE_ENABLED", false),
 		contextLength:      envInt("OLLAMA_CONTEXT_LENGTH", 16384),
 		nasRamGB:           envFloat("NAS_RAM_GB", 8),
@@ -118,6 +123,7 @@ func main() {
 		browserRelayGrace:  envDuration("BROWSER_RELAY_GRACE", 45*time.Second),
 		agentJobTimeout:    envDuration("AGENT_JOB_TIMEOUT", 30*time.Minute),
 		toolExecTimeout:    envDuration("TOOL_EXEC_TIMEOUT", 15*time.Minute),
+		runCommandTimeout:  envDuration("RUN_COMMAND_TIMEOUT", 120*time.Second),
 	}
 	cfg.cookieSecure = strings.HasPrefix(cfg.appBaseURL, "https://")
 	cfg.allowedEmails = parseAllowed(os.Getenv("ALLOWED_EMAILS"))
@@ -266,6 +272,8 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /api/conversations/{id}/generate", s.requireAuth(s.handleGenerate))
 	mux.HandleFunc("POST /api/conversations/{id}/model-response", s.requireAuth(s.handleModelResponse))
 	mux.HandleFunc("POST /api/conversations/{id}/cancel", s.requireAuth(s.handleCancel))
+	mux.HandleFunc("POST /api/conversations/{id}/pause", s.requireAuth(s.handlePause))
+	mux.HandleFunc("POST /api/conversations/{id}/resume", s.requireAuth(s.handleResume))
 	mux.HandleFunc("GET /api/conversations/{id}/events", s.requireAuth(s.handleEvents))
 	mux.HandleFunc("GET /api/conversations/{id}/job", s.requireAuth(s.handleJob))
 	mux.HandleFunc("GET /api/folders", s.requireAuth(s.handleListFolders))

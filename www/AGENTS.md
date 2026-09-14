@@ -16,7 +16,7 @@ There is no build step, so cache-busting is manual query strings in **three** se
 - **Editing `app.js`** → bump the number in `index.html:112` (`<script type="module" src="app.js?v=…">`).
 - **Editing `lib.js`** → bump the number in the ES module import inside `app.js:3` (`import { … } from './lib.js?v=…'`). This is **not** in `index.html` — it's easy to miss.
 
-Current values (as of this commit): `styles.css?v=42`, `app.js?v=48`, `lib.js?v=28`. Verify against the files before relying on these numbers.
+Current values (as of this commit): `styles.css?v=48`, `app.js?v=52`, `lib.js?v=35`. Verify against the files before relying on these numbers.
 
 The desktop app has its own independent `?v=` constants for renderer assets it injects on top of this directory — see `desktop/AGENTS.md`.
 
@@ -65,7 +65,7 @@ The file is one top-level module with no submodules. Regions below are approxima
 - Loads `app.js` as `<script type="module">` (line 112) — it's an ES module that imports `lib.js`.
 - Loads `vendor/highlight.min.js` as a classic `<script defer>` (line 10) — exposes `window.hljs`, used by `lib.js`'s `highlightAll`.
 - `vendor/highlight-github-dark.min.css` and `styles.css` are plain `<link>` stylesheets (lines 8-9).
-- Key element IDs the JS depends on: `login`, `app`, `sidebar`, `convList`, `chat`, `input`, `send`, `modelBtn`, `modelsModal`, `agentModal`, `plusBtn`, `plusPopup`, `slashPopup`, `pills`, `imgPills`, `attachBtn`, `fileInput`, `tabInstalled`, `tabBrowse`, `tabBody`, `pullStatus`, `agentSystem`, `agentTools`, `agentAutoApprove`.
+- Key element IDs the JS depends on: `login`, `app`, `sidebar`, `convList`, `chat`, `input`, `send`, `pauseBtn` (Pause, shown for agent runs), `modelBtn`, `modelsModal`, `agentModal`, `plusBtn`, `plusPopup`, `slashPopup`, `pills`, `imgPills`, `attachBtn`, `fileInput`, `tabInstalled`, `tabBrowse`, `tabBody`, `pullStatus`, `agentSystem`, `agentTools`, `agentAutoApprove`.
 
 ## Backend contract
 
@@ -75,13 +75,13 @@ All routes below are registered in `routes()` at `backend/main.go:234-281`.
 - `GET /api/auth/me`, `POST /api/auth/request`, `POST /api/auth/logout`
 - `GET /api/models`, `GET /api/models/catalog`, `GET /api/models/library`, `GET /api/models/library/tags`, `GET /api/models/preflight`, `POST /api/models/pull`, `GET /api/models/pulls/active`, `GET /api/models/pull/{jobId}/events`, `POST /api/models/pull/{jobId}/cancel`, `DELETE /api/models/{name}`, `POST /api/models/{name}/benchmark`, `GET /api/models/{name}/info`
 - `GET /api/jobs/active`
-- `GET /api/conversations`, `GET /api/conversations/{id}`, `POST /api/conversations`, `PATCH /api/conversations/{id}`, `DELETE /api/conversations/{id}`, `POST /api/conversations/{id}/generate`, `POST /api/conversations/{id}/model-response`, `POST /api/conversations/{id}/cancel`, `GET /api/conversations/{id}/job`
+- `GET /api/conversations`, `GET /api/conversations/{id}`, `POST /api/conversations`, `PATCH /api/conversations/{id}`, `DELETE /api/conversations/{id}`, `POST /api/conversations/{id}/generate`, `POST /api/conversations/{id}/model-response`, `POST /api/conversations/{id}/cancel`, `POST /api/conversations/{id}/pause`, `POST /api/conversations/{id}/resume` (agent runs only), `GET /api/conversations/{id}/job` (returns a synthetic `paused` state + `pausedStep` when a checkpoint exists but no job is live)
 - `GET /api/folders`, `POST /api/folders`, `PUT /api/folders/{id}`, `DELETE /api/folders/{id}`
 - `GET /api/agent/config`, `PUT /api/agent/config`
 
 **SSE event streams:**
 - `GET /api/events` — user-scoped multiplexed stream (opened once after auth by `openGlobalStream`). Event types switched on: `modelCall`, `done`, `joberror`. Used for background-chunk local relays and completion toasts/badges.
-- `GET /api/conversations/{id}/events` — per-conversation stream (opened by `tailJob`). Event types switched on: `reset`, `searches`, `search`, `questions`, `steps`, `tool`, `thoughts`, `thought`, `clear`, `modelCall`, `phase`, `chunk`, `done`, `joberror`.
+- `GET /api/conversations/{id}/events` — per-conversation stream (opened by `tailJob`). Event types switched on: `reset`, `searches`, `search`, `questions`, `steps`, `tool`, `thoughts`, `thought`, `clear`, `modelCall`, `phase`, `chunk`, `done`, `joberror`. The terminal `done` carries no payload, so a paused agent run is distinguished from a finish/cancel by a follow-up `/job` fetch in the `done` handler (a `paused` status renders a Resume banner instead of reloading).
 - `GET /api/models/pull/{jobId}/events` — pull progress stream (opened by `tailPull`). Event types: `reset`, `phase`, `progress`, `done`, `joberror`.
 
 Routes registered in the backend but **not** called by this page: `GET /api/health`, `GET /api/auth/verify` (email-link landing), `POST /api/chat/completions` (direct proxy, unused by the web UI which goes through `/generate`), `PUT /api/conversations/{id}` (this page uses PATCH), `POST /api/conversations/{id}/tool-response` and `GET|POST /api/repos` (desktop bridge only).

@@ -1284,6 +1284,12 @@ struct ExecBody {
     // matching today's exact behaviour for older clients and branchless chats.
     #[serde(default)]
     branch: String,
+    // run_command timeout in milliseconds, carried on the toolExec payload so
+    // the backend stays authoritative (RUN_COMMAND_TIMEOUT). 0 = use the
+    // sidecar default (120s). Only read by run_command's buffered + streaming
+    // executors.
+    #[serde(default)]
+    run_command_timeout_ms: u64,
 }
 
 #[derive(Serialize, Default)]
@@ -1297,6 +1303,11 @@ struct ExecResult {
     approval_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     approval_preview: Option<String>,
+    // exit_code is set by command-shaped tools (run_command) so the Warp-style
+    // command block shows the real exit status; other tools leave it None and
+    // the renderer infers it from is_error. 124 signals a run_command timeout.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i64>,
 }
 
 // repos_exec receives a file-tool call from the renderer (which got it from the
@@ -1347,7 +1358,11 @@ async fn repos_exec(State(st): State<AppState>, Json(body): Json<ExecBody>) -> R
         "create_pr" => exec_create_pr(&st.client, &root, &body.args, body.approved).await,
         "merge_pr" => exec_merge_pr(&st.client, &root, &body.args, body.approved).await,
         "apply_patch" => exec_apply_patch(&root, &body.args, body.approved).await,
-        "run_command" => exec_run_command(&root, &body.args, body.approved).await,
+        "run_command" => exec_run_command(&root, &body.args, body.approved, body.run_command_timeout_ms).await,
+        "write_file" => exec_write_file(&root, &body.args, body.approved).await,
+        "edit_file" => exec_edit_file(&root, &body.args, body.approved).await,
+        "delete_path" => exec_delete_path(&root, &body.args, body.approved).await,
+        "move_path" => exec_move_path(&root, &body.args, body.approved).await,
         other => ExecResult { observation: format!("Unknown tool: {other}"), preview: "unknown tool".into(), is_error: true, ..Default::default() },
     };
     json_ok(&result)
@@ -1399,6 +1414,7 @@ async fn repos_exec_stream(State(st): State<AppState>, Json(body): Json<ExecBody
     let (tx, rx) = mpsc::channel::<StreamMsg>(64);
     let root_for_task = root.clone();
     let command_for_task = command.clone();
+    let timeout_for_task = if body.run_command_timeout_ms == 0 { 120_000 } else { body.run_command_timeout_ms };
     tokio::spawn(async move {
         let start = std::time::Instant::now();
         let mut child = match tokio::process::Command::new("sh")
@@ -1422,7 +1438,19 @@ async fn repos_exec_stream(State(st): State<AppState>, Json(body): Json<ExecBody
         let stderr = child.stderr.take().unwrap();
         let stdout_task = tokio::spawn(pipe_lines(stdout, tx.clone()));
         let stderr_task = tokio::spawn(pipe_lines(stderr, tx.clone()));
-        let status = child.wait().await;
+        let limit = std::time::Duration::from_millis(timeout_for_task);
+        let status = match tokio::time::timeout(limit, child.wait()).await {
+            Ok(s) => s,
+            Err(_) => {
+                // Timed out: kill the child, flush a note, and emit exit 124.
+                let _ = child.kill().await;
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                let _ = tx.send(StreamMsg::Chunk(format!("\n[command timed out after {}s — killed]\n", timeout_for_task / 1000))).await;
+                let _ = tx.send(StreamMsg::Exit(124, start.elapsed().as_millis() as i64)).await;
+                return;
+            }
+        };
         let _ = stdout_task.await;
         let _ = stderr_task.await;
         let dur = start.elapsed().as_millis() as i64;
@@ -1486,7 +1514,10 @@ async fn pipe_lines<R: AsyncRead + Unpin + Send>(reader: R, tx: mpsc::Sender<Str
 }
 
 // safe_path resolves a repo-relative path and guards against traversal outside
-// the repo root. Returns the canonicalized absolute path, or an error.
+// the repo root. Returns the canonicalized absolute path, or an error. Only
+// resolves paths that already exist (it canonicalizes), so it suits read/edit/
+// move-source tools; create-oriented tools (write_file, move destination) use
+// resolve_new_path instead.
 fn safe_path(root: &Path, rel: &str) -> Result<PathBuf, String> {
     let cleaned = rel.trim_start_matches(['/', '.']);
     let candidate = root.join(cleaned);
@@ -1495,6 +1526,160 @@ fn safe_path(root: &Path, rel: &str) -> Result<PathBuf, String> {
         return Err("path is outside the repository root".into());
     }
     Ok(canon)
+}
+
+// resolve_new_path resolves a repo-relative path that may NOT yet exist (for
+// create/overwrite/move-destination tools). Unlike safe_path it canonicalizes
+// only the longest existing ancestor and rejoins the non-existent tail, so a
+// path whose parent directories don't exist yet is still resolvable. Rejects
+// any `..` component (a create tool must not escape the repo root via a
+// relative traversal, and canonicalize can't catch it when the path doesn't
+// exist yet) and any path inside `.git/`. Creates no directories.
+fn resolve_new_path(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    // Strip a leading "/" and any "./" prefix, but keep a leading "." that is
+    // part of a real name like ".git" or ".env" (trim_start_matches(['/','.'])
+    // would eat the "." in ".git" and let the guard below miss it).
+    let stripped = rel.trim_start_matches('/');
+    let cleaned = stripped.strip_prefix("./").unwrap_or(stripped);
+    if cleaned.is_empty() {
+        return Err("no path provided".into());
+    }
+    let norm = cleaned.replace('\\', "/");
+    if norm == ".git" || norm.starts_with(".git/") {
+        return Err("paths inside .git are not allowed".into());
+    }
+    // Reject any `..` component — canonicalize can't guard a non-existent path.
+    for comp in std::path::Path::new(&norm).components() {
+        if matches!(comp, std::path::Component::ParentDir) {
+            return Err("path traversal (..) is not allowed".into());
+        }
+    }
+    let candidate = root.join(cleaned);
+    // Walk existing ancestors upward until one canonicalizes, collecting the
+    // non-existent tail. root itself always exists and is already canonical.
+    let mut existing = candidate.clone();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match std::fs::canonicalize(&existing) {
+            Ok(c) => {
+                if !c.starts_with(root) {
+                    return Err("path is outside the repository root".into());
+                }
+                let mut full = c;
+                for part in tail.into_iter().rev() {
+                    full.push(part);
+                }
+                return Ok(full);
+            }
+            Err(_) => {
+                if existing.as_path() == root {
+                    // None of the path exists yet; anchor at the (canonical) root.
+                    return Ok(candidate.clone());
+                }
+                match existing.file_name() {
+                    Some(name) => {
+                        tail.push(name.to_os_string());
+                        existing = match existing.parent() {
+                            Some(p) => p.to_path_buf(),
+                            None => return Err("path is outside the repository root".into()),
+                        };
+                    }
+                    None => return Err("path is outside the repository root".into()),
+                }
+            }
+        }
+    }
+}
+
+// cap_preview truncates a string to max bytes on a UTF-8 char boundary and
+// appends an overflow marker. Used for approval-dialog previews that could be
+// large (diffs, file contents).
+fn cap_preview(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n...[{} more chars]", &s[..end], s.len() - end)
+}
+
+// count_matches counts non-overlapping occurrences of needle in haystack.
+fn count_matches(haystack: &str, needle: &str) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut start = 0;
+    while let Some(idx) = haystack[start..].find(needle) {
+        count += 1;
+        start += idx + needle.len();
+        if start > haystack.len() {
+            break;
+        }
+    }
+    count
+}
+
+// unified_diff builds a unified-diff preview of old vs new file content for the
+// approval dialog. It trims the common prefix and suffix lines and emits the
+// differing middle as -/+ lines with up to one line of context on each side,
+// so the existing colored-diff renderer (renderApprovalContent) works
+// unchanged. Preview-only: the actual write uses the full content.
+fn unified_diff(old: &str, new: &str, path: &str) -> String {
+    fn to_lines<'a>(s: &'a str) -> Vec<&'a str> {
+        let mut v: Vec<&'a str> = s.split('\n').collect();
+        if s.ends_with('\n') {
+            v.pop();
+        }
+        v
+    }
+    let ol = to_lines(old);
+    let nl = to_lines(new);
+    let mut pre = 0;
+    while pre < ol.len() && pre < nl.len() && ol[pre] == nl[pre] {
+        pre += 1;
+    }
+    let mut suf = 0;
+    while suf < (ol.len() - pre) && suf < (nl.len() - pre) && ol[ol.len() - 1 - suf] == nl[nl.len() - 1 - suf] {
+        suf += 1;
+    }
+    let old_mid = &ol[pre..ol.len() - suf];
+    let new_mid = &nl[pre..nl.len() - suf];
+    let mut out = String::new();
+    out.push_str(&format!("--- a/{path}\n+++ b/{path}\n"));
+    if old_mid.is_empty() && new_mid.is_empty() {
+        return out; // identical — no hunk
+    }
+    let has_ctx_pre = pre > 0;
+    let has_ctx_suf = suf > 0;
+    let old_start = if has_ctx_pre { pre } else { pre + 1 };
+    let new_start = old_start;
+    let old_count = old_mid.len() + has_ctx_pre as usize + has_ctx_suf as usize;
+    let new_count = new_mid.len() + has_ctx_pre as usize + has_ctx_suf as usize;
+    out.push_str(&format!("@@ -{old_start},{old_count} +{new_start},{new_count} @@\n"));
+    if has_ctx_pre {
+        out.push(' ');
+        out.push_str(ol[pre - 1]);
+        out.push('\n');
+    }
+    for line in old_mid {
+        out.push('-');
+        out.push_str(line);
+        out.push('\n');
+    }
+    for line in new_mid {
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+    }
+    if has_ctx_suf {
+        out.push(' ');
+        out.push_str(ol[ol.len() - suf]);
+        out.push('\n');
+    }
+    out
 }
 
 fn cap(s: &str) -> String {
@@ -1702,12 +1887,12 @@ async fn exec_git_status(root: &Path) -> ExecResult {
             let s = String::from_utf8_lossy(&o.stdout).to_string();
             let trimmed = s.trim();
             if trimmed.is_empty() {
-                ExecResult { observation: "Working tree clean.".into(), preview: "clean".into(), is_error: false, needs_approval: None, approval_kind: None, approval_preview: None }
+                ExecResult { observation: "Working tree clean.".into(), preview: "clean".into(), is_error: false, ..Default::default() }
             } else {
-                ExecResult { observation: cap(trimmed), preview: format!("{} changes", trimmed.lines().count()), is_error: false, needs_approval: None, approval_kind: None, approval_preview: None }
+                ExecResult { observation: cap(trimmed), preview: format!("{} changes", trimmed.lines().count()), is_error: false, ..Default::default() }
             }
         }
-        _ => ExecResult { observation: "git status failed.".into(), preview: "git error".into(), is_error: true, needs_approval: None, approval_kind: None, approval_preview: None },
+        _ => ExecResult { observation: "git status failed.".into(), preview: "git error".into(), is_error: true, ..Default::default() },
     }
 }
 
@@ -1809,97 +1994,376 @@ async fn exec_git_log(root: &Path, args: &str) -> ExecResult {
 
 // --- Write tools (Phase 4: per-invocation approval required) ---
 
+// normalize_patch cleans up a unified diff a small model emitted before
+// handing it to `git apply`: normalizes CRLF to LF, strips markdown code fences
+// and any prose preamble before the first `--- `/`diff --git ` header, and
+// guarantees exactly one trailing newline. These are the routine small-model
+// failure shapes that strict `git apply` rejects ("corrupt patch at line N").
+fn normalize_patch(patch: &str) -> String {
+    let mut s = patch.replace("\r\n", "\n").replace('\r', "\n");
+    // Strip markdown code fences (``` or ```diff …), keeping their interior.
+    let mut out = String::with_capacity(s.len());
+    for line in s.split_inclusive('\n') {
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let t = body.trim_start();
+        if t.starts_with("```")
+            && t.trim().chars().all(|c| c == '`' || c.is_alphanumeric() || c == '_' || c == '-')
+        {
+            continue;
+        }
+        out.push_str(line);
+    }
+    s = out;
+    // Drop prose preamble before the first diff header line.
+    for needle in ["--- ", "diff --git "] {
+        if let Some(pos) = s.find(needle) {
+            if pos == 0 || s.as_bytes()[pos - 1] == b'\n' {
+                s = s[pos..].to_string();
+                break;
+            }
+        }
+    }
+    let trimmed = s.trim_end_matches('\n');
+    format!("{trimmed}\n")
+}
+
+// first_failing_hunk extracts the first @@ hunk header mentioned in a git apply
+// error message so the model can locate the failing hunk. Returns "" if none.
+fn first_failing_hunk(err: &str) -> String {
+    match err.find("@@ ") {
+        Some(i) => err[i..].split('\n').next().unwrap_or("").to_string(),
+        None => String::new(),
+    }
+}
+
 // apply_patch applies a unified diff to the repo via `git apply`. The user
 // must approve each application: if not approved, returns needs_approval with
-// the diff as the preview so the UI can show it. On approval, applies the
-// patch and returns the result.
+// the normalized diff as the preview. On approval, normalizes the patch, tries
+// an apply ladder (first success wins), and on success reports the files +
+// line counts via `git apply --numstat`; on failure, returns the git error +
+// the first failing hunk header and an explicit instruction to switch to
+// write_file/edit_file rather than re-emitting the same diff.
 async fn exec_apply_patch(root: &Path, args: &str, approved: bool) -> ExecResult {
     let patch = match serde_json::from_str::<serde_json::Value>(args) {
         Ok(v) => v.get("patch").and_then(|p| p.as_str()).unwrap_or("").to_string(),
-        Err(_) => return ExecResult { observation: "Invalid args for apply_patch.".into(), preview: "bad args".into(), is_error: true, needs_approval: None, approval_kind: None, approval_preview: None },
+        Err(_) => return ExecResult { observation: "Invalid args for apply_patch.".into(), preview: "bad args".into(), is_error: true, ..Default::default() },
     };
     if patch.is_empty() {
-        return ExecResult { observation: "No patch provided.".into(), preview: "no patch".into(), is_error: true, needs_approval: None, approval_kind: None, approval_preview: None };
+        return ExecResult { observation: "No patch provided.".into(), preview: "no patch".into(), is_error: true, ..Default::default() };
     }
+    let normalized = normalize_patch(&patch);
     if !approved {
-        // Return a preview of the diff for the user to approve. Cap it so a
-        // huge diff doesn't flood the UI.
-        let preview = if patch.len() > 2000 { format!("{}\n...[{} more chars]", &patch[..2000], patch.len() - 2000) } else { patch.clone() };
         return ExecResult {
             observation: String::new(),
             preview: "awaiting approval".into(),
             is_error: false,
             needs_approval: Some(true),
             approval_kind: Some("apply_patch".into()),
-            approval_preview: Some(preview),
+            approval_preview: Some(cap_preview(&normalized, 2000)),
+            ..Default::default()
         };
     }
-    // Write the patch to a temp file and apply it with `git apply`. Small
-    // models often emit diffs with wrong hunk line counts or whitespace
-    // drift that strict `git apply` rejects ("corrupt patch", "patch does not
-    // apply"); retry with --recount (recomputes counts) then --3way (tolerates
-    // context drift via a 3-way merge) before giving up.
     let patch_file = root.join(".nas-llm-patch.tmp");
-    if let Err(e) = std::fs::write(&patch_file, &patch) {
-        return ExecResult { observation: format!("Could not write patch file: {e}"), preview: "write error".into(), is_error: true, needs_approval: None, approval_kind: None, approval_preview: None };
+    if let Err(e) = std::fs::write(&patch_file, &normalized) {
+        return ExecResult { observation: format!("Could not write patch file: {e}"), preview: "write error".into(), is_error: true, ..Default::default() };
     }
-    let mut last_err = String::new();
+    // Apply ladder, first success wins: plain → --recount (fixes wrong hunk
+    // line counts) → --3way (tolerates context drift via a 3-way merge) →
+    // --recount --unidiff-zero -C0 (no-context hunks, ignores whitespace).
+    let ladders: &[&[&str]] = &[
+        &["apply"],
+        &["apply", "--recount", "--whitespace=nowarn"],
+        &["apply", "--3way"],
+        &["apply", "--recount", "--unidiff-zero", "-C0"],
+    ];
     let mut applied = false;
-    // Strict first.
-    let out = tokio::process::Command::new("git")
-        .arg("-C").arg(root)
-        .arg("apply").arg(&patch_file)
-        .output().await;
-    if let Ok(o) = &out {
-        if o.status.success() { applied = true; }
-        else { last_err = String::from_utf8_lossy(&o.stderr).trim().to_string(); }
-    } else if let Err(e) = &out {
-        last_err = format!("Could not run git: {e}");
-    }
-    // Fallback: --recount fixes wrong hunk line counts (the most common
-    // small-model diff error). --whitespace=nowarn ignores trailing-
-    // whitespace drift.
-    if !applied {
-        let out2 = tokio::process::Command::new("git")
+    let mut last_err = String::new();
+    let mut succeeded_via = String::new();
+    for rung in ladders {
+        let out = tokio::process::Command::new("git")
             .arg("-C").arg(root)
-            .arg("apply").arg("--recount").arg("--whitespace=nowarn").arg(&patch_file)
+            .args(*rung)
+            .arg(&patch_file)
             .output().await;
-        if let Ok(o) = &out2 {
-            if o.status.success() { applied = true; }
-            else { last_err = String::from_utf8_lossy(&o.stderr).trim().to_string(); }
-        }
-    }
-    // Fallback: --3way tolerates context drift by falling back to a 3-way
-    // merge using the indexed blobs.
-    if !applied {
-        let out3 = tokio::process::Command::new("git")
-            .arg("-C").arg(root)
-            .arg("apply").arg("--3way").arg(&patch_file)
-            .output().await;
-        if let Ok(o) = &out3 {
-            if o.status.success() { applied = true; }
-            else { last_err = String::from_utf8_lossy(&o.stderr).trim().to_string(); }
+        match out {
+            Ok(o) if o.status.success() => { applied = true; succeeded_via = rung.join(" "); break; }
+            Ok(o) => { last_err = String::from_utf8_lossy(&o.stderr).trim().to_string(); }
+            Err(e) => { last_err = format!("Could not run git: {e}"); }
         }
     }
     let _ = std::fs::remove_file(&patch_file);
     if applied {
-        ExecResult { observation: "Patch applied successfully.".into(), preview: "applied".into(), is_error: false, needs_approval: None, approval_kind: None, approval_preview: None }
+        // Report which files and line counts changed (--numstat is a dry-run
+        // stat computed from the patch, not the worktree, so it's safe to run
+        // after the apply already succeeded).
+        let numstat = tokio::process::Command::new("git")
+            .arg("-C").arg(root)
+            .arg("apply").arg("--numstat").arg(&patch_file)
+            .output().await;
+        let stat = match numstat {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            _ => String::new(),
+        };
+        let via = if succeeded_via == "apply" { String::new() } else { format!(" (via git {succeeded_via})") };
+        let obs = if stat.is_empty() {
+            format!("Patch applied successfully.{via}")
+        } else {
+            format!("Patch applied successfully.{via}\n{stat}")
+        };
+        ExecResult { observation: obs, preview: "applied".into(), is_error: false, ..Default::default() }
     } else {
-        ExecResult { observation: format!("git apply failed: {last_err}"), preview: "apply failed".into(), is_error: true, needs_approval: None, approval_kind: None, approval_preview: None }
+        let hunk = first_failing_hunk(&last_err);
+        let hunk_part = if hunk.is_empty() { String::new() } else { format!("\nFirst failing hunk: {hunk}") };
+        ExecResult {
+            observation: format!("git apply failed: {last_err}{hunk_part}\nThe file is unchanged. Repeating the identical patch will fail the same way. For a single-file edit, use edit_file (exact string replacement) or write_file (create/overwrite) instead of re-emitting a diff."),
+            preview: "apply failed".into(),
+            is_error: true,
+            ..Default::default()
+        }
+    }
+}
+
+// write_file creates or overwrites a file, creating parent directories.
+// Approval-gated: the first call returns a unified-diff preview (empty→content
+// for a new file, old→new for an overwrite); on approval the write runs and the
+// observation reports created-vs-overwritten plus byte and line counts.
+async fn exec_write_file(root: &Path, args: &str, approved: bool) -> ExecResult {
+    let v = match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(v) => v,
+        Err(_) => return ExecResult { observation: "Invalid args for write_file.".into(), preview: "bad args".into(), is_error: true, ..Default::default() },
+    };
+    let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("").trim().to_string();
+    let content = v.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+    if path.is_empty() {
+        return ExecResult { observation: "No path provided.".into(), preview: "no path".into(), is_error: true, ..Default::default() };
+    }
+    let full = match resolve_new_path(root, &path) {
+        Ok(p) => p,
+        Err(e) => return ExecResult { observation: e.clone(), preview: e, is_error: true, ..Default::default() },
+    };
+    let existed = full.exists();
+    let old = if existed { std::fs::read_to_string(&full).unwrap_or_default() } else { String::new() };
+    if !approved {
+        let preview = unified_diff(&old, &content, &path);
+        return ExecResult {
+            observation: String::new(),
+            preview: "awaiting approval".into(),
+            is_error: false,
+            needs_approval: Some(true),
+            approval_kind: Some("write_file".into()),
+            approval_preview: Some(cap_preview(&preview, 4000)),
+            ..Default::default()
+        };
+    }
+    if let Some(parent) = full.parent() {
+        if !parent.exists() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return ExecResult { observation: format!("Could not create directory: {e}"), preview: "mkdir error".into(), is_error: true, ..Default::default() };
+            }
+        }
+    }
+    if let Err(e) = std::fs::write(&full, &content) {
+        return ExecResult { observation: format!("Could not write {path}: {e}"), preview: "write error".into(), is_error: true, ..Default::default() };
+    }
+    let bytes = content.len();
+    let lines = content.lines().count();
+    let verb = if existed { "Overwrote" } else { "Created" };
+    ExecResult {
+        observation: format!("{verb} {path} ({bytes} bytes, {lines} lines)."),
+        preview: format!("{} {path}", if existed { "overwrote" } else { "created" }),
+        is_error: false,
+        ..Default::default()
+    }
+}
+
+// edit_file performs an exact string replacement in a file. When old_string is
+// missing or matches more than once (and replace_all is not set), returns an
+// error observation naming the match count and asking for more surrounding
+// context; the file is unchanged. Approval-gated with an old→new unified-diff
+// preview. This is the reliable substitute for diffs on small models.
+async fn exec_edit_file(root: &Path, args: &str, approved: bool) -> ExecResult {
+    let v = match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(v) => v,
+        Err(_) => return ExecResult { observation: "Invalid args for edit_file.".into(), preview: "bad args".into(), is_error: true, ..Default::default() },
+    };
+    let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("").trim().to_string();
+    let old_string = v.get("old_string").and_then(|s| s.as_str()).unwrap_or("").to_string();
+    let new_string = v.get("new_string").and_then(|s| s.as_str()).unwrap_or("").to_string();
+    let replace_all = v.get("replace_all").and_then(|b| b.as_bool()).unwrap_or(false);
+    if path.is_empty() {
+        return ExecResult { observation: "No path provided.".into(), preview: "no path".into(), is_error: true, ..Default::default() };
+    }
+    if old_string.is_empty() {
+        return ExecResult { observation: "old_string is empty — provide the exact text to replace.".into(), preview: "no old_string".into(), is_error: true, ..Default::default() };
+    }
+    let full = match safe_path(root, &path) {
+        Ok(p) => p,
+        Err(e) => return ExecResult { observation: e.clone(), preview: e, is_error: true, ..Default::default() },
+    };
+    let content = match std::fs::read_to_string(&full) {
+        Ok(c) => c,
+        Err(e) => return ExecResult { observation: format!("Could not read {path}: {e}"), preview: "read error".into(), is_error: true, ..Default::default() },
+    };
+    let matches = count_matches(&content, &old_string);
+    if matches == 0 {
+        return ExecResult {
+            observation: format!("old_string was not found in {path} (0 matches). The file is unchanged. Re-check the exact text (indentation, whitespace) and try again, or use write_file to overwrite the whole file."),
+            preview: "no match".into(),
+            is_error: true,
+            ..Default::default()
+        };
+    }
+    if matches > 1 && !replace_all {
+        return ExecResult {
+            observation: format!("old_string matches {matches} times in {path}. The file is unchanged. Provide more surrounding context so the match is unique, or set replace_all=true to replace every occurrence."),
+            preview: format!("{matches} matches"),
+            is_error: true,
+            ..Default::default()
+        };
+    }
+    let new_content = if replace_all {
+        content.replace(&old_string, &new_string)
+    } else {
+        content.replacen(&old_string, &new_string, 1)
+    };
+    if !approved {
+        let preview = unified_diff(&content, &new_content, &path);
+        return ExecResult {
+            observation: String::new(),
+            preview: "awaiting approval".into(),
+            is_error: false,
+            needs_approval: Some(true),
+            approval_kind: Some("edit_file".into()),
+            approval_preview: Some(cap_preview(&preview, 4000)),
+            ..Default::default()
+        };
+    }
+    if let Err(e) = std::fs::write(&full, &new_content) {
+        return ExecResult { observation: format!("Could not write {path}: {e}"), preview: "write error".into(), is_error: true, ..Default::default() };
+    }
+    let n = if replace_all { matches } else { 1 };
+    ExecResult {
+        observation: format!("Edited {path} — {n} replacement(s)."),
+        preview: format!("edited {path}"),
+        is_error: false,
+        ..Default::default()
+    }
+}
+
+// delete_path removes a file or directory. Refuses the repo root and anything
+// under .git/; a directory requires recursive=true. Approval-gated; always
+// prompts (never auto-approved — it joins create_pr/merge_pr as a tool the
+// auto-approve setting does not silence).
+async fn exec_delete_path(root: &Path, args: &str, approved: bool) -> ExecResult {
+    let v = match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(v) => v,
+        Err(_) => return ExecResult { observation: "Invalid args for delete_path.".into(), preview: "bad args".into(), is_error: true, ..Default::default() },
+    };
+    let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("").trim().to_string();
+    let recursive = v.get("recursive").and_then(|b| b.as_bool()).unwrap_or(false);
+    if path.is_empty() || path == "." || path == "/" {
+        return ExecResult { observation: "Refusing to delete the repository root.".into(), preview: "refused".into(), is_error: true, ..Default::default() };
+    }
+    let full = match resolve_new_path(root, &path) {
+        Ok(p) => p,
+        Err(e) => return ExecResult { observation: e.clone(), preview: e, is_error: true, ..Default::default() },
+    };
+    if full == root {
+        return ExecResult { observation: "Refusing to delete the repository root.".into(), preview: "refused".into(), is_error: true, ..Default::default() };
+    }
+    if !full.exists() {
+        return ExecResult { observation: format!("{path} does not exist."), preview: "missing".into(), is_error: true, ..Default::default() };
+    }
+    let is_dir = full.is_dir();
+    if is_dir && !recursive {
+        return ExecResult { observation: format!("{path} is a directory — set recursive=true to delete it."), preview: "is a dir".into(), is_error: true, ..Default::default() };
+    }
+    if !approved {
+        let preview = if is_dir { format!("delete {path}/ (recursive)") } else { format!("delete {path}") };
+        return ExecResult {
+            observation: String::new(),
+            preview: "awaiting approval".into(),
+            is_error: false,
+            needs_approval: Some(true),
+            approval_kind: Some("delete_path".into()),
+            approval_preview: Some(preview),
+            ..Default::default()
+        };
+    }
+    let res = if is_dir { std::fs::remove_dir_all(&full) } else { std::fs::remove_file(&full) };
+    match res {
+        Ok(()) => ExecResult { observation: format!("Deleted {path}."), preview: format!("deleted {path}"), is_error: false, ..Default::default() },
+        Err(e) => ExecResult { observation: format!("Could not delete {path}: {e}"), preview: "delete error".into(), is_error: true, ..Default::default() },
+    }
+}
+
+// move_path renames or moves a file/directory, creating the destination's
+// parent directories. Approval-gated with a "from → to" preview.
+async fn exec_move_path(root: &Path, args: &str, approved: bool) -> ExecResult {
+    let v = match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(v) => v,
+        Err(_) => return ExecResult { observation: "Invalid args for move_path.".into(), preview: "bad args".into(), is_error: true, ..Default::default() },
+    };
+    let from = v.get("from").and_then(|p| p.as_str()).unwrap_or("").trim().to_string();
+    let to = v.get("to").and_then(|p| p.as_str()).unwrap_or("").trim().to_string();
+    if from.is_empty() || to.is_empty() {
+        return ExecResult { observation: "move_path needs both `from` and `to`.".into(), preview: "missing path".into(), is_error: true, ..Default::default() };
+    }
+    let src = match safe_path(root, &from) {
+        Ok(p) => p,
+        Err(e) => return ExecResult { observation: e.clone(), preview: e, is_error: true, ..Default::default() },
+    };
+    if !src.exists() {
+        return ExecResult { observation: format!("{from} does not exist."), preview: "missing".into(), is_error: true, ..Default::default() };
+    }
+    let dst = match resolve_new_path(root, &to) {
+        Ok(p) => p,
+        Err(e) => return ExecResult { observation: e.clone(), preview: e, is_error: true, ..Default::default() },
+    };
+    if dst == src {
+        return ExecResult { observation: "from and to are the same path.".into(), preview: "no-op".into(), is_error: true, ..Default::default() };
+    }
+    if dst.exists() {
+        return ExecResult { observation: format!("{to} already exists."), preview: "exists".into(), is_error: true, ..Default::default() };
+    }
+    if !approved {
+        return ExecResult {
+            observation: String::new(),
+            preview: "awaiting approval".into(),
+            is_error: false,
+            needs_approval: Some(true),
+            approval_kind: Some("move_path".into()),
+            approval_preview: Some(format!("{from} → {to}")),
+            ..Default::default()
+        };
+    }
+    if let Some(parent) = dst.parent() {
+        if !parent.exists() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return ExecResult { observation: format!("Could not create directory: {e}"), preview: "mkdir error".into(), is_error: true, ..Default::default() };
+            }
+        }
+    }
+    match std::fs::rename(&src, &dst) {
+        Ok(()) => ExecResult { observation: format!("Moved {from} → {to}."), preview: format!("moved {from} → {to}"), is_error: false, ..Default::default() },
+        Err(e) => ExecResult { observation: format!("Could not move {from} → {to}: {e}"), preview: "move error".into(), is_error: true, ..Default::default() },
     }
 }
 
 // run_command runs a shell command in the repo root. The user must approve each
 // command: if not approved, returns needs_approval with the command as the
-// preview. On approval, runs the command and returns its combined stdout+stderr
-// (capped). Commands run via `sh -c` in the repo directory.
-async fn exec_run_command(root: &Path, args: &str, approved: bool) -> ExecResult {
+// preview. On approval, runs the command (via `sh -c` in the repo directory)
+// and returns its combined stdout+stderr (capped). A command that does not exit
+// within timeout_ms (default 120s, carried on the toolExec payload from the
+// backend's RUN_COMMAND_TIMEOUT) is killed and reported as a timeout so a
+// dev server / watcher can't park the relay until TOOL_EXEC_TIMEOUT.
+async fn exec_run_command(root: &Path, args: &str, approved: bool, timeout_ms: u64) -> ExecResult {
     let command = match serde_json::from_str::<serde_json::Value>(args) {
         Ok(v) => v.get("command").and_then(|p| p.as_str()).unwrap_or("").to_string(),
-        Err(_) => return ExecResult { observation: "Invalid args for run_command.".into(), preview: "bad args".into(), is_error: true, needs_approval: None, approval_kind: None, approval_preview: None },
+        Err(_) => return ExecResult { observation: "Invalid args for run_command.".into(), preview: "bad args".into(), is_error: true, ..Default::default() },
     };
     if command.is_empty() {
-        return ExecResult { observation: "No command provided.".into(), preview: "no command".into(), is_error: true, needs_approval: None, approval_kind: None, approval_preview: None };
+        return ExecResult { observation: "No command provided.".into(), preview: "no command".into(), is_error: true, ..Default::default() };
     }
     if !approved {
         return ExecResult {
@@ -1909,24 +2373,36 @@ async fn exec_run_command(root: &Path, args: &str, approved: bool) -> ExecResult
             needs_approval: Some(true),
             approval_kind: Some("run_command".into()),
             approval_preview: Some(command.clone()),
+            ..Default::default()
         };
     }
-    let out = tokio::process::Command::new("sh")
+    let ms = if timeout_ms == 0 { 120_000 } else { timeout_ms };
+    let limit = std::time::Duration::from_millis(ms);
+    let run = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(&command)
         .current_dir(root)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .output().await;
-    match out {
-        Ok(o) => {
+        .kill_on_drop(true)
+        .output();
+    match tokio::time::timeout(limit, run).await {
+        Ok(Ok(o)) => {
             let combined = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
             let trimmed = combined.trim();
             let is_err = !o.status.success();
-            let preview = if is_err { format!("exit {}", o.status.code().unwrap_or(-1)) } else { "command completed".into() };
-            ExecResult { observation: cap(trimmed), preview, is_error: is_err, needs_approval: None, approval_kind: None, approval_preview: None }
+            let code = o.status.code().unwrap_or(-1) as i64;
+            let preview = if is_err { format!("exit {code}") } else { "command completed".into() };
+            ExecResult { observation: cap(trimmed), preview, is_error: is_err, exit_code: Some(code), ..Default::default() }
         }
-        Err(e) => ExecResult { observation: format!("Could not run command: {e}"), preview: "exec error".into(), is_error: true, needs_approval: None, approval_kind: None, approval_preview: None },
+        Ok(Err(e)) => ExecResult { observation: format!("Could not run command: {e}"), preview: "exec error".into(), is_error: true, exit_code: Some(-1), ..Default::default() },
+        Err(_) => ExecResult {
+            observation: format!("Command timed out after {}s and was killed. A non-exiting command (dev server, watcher) can't run via run_command — redirect its output to a file and read that, or run it outside the agent.", ms / 1000),
+            preview: "timed out".into(),
+            is_error: true,
+            exit_code: Some(124),
+            ..Default::default()
+        },
     }
 }
 
@@ -1961,6 +2437,7 @@ async fn exec_git_commit(root: &Path, args: &str, approved: bool) -> ExecResult 
             needs_approval: Some(true),
             approval_kind: Some("git_commit".into()),
             approval_preview: Some(message),
+            ..Default::default()
         };
     }
     let token = token_get().unwrap_or_default();
@@ -1995,6 +2472,7 @@ async fn exec_git_push(root: &Path, _args: &str, approved: bool) -> ExecResult {
             needs_approval: Some(true),
             approval_kind: Some("git_push".into()),
             approval_preview: Some(format!("push HEAD:{} to origin", branch)),
+            ..Default::default()
         };
     }
     let token = token_get().unwrap_or_default();
@@ -2055,6 +2533,7 @@ async fn exec_create_pr(client: &reqwest::Client, root: &Path, args: &str, appro
             needs_approval: Some(true),
             approval_kind: Some("create_pr".into()),
             approval_preview: Some(format!("PR \"{}\": {} → {}", title, head, base)),
+            ..Default::default()
         };
     }
     match create_pr_for_repo(client, root, &title, &body_text, &head, Some(&base)).await {
@@ -2161,6 +2640,7 @@ async fn exec_merge_pr(client: &reqwest::Client, root: &Path, args: &str, approv
             needs_approval: Some(true),
             approval_kind: Some("merge_pr".into()),
             approval_preview: Some(preview),
+            ..Default::default()
         };
     }
     match merge_pr_for_repo(client, root, number, &method).await {
@@ -3311,5 +3791,222 @@ fn json_err(msg: &str, status: StatusCode) -> Response {
     r.headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn j(v: serde_json::Value) -> String {
+        v.to_string()
+    }
+
+    // init_test_repo creates a temp git repo with one committed file f.txt =
+    // "a\nb\n". The agent's file-tool executors operate on it directly.
+    async fn init_test_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path();
+        let env = [
+            ("GIT_AUTHOR_NAME", "T"),
+            ("GIT_AUTHOR_EMAIL", "t@t"),
+            ("GIT_COMMITTER_NAME", "T"),
+            ("GIT_COMMITTER_EMAIL", "t@t"),
+        ];
+        let mut cmd = tokio::process::Command::new("git");
+        cmd.arg("-C").arg(p).arg("init").arg("-q");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let _ = cmd.output().await.expect("git init");
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(p).arg("config").arg("user.name").arg("T")
+            .output().await.expect("git config name");
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(p).arg("config").arg("user.email").arg("t@t")
+            .output().await.expect("git config email");
+        std::fs::write(p.join("f.txt"), "a\nb\n").unwrap();
+        let mut add = tokio::process::Command::new("git");
+        add.arg("-C").arg(p).arg("add").arg("-A");
+        for (k, v) in env {
+            add.env(k, v);
+        }
+        let _ = add.output().await.expect("git add");
+        let mut commit = tokio::process::Command::new("git");
+        commit.arg("-C").arg(p).arg("commit").arg("-q").arg("-m").arg("init");
+        for (k, v) in env {
+            commit.env(k, v);
+        }
+        let _ = commit.output().await.expect("git commit");
+        dir
+    }
+
+    #[test]
+    fn normalize_patch_strips_fences_and_preamble() {
+        let raw = "I'll edit the file:\n```diff\n--- a/f.txt\n+++ b/f.txt\n@@ -1,1 +1,1 @@\n-a\n+b\n```";
+        let n = normalize_patch(raw);
+        assert!(n.starts_with("--- a/f.txt"), "preamble not stripped: {n:?}");
+        assert!(!n.contains("```"), "fences not stripped: {n:?}");
+        assert!(!n.contains("I'll"), "prose not stripped: {n:?}");
+        assert!(n.ends_with('\n'), "no trailing newline: {n:?}");
+        assert!(!n.ends_with("\n\n"), "more than one trailing newline: {n:?}");
+    }
+
+    #[test]
+    fn normalize_patch_crlf_to_lf() {
+        let raw = "--- a/f.txt\r\n+++ b/f.txt\r\n@@ -1,1 +1,1 @@\r\n-a\r\n+b\r\n";
+        let n = normalize_patch(raw);
+        assert!(!n.contains('\r'), "CRLF not normalized: {n:?}");
+    }
+
+    #[test]
+    fn resolve_new_path_guards() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        // ok: new file in a not-yet-existing subdirectory.
+        let p = resolve_new_path(&root, "src/new.txt").unwrap();
+        assert!(p.starts_with(&root));
+        assert!(p.ends_with("src/new.txt"));
+        // .git is refused.
+        assert!(resolve_new_path(&root, ".git/config").is_err());
+        // .env (a real dotfile name) is allowed.
+        assert!(resolve_new_path(&root, ".env").is_ok());
+        // any .. component is refused (can't escape via a non-existent path).
+        assert!(resolve_new_path(&root, "../escape.txt").is_err());
+        assert!(resolve_new_path(&root, "a/../../escape.txt").is_err());
+    }
+
+    #[test]
+    fn count_matches_counts_nonoverlapping() {
+        assert_eq!(count_matches("foo bar foo", "foo"), 2);
+        assert_eq!(count_matches("foo bar foo", "baz"), 0);
+        assert_eq!(count_matches("aaaa", "aa"), 2); // non-overlapping
+        assert_eq!(count_matches("x", ""), 0);
+    }
+
+    #[test]
+    fn unified_diff_new_file_is_all_additions() {
+        let d = unified_diff("", "a\nb\n", "f.txt");
+        assert!(d.contains("--- a/f.txt"));
+        assert!(d.contains("+++ b/f.txt"));
+        assert!(d.contains("+a"));
+        assert!(d.contains("+b"));
+        assert!(!d.contains("-a"));
+    }
+
+    #[tokio::test]
+    async fn edit_file_match_counting() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("f.txt"), "foo\nbar\nfoo\n").unwrap();
+        // 0 matches → error, file unchanged.
+        let r0 = exec_edit_file(&root, &j(serde_json::json!({"path":"f.txt","old_string":"baz","new_string":"x"})), true).await;
+        assert!(r0.is_error);
+        assert!(r0.observation.contains("0 matches"), "got: {}", r0.observation);
+        // >1 match without replace_all → error, file unchanged.
+        let r1 = exec_edit_file(&root, &j(serde_json::json!({"path":"f.txt","old_string":"foo","new_string":"x"})), true).await;
+        assert!(r1.is_error);
+        assert!(r1.observation.contains("2 times"), "got: {}", r1.observation);
+        assert_eq!(std::fs::read_to_string(root.join("f.txt")).unwrap(), "foo\nbar\nfoo\n");
+        // >1 match with replace_all → success.
+        let r2 = exec_edit_file(&root, &j(serde_json::json!({"path":"f.txt","old_string":"foo","new_string":"x","replace_all":true})), true).await;
+        assert!(!r2.is_error);
+        assert_eq!(std::fs::read_to_string(root.join("f.txt")).unwrap(), "x\nbar\nx\n");
+        // exactly 1 match → success.
+        std::fs::write(root.join("g.txt"), "hello\nworld\n").unwrap();
+        let r3 = exec_edit_file(&root, &j(serde_json::json!({"path":"g.txt","old_string":"world","new_string":"all"})), true).await;
+        assert!(!r3.is_error);
+        assert_eq!(std::fs::read_to_string(root.join("g.txt")).unwrap(), "hello\nall\n");
+    }
+
+    #[tokio::test]
+    async fn write_file_creates_and_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        // create (with a new parent dir)
+        let r1 = exec_write_file(&root, &j(serde_json::json!({"path":"sub/f.txt","content":"hi\n"})), true).await;
+        assert!(!r1.is_error, "{}", r1.observation);
+        assert!(r1.observation.contains("Created"));
+        assert_eq!(std::fs::read_to_string(root.join("sub/f.txt")).unwrap(), "hi\n");
+        // overwrite
+        let r2 = exec_write_file(&root, &j(serde_json::json!({"path":"sub/f.txt","content":"bye\n"})), true).await;
+        assert!(!r2.is_error);
+        assert!(r2.observation.contains("Overwrote"));
+        assert_eq!(std::fs::read_to_string(root.join("sub/f.txt")).unwrap(), "bye\n");
+    }
+
+    #[tokio::test]
+    async fn delete_path_requires_recursive_for_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        std::fs::write(root.join("d/f.txt"), "x").unwrap();
+        // dir without recursive → error
+        let r1 = exec_delete_path(&root, &j(serde_json::json!({"path":"d"})), true).await;
+        assert!(r1.is_error);
+        assert!(r1.observation.contains("directory"));
+        assert!(root.join("d").exists());
+        // dir with recursive → deleted
+        let r2 = exec_delete_path(&root, &j(serde_json::json!({"path":"d","recursive":true})), true).await;
+        assert!(!r2.is_error);
+        assert!(!root.join("d").exists());
+        // refuse repo root
+        let r3 = exec_delete_path(&root, &j(serde_json::json!({"path":"."})), true).await;
+        assert!(r3.is_error);
+    }
+
+    #[tokio::test]
+    async fn move_path_renames_and_makes_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("a.txt"), "data").unwrap();
+        let r = exec_move_path(&root, &j(serde_json::json!({"from":"a.txt","to":"nested/b.txt"})), true).await;
+        assert!(!r.is_error, "{}", r.observation);
+        assert!(!root.join("a.txt").exists());
+        assert_eq!(std::fs::read_to_string(root.join("nested/b.txt")).unwrap(), "data");
+    }
+
+    #[tokio::test]
+    async fn apply_patch_ladder_wrong_counts_no_trailing_newline() {
+        let dir = init_test_repo().await;
+        let root = dir.path();
+        // A diff with wrong hunk line counts (-1,3 +1,3 but only 2 old / 2 new
+        // lines) and no trailing newline on the patch text. Strict git apply
+        // fails ("corrupt patch"); normalize_patch adds the trailing newline
+        // and the --recount rung recomputes the counts.
+        let patch = "--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+c"; // no trailing \n
+        let args = j(serde_json::json!({ "patch": patch }));
+        let res = exec_apply_patch(root, &args, true).await;
+        assert!(!res.is_error, "expected ladder to apply, got: {}", res.observation);
+        assert_eq!(std::fs::read_to_string(root.join("f.txt")).unwrap(), "a\nc\n");
+    }
+
+    #[tokio::test]
+    async fn apply_patch_ladder_zero_context_hunk() {
+        let dir = init_test_repo().await;
+        let root = dir.path();
+        // A zero-context hunk (no context lines). Strict git apply may reject
+        // it; the --unidiff-zero rung accepts it. Either way the ladder should
+        // succeed and insert "new" before "a".
+        let patch = "--- a/f.txt\n+++ b/f.txt\n@@ -1,0 +1,1 @@\n+new\n";
+        let args = j(serde_json::json!({ "patch": patch }));
+        let res = exec_apply_patch(root, &args, true).await;
+        assert!(!res.is_error, "expected zero-context apply to succeed, got: {}", res.observation);
+        assert_eq!(std::fs::read_to_string(root.join("f.txt")).unwrap(), "new\na\nb\n");
+    }
+
+    #[tokio::test]
+    async fn apply_patch_failure_nudges_to_edit_file() {
+        let dir = init_test_repo().await;
+        let root = dir.path();
+        // A patch whose context doesn't match the file — every rung fails.
+        let patch = "--- a/f.txt\n+++ b/f.txt\n@@ -1,1 +1,1 @@\n-zzz\n+q\n";
+        let args = j(serde_json::json!({ "patch": patch }));
+        let res = exec_apply_patch(root, &args, true).await;
+        assert!(res.is_error);
+        assert!(res.observation.contains("edit_file"), "missing switch-tool nudge: {}", res.observation);
+        assert!(res.observation.contains("unchanged"));
+        // file untouched
+        assert_eq!(std::fs::read_to_string(root.join("f.txt")).unwrap(), "a\nb\n");
+    }
 }
 

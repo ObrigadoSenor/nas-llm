@@ -23,3 +23,6 @@ keyring = "4"
 tauri-plugin-dialog = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-notification = "2"
+
+[dev-dependencies]
+tempfile = "3"

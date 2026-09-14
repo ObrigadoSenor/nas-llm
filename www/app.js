@@ -1,6 +1,6 @@
 // nas-llm chat UI — app logic, split out of the old single-file index.html.
 // Imports UI helpers (icons, markdown rendering) from lib.js. No build step.
-import { icon, setIcon, renderMessage, escapeHtml, StreamRenderer, thinkingDots, renderSearchBlock, appendSearchEntry, showSearchPending, clearSearchPending, renderSourceLinks, appendSourceLinks, renderClarifyCard, renderAgentSteps, appendAgentStep, buildThoughtsWrap, renderThoughts, appendThought, setThoughtsSummary, isCommandTool, openBlock, appendBlock, closeBlock, isBlockStep, resetBlocks, installBlocksHook } from './lib.js?v=34';
+import { icon, setIcon, renderMessage, escapeHtml, StreamRenderer, thinkingDots, renderSearchBlock, appendSearchEntry, showSearchPending, clearSearchPending, renderSourceLinks, appendSourceLinks, renderClarifyCard, renderAgentSteps, appendAgentStep, buildThoughtsWrap, renderThoughts, appendThought, setThoughtsSummary, isCommandTool, openBlock, appendBlock, closeBlock, isBlockStep, resetBlocks, installBlocksHook } from './lib.js?v=35';
 
 installBlocksHook();
 // Streamed command output + exit, forwarded by the desktop renderer (the
@@ -24,6 +24,7 @@ const loginEmail=$("loginEmail"), loginBtn=$("loginBtn"), loginInfo=$("loginInfo
 const sidebar=$("sidebar"), scrim=$("scrim"), menuBtn=$("menuBtn"), closeSide=$("closeSide");
 const plusBtn=$("plusBtn"), plusPopup=$("plusPopup"), slashPopup=$("slashPopup"), pills=$("pills");
 const attachBtn=$("attachBtn"), fileInput=$("fileInput"), imgPills=$("imgPills");
+const pauseBtn=$("pauseBtn");
 
 // Static button icons (set once; the buttons live inside #app, which is hidden
 // until auth, so there's no flash of unstyled content).
@@ -34,6 +35,7 @@ setIcon($("menuBtn"), "menu", 18);
 setIcon($("plusBtn"), "plus", 18);
 setIcon($("send"),"send",16); $("send").setAttribute("aria-label","Send");
 setIcon(attachBtn,"paperclip",16);
+setIcon(pauseBtn,"pause",16); pauseBtn.setAttribute("aria-label","Pause");
 setIcon($("logout"), "logout", 15); $("logout").insertAdjacentHTML("beforeend", '<span>Log out</span>');
 setIcon($("closeModels"), "close", 18);
 setIcon($("closeAgent"), "close", 18);
@@ -71,6 +73,8 @@ let generatingIds = new Set(); // conversation IDs with an active background job
 let finishedIds = new Set();   // conversation IDs with an unseen completion badge (cleared on open)
 let activeES = null;           // the current EventSource tail (active conversation)
 let activeJobConvId = null;    // conversation whose tail is currently open
+let activeJobAgent = false;    // whether the active job is an agent run (shows Pause)
+let pausedConvIds = new Set(); // conversations with a live checkpoint (Resume affordance)
 let pendingClarifyAnswer = null; // option clicked while a question was still finalizing
 let inputHistory = loadInputHistory(); // sent questions, oldest→newest
 let histIndex = inputHistory.length;   // pointer; ==length means "current draft"
@@ -322,30 +326,35 @@ composer.addEventListener("drop",e=>{
 });
 renderComposer();
 
-// The Send button becomes Stop while the open conversation is generating.
+// The Send button becomes Stop while the open conversation is generating. An
+// agent run also shows a Pause button (next to Stop); plain chat/search/clarify
+// runs are not pausable — there is nothing to resume.
 function renderSend(){
   const gen = activeJobConvId !== null && activeJobConvId === activeId;
-  if(gen){ setIcon(send,"stop",16); send.classList.add("stop"); send.setAttribute("aria-label","Stop"); send.disabled=false; }
-  else { setIcon(send,"send",16); send.classList.remove("stop"); send.setAttribute("aria-label","Send"); send.disabled=false; }
+  if(gen){
+    setIcon(send,"stop",16); send.classList.add("stop"); send.setAttribute("aria-label","Stop"); send.disabled=false;
+    if(activeJobAgent){
+      pauseBtn.classList.remove("hidden"); pauseBtn.disabled=false;
+      attachBtn.classList.add("hidden"); // avoid colliding with Pause in the wrap
+    } else {
+      pauseBtn.classList.add("hidden");
+    }
+  } else {
+    setIcon(send,"send",16); send.classList.remove("stop"); send.setAttribute("aria-label","Send"); send.disabled=false;
+    pauseBtn.classList.add("hidden");
+  }
 }
-async function stopActive(){
-  if(activeJobConvId !== activeId) return;
+// pauseActive asks the backend to pause the active agent run between steps.
+// The worker checkpoints the transcript and finalizes the job "paused"; the
+// SSE "done" event then drives the paused banner + Resume affordance.
+async function pauseActive(){
+  if(activeJobConvId !== activeId || !activeJobAgent) return;
   const id=activeId;
-  send.disabled=true;
-  // For a local-model job, abort the in-flight localhost inference immediately
-  // so Stop is responsive — don't wait for the SSE "done" round-trip. Looked
-  // up by convId (not a singleton) so this can never abort a different chat's
-  // relay. The backend /cancel still finalizes the connection-bound job.
-  const ctrl=localAborts.get(id);
-  if(ctrl){ ctrl.abort(); localAborts.delete(id); }
-  // The per-conversation "done" event carries no payload, so tailJob can't
-  // otherwise distinguish a clean finish from a user-requested stop — stash
-  // the intent here so it can report "cancelled" instead of "done".
-  stoppedByUser.add(id);
-  try{ await fetch("/api/conversations/"+encodeURIComponent(id)+"/cancel",{method:"POST"}); }catch{}
-  // The SSE "done" event from the cancelled job finalizes the UI; if it never
-  // arrives (e.g. the job already finished), fall back after a short delay.
-  setTimeout(()=>{ if(activeJobConvId === activeId){ activeJobConvId=null; renderSend(); } }, 4000);
+  pauseBtn.disabled=true; send.disabled=true;
+  try{ await fetch("/api/conversations/"+encodeURIComponent(id)+"/pause",{method:"POST"}); }catch{}
+  // The backend finalizes the job "paused"; tailJob's done handler renders the
+  // paused banner. Fall back if the terminal event never arrives.
+  setTimeout(()=>{ if(activeJobConvId===id){ activeJobConvId=null; activeJobAgent=false; renderSend(); } }, 4000);
 }
 
 // --- Retry with exponential backoff (network/CORS/429/5xx are retryable) ----
@@ -1042,8 +1051,40 @@ async function syncGenerating(){
 // modelCall rounds for that job once nothing is listening on its own tail.
 function closeTail(){ if(activeES){ activeES.close(); activeES=null; } }
 
+// renderPausedBanner appends a "Paused at step N" banner with a Resume
+// button into a container (the live assistant bubble, or #chat on load). Resume
+// POSTs /resume (with an optional typed note) and re-tails the resumed job.
+function renderPausedBanner(container, convId, step){
+  if(!container) return;
+  if(container.querySelector(".paused-banner")) return; // avoid duplicates
+  const banner=document.createElement("div"); banner.className="paused-banner";
+  const ic=document.createElement("span"); ic.className="status-ic"; ic.innerHTML=icon("pause",16); banner.appendChild(ic);
+  const label=document.createElement("span"); label.textContent="Paused at step "+step; banner.appendChild(label);
+  const resume=document.createElement("button"); resume.className="paused-resume"; resume.type="button"; resume.textContent="Resume";
+  resume.addEventListener("click",()=>resumeConversation(convId));
+  banner.appendChild(resume);
+  container.appendChild(banner);
+}
+async function resumeConversation(id, note){
+  if(!id) return;
+  try{
+    const r=await fetch("/api/conversations/"+encodeURIComponent(id)+"/resume",{
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(note?{note}:{})
+    });
+    if(!r.ok) return;
+    const job=await r.json();
+    pausedConvIds.delete(id);
+    const aTs=Date.now();
+    const {bubble, searchWrap, srcLinks, stepsWrap, thoughtsWrap, thoughtsDet}=addMsg("assistant","",aTs);
+    generatingIds.add(id); renderSidebar();
+    activeJobConvId=id; activeJobAgent=true; renderSend();
+    tailJob(id, job.id, bubble, job.content||"", searchWrap, srcLinks, null, stepsWrap, null, thoughtsWrap, thoughtsDet, null);
+  }catch{}
+}
 // If the conversation has an active background job, render its partial content
-// and reopen the SSE tail so switching back resumes live.
+// and reopen the SSE tail so switching back resumes live. A paused run (no live
+// job but a checkpoint) surfaces a Resume affordance instead.
 async function resumeIfGenerating(id){
   let job;
   try{
@@ -1054,12 +1095,21 @@ async function resumeIfGenerating(id){
     }
     job=await r.json();
   }catch{ return; }
+  if(job.status==="paused"){
+    // A paused agent run with no live job: surface the Resume affordance so
+    // "resume whenever" survives a reload, chat switch, or backend restart.
+    pausedConvIds.add(id);
+    renderSidebar();
+    if(id===activeId) renderPausedBanner(chat, id, job.pausedStep||0);
+    return;
+  }
   if(job.status!=="queued" && job.status!=="generating"){
     if(generatingIds.has(id)){ generatingIds.delete(id); renderSidebar(); }
     return;
   }
+  pausedConvIds.delete(id);
   generatingIds.add(id); renderSidebar();
-  activeJobConvId=id; renderSend();
+  activeJobConvId=id; activeJobAgent=!!job.agent; renderSend();
   const hasQ = !!(job.questions && job.questions.questions && job.questions.questions.length);
   const {bubble, searchWrap, srcLinks, stepsWrap, thoughtsWrap, thoughtsDet}=addMsg("assistant", hasQ ? "" : (job.content||""), job.createdAt||Date.now(), job.searches||null, null, job.questions||null, false, job.steps||null, job.thoughts||null);
   // A generating job with no reasoning yet collapses the empty drawer; one with
@@ -1375,17 +1425,33 @@ function tailJob(convId, jobId, bubble, initialAcc, searchWrap, srcLinks, initia
     else if(p==="answering") clearSearchPending(searchWrap);
   });
   es.addEventListener("chunk", e=>{ let d=""; try{ d=JSON.parse(e.data); }catch{} renderer.append(d); });
-  es.addEventListener("done", ()=>{
+  es.addEventListener("done", async ()=>{
     esClosed=true; es.close(); if(activeES===es) activeES=null;
     const ctrl=localAborts.get(convId); if(ctrl){ ctrl.abort(); localAborts.delete(convId); }
     if(thoughtsDet){ if(thoughtStart){ const secs=((Date.now()-thoughtStart)/1000).toFixed(1); setThoughtsSummary(thoughtsDet,"Thought for "+secs+"s",{streaming:false}); } else setThoughtsSummary(thoughtsDet,"Thinking",{streaming:false}); thoughtsDet.open=false; }
-    // The per-conversation "done" event carries no payload, so a user-requested
-    // stop is distinguished via stoppedByUser (set by stopActive) rather than
-    // anything on this event.
-    const status = stoppedByUser.has(convId) ? "cancelled" : "done";
+    // The per-conversation "done" event carries no payload, so distinguish a
+    // pause (checkpoint written, job finalized "paused") from a finish/cancel
+    // by checking the job's final status. Only an agent run can pause, so skip
+    // the extra fetch for non-agent jobs. A pause surfaces a Resume affordance
+    // in the bubble instead of reloading the conversation.
+    let status = stoppedByUser.has(convId) ? "cancelled" : "done";
     stoppedByUser.delete(convId);
-    finishJob(convId, jobId, status, null);
-    onGenerationDone(convId);
+    let pausedStep = 0;
+    if(activeJobAgent){
+      try{
+        const r=await fetch("/api/conversations/"+encodeURIComponent(convId)+"/job");
+        if(r.ok){ const j=await r.json(); if(j.status==="paused"){ status="paused"; pausedStep=j.pausedStep||0; } }
+      }catch{}
+    }
+    if(status==="paused"){
+      pausedConvIds.add(convId);
+      finishJob(convId, jobId, "paused", null);
+      if(convId===activeId){ activeJobConvId=null; activeJobAgent=false; renderSend(); renderPausedBanner(bubble, convId, pausedStep); }
+      else { renderSidebar(); }
+    } else {
+      finishJob(convId, jobId, status, null);
+      onGenerationDone(convId);
+    }
   });
   es.addEventListener("joberror", e=>{
     esClosed=true; es.close(); if(activeES===es) activeES=null;
@@ -1406,6 +1472,7 @@ async function onGenerationDone(convId){
   // generatingIds/sidebar/badge/toast/CustomEvent are already handled by
   // finishJob, called just before this from tailJob's "done" handler.
   if(activeJobConvId===convId) activeJobConvId=null;
+  if(convId===activeId) activeJobAgent=false; // a finished run is no longer pausable
   if(convId===activeId){
     renderSend();
     // Reload from the server: the assistant reply is persisted there now.
@@ -1421,7 +1488,7 @@ async function onGenerationDone(convId){
   input.focus();
 }
 function newChat(){
-  closeTail(); activeJobConvId=null; renderSend();
+  closeTail(); activeJobConvId=null; activeJobAgent=false; renderSend();
   activeId=null; messages=[]; chat.innerHTML=""; histIndex=inputHistory.length; draft="";
   try{ window.dispatchEvent(new CustomEvent("nasllm:activeConv",{detail:null})); }catch{}
   pendingImages=[]; renderImgPills();
@@ -1700,6 +1767,7 @@ function sendClarifyAnswer(value, bubble){
 }
 
 send.addEventListener("click",()=>{ if(send.classList.contains("stop")) stopActive(); else stream(); });
+pauseBtn.addEventListener("click", pauseActive);
 input.addEventListener("keydown",e=>{
   if(slashPopupOpen()){
     if(e.key==="ArrowDown"){ e.preventDefault(); if(slashItems.length){ slashSelected=Math.min(slashItems.length-1,slashSelected+1); markSlashSelected(); } return; }

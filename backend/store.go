@@ -162,6 +162,18 @@ CREATE TABLE IF NOT EXISTS agent_steps (
 	created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_agent_steps_job ON agent_steps(job_id, step);
+CREATE TABLE IF NOT EXISTS agent_checkpoints (
+	conversation_id TEXT NOT NULL,
+	email TEXT NOT NULL,
+	job_id TEXT NOT NULL,
+	step INTEGER NOT NULL,
+	transcript TEXT NOT NULL,
+	model TEXT NOT NULL,
+	local INTEGER NOT NULL DEFAULT 0,
+	supports_tools INTEGER NOT NULL DEFAULT 0,
+	created_at INTEGER NOT NULL,
+	UNIQUE(email, conversation_id)
+);
 CREATE TABLE IF NOT EXISTS notes (
 	id TEXT PRIMARY KEY,
 	email TEXT NOT NULL,
@@ -756,6 +768,80 @@ func (s *store) persistAgentSteps(jobID string, steps []agentStep) error {
 		}
 	}
 	return nil
+}
+
+// --- Agent pause/resume checkpoints ----------------------------------------
+
+// agentCheckpoint is a persisted snapshot of an agent run at a pause point: the
+// ReAct transcript (the []oaiMessage list runAgentLoop was driving) and the
+// step index, so a resumed run can rehydrate the conversation and continue on
+// the remaining budget. One row per (email, conversation_id); a new pause
+// upserts over a prior checkpoint, and a clean finish deletes it.
+type agentCheckpoint struct {
+	JobID         string
+	ConvID        string
+	Email         string
+	Step          int
+	Transcript    []oaiMessage
+	Model         string
+	Local         bool
+	SupportsTools bool
+	CreatedAt     int64
+}
+
+// saveCheckpoint upserts the checkpoint for a (email, conversation_id). A new
+// pause overwrites a prior checkpoint so only the latest pause is resumable.
+func (s *store) saveCheckpoint(cp agentCheckpoint) error {
+	transcript, err := json.Marshal(cp.Transcript)
+	if err != nil {
+		return err
+	}
+	local, st := 0, 0
+	if cp.Local {
+		local = 1
+	}
+	if cp.SupportsTools {
+		st = 1
+	}
+	_, err = s.db.Exec(`INSERT INTO agent_checkpoints(conversation_id, email, job_id, step, transcript, model, local, supports_tools, created_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(email, conversation_id) DO UPDATE SET job_id=excluded.job_id, step=excluded.step,
+			transcript=excluded.transcript, model=excluded.model, local=excluded.local,
+			supports_tools=excluded.supports_tools, created_at=excluded.created_at`,
+		cp.ConvID, cp.Email, cp.JobID, cp.Step, string(transcript), cp.Model, local, st, cp.CreatedAt)
+	return err
+}
+
+// loadCheckpoint returns the live checkpoint for a (email, conversation_id), or
+// nil if none (no paused run to resume).
+func (s *store) loadCheckpoint(email, convID string) (*agentCheckpoint, error) {
+	var cp agentCheckpoint
+	var transcriptJSON string
+	var local, st int
+	err := s.db.QueryRow(`SELECT job_id, conversation_id, email, step, transcript, model, local, supports_tools, created_at
+		FROM agent_checkpoints WHERE email = ? AND conversation_id = ?`, email, convID).
+		Scan(&cp.JobID, &cp.ConvID, &cp.Email, &cp.Step, &transcriptJSON, &cp.Model, &local, &st, &cp.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal([]byte(transcriptJSON), &cp.Transcript); err != nil {
+		return nil, err
+	}
+	cp.Local = local != 0
+	cp.SupportsTools = st != 0
+	return &cp, nil
+}
+
+// deleteCheckpoint drops the checkpoint for a (email, conversation_id). Called
+// by the worker when a resumed run finishes cleanly (done/error/cancelled) so a
+// finished conversation has no lingering "paused" state. A run that pauses
+// again upserts a fresh checkpoint instead of deleting.
+func (s *store) deleteCheckpoint(email, convID string) error {
+	_, err := s.db.Exec(`DELETE FROM agent_checkpoints WHERE email = ? AND conversation_id = ?`, email, convID)
+	return err
 }
 
 // --- Memory (notes) --------------------------------------------------------
