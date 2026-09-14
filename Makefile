@@ -23,23 +23,8 @@ check: check-backend check-desktop ## Run every automated check (Go + Rust)
 
 check-backend: fmt-check vet test ## Go: gofmt, vet, and tests
 
-# The project targets the Go version in backend/go.mod (backend/Dockerfile pins
-# the matching golang:<ver>-alpine builder), and CI runs gofmt on that version.
-# Newer toolchains add formatting rules that would flag untouched files, so on a
-# newer local Go we only check the files this branch actually changed. That
-# keeps `make check` green on a clean checkout instead of tempting a reformat of
-# unrelated code.
-fmt-check: ## Check gofmt (full tree on the pinned Go, changed files on a newer one)
-	@proj="$$(awk '/^go /{print $$2; exit}' $(BACKEND)/go.mod)"; \
-	local_v="$$(go env GOVERSION | sed 's/^go//')"; \
-	if [ "$$(echo $$local_v | cut -d. -f2)" -gt "$$(echo $$proj | cut -d. -f2)" ]; then \
-		echo "gofmt: local Go $$local_v is newer than the project's $$proj — checking changed files only"; \
-		files="$$(git diff --name-only --diff-filter=ACM origin/main...HEAD -- '$(BACKEND)/*.go' 2>/dev/null | sed 's|^$(BACKEND)/||')"; \
-		if [ -z "$$files" ]; then echo "gofmt: no changed Go files"; exit 0; fi; \
-		out="$$(cd $(BACKEND) && gofmt -l $$files)"; \
-	else \
-		out="$$(cd $(BACKEND) && gofmt -l .)"; \
-	fi; \
+fmt-check: ## Fail if any Go file needs gofmt
+	@out="$$(cd $(BACKEND) && gofmt -l .)"; \
 	if [ -n "$$out" ]; then \
 		echo "gofmt needed on:"; echo "$$out"; \
 		echo "run 'make fmt' to fix"; \

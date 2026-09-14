@@ -21,8 +21,7 @@ jobs:
       - uses: actions/checkout@v4
 
       # Pinned to the version in backend/go.mod, which backend/Dockerfile also
-      # builds with (golang:1.22-alpine). gofmt rules change between releases,
-      # so the formatting gate is only meaningful on the pinned version.
+      # builds with (golang:1.22-alpine), so CI compiles and tests what ships.
       - uses: actions/setup-go@v5
         with:
           go-version-file: backend/go.mod

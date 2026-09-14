@@ -279,8 +279,8 @@ func TestAgentNarrationGuard(t *testing.T) {
 
 		mb := &fakeBackend{responses: []oaiMessage{
 			narrationMsg("I'll edit foo.go to add a comment."), // round 1: narrates
-			toolCallMsg("call_1", "get_time", "{}"),           // round 2: real tool call
-			finalAnswerMsg("Done - added the comment."),      // round 3: synthesized answer
+			toolCallMsg("call_1", "get_time", "{}"),            // round 2: real tool call
+			finalAnswerMsg("Done - added the comment."),        // round 3: synthesized answer
 		}}
 
 		var (
@@ -330,7 +330,7 @@ func TestAgentNarrationGuard(t *testing.T) {
 
 		mb := &fakeBackend{responses: []oaiMessage{
 			narrationMsg("I'll edit foo.go to add a comment."), // round 1: re-prompted
-			narrationMsg("I'll change bar.go too."),          // round 2: budget exhausted -> accept
+			narrationMsg("I'll change bar.go too."),            // round 2: budget exhausted -> accept
 		}}
 
 		var steps []agentStep
@@ -413,8 +413,8 @@ func TestAgentProseToolCallRecovery(t *testing.T) {
 		// call is even duplicated, as small models often do.
 		narrated := "Sure, let's check the time.\n\n```\n{ \"name\": \"get_time\", \"arguments\": {} }\n```\n{\"name\":\"get_time\",\"arguments\":{}}"
 		mb := &fakeBackend{responses: []oaiMessage{
-			narrationMsg(narrated),                  // round 1: narrates the call as JSON prose
-			finalAnswerMsg("It's 3pm."),             // round 2: synthesizes after the real observation
+			narrationMsg(narrated),      // round 1: narrates the call as JSON prose
+			finalAnswerMsg("It's 3pm."), // round 2: synthesizes after the real observation
 		}}
 
 		var (
@@ -468,7 +468,7 @@ func TestAgentProseToolCallRecovery(t *testing.T) {
 		// the narration guard re-prompts once, then accepts the second narration.
 		mb := &fakeBackend{responses: []oaiMessage{
 			narrationMsg("I'll check the time for you."), // round 1: no JSON -> re-prompt
-			narrationMsg("I'll check it now."),          // round 2: budget exhausted -> accept
+			narrationMsg("I'll check it now."),           // round 2: budget exhausted -> accept
 		}}
 
 		var steps []agentStep
@@ -577,8 +577,8 @@ func TestAgentAwaitingToolResultFallback(t *testing.T) {
 
 		mb := &fakeBackend{responses: []oaiMessage{
 			narrationMsg("Please provide the output from the tool response so I can proceed."), // round 1: re-prompt
-			toolCallMsg("call_1", "get_time", "{}"),                                              // round 2: real tool call
-			finalAnswerMsg("Done — updated the settings menu."),                                  // round 3: synthesized
+			toolCallMsg("call_1", "get_time", "{}"),                                            // round 2: real tool call
+			finalAnswerMsg("Done — updated the settings menu."),                                // round 3: synthesized
 		}}
 
 		var (
