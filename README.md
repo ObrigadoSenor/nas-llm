@@ -3,7 +3,7 @@
 A single secure **public OpenAI-compatible HTTPS API endpoint** running on a
 UGREEN NASync DXP2800 (Intel N100, 8 GB), called by a browser extension, with
 **no router ports opened**. The API host (`llm.selected.systems`) is pure-API:
-o user accounts, no management routes. A second host (`chat.selected.systems`)
+no user accounts, no management routes. A second host (`chat.selected.systems`)
 runs a minimal streaming chat page backed by a small Go service for magic-link
 login and SQLite chat history. Models are managed from the chat UI (download,
 remove, benchmark) with the `ollama` CLI over SSH as a fallback.
@@ -45,10 +45,43 @@ Chat UI: **`https://chat.selected.systems`** — a minimal streaming chat page (
 | `scripts/deploy.sh` | sync the stack to the NAS and `docker compose up -d --build` |
 | `scripts/pull-models.sh` | `docker exec ollama ollama ...` over SSH |
 | `scripts/smoke-test.sh` | API auth/CORS/allowlist/port-isolation/streaming + chat `/api/*` 401 + SearXNG internal JSON checks |
-| `ai/tasks.md` | phased task list |
+| `ai/` | task lists, design docs, and release logs (`ai/tasks.md` is the phased task list) |
 | `desktop/` | Tauri 2 desktop shell around the chat UI (sign-in, repos, in-app updates); see `desktop/README.md` for the release process |
 | `scripts/bump-desktop-version.sh` | bump the desktop app version (patch/minor/major) and tag a release |
+| `.github/workflows/ci.yml` | run the Go and Rust checks on every push and pull request |
 | `.github/workflows/desktop-release.yml` | build + sign + publish the desktop app to a GitHub Release on a `v*` tag push |
+| `AGENTS.md` | contributor/agent brief: code map, conventions, verification loop. `backend/`, `www/`, and `desktop/` each have their own |
+| `Makefile` | `make check` — the verification loop (Go fmt/vet/test + `cargo check`) |
+
+## Development
+
+This README covers running the deployed system. For working on the code —
+where a feature lives, how to verify a change, the branch and commit
+conventions — read `AGENTS.md` first. Each code directory (`backend/`, `www/`,
+`desktop/`) has its own `AGENTS.md` with a file-level map.
+
+The short version:
+
+```sh
+make check        # gofmt + go vet + go test, then cargo check
+make run-backend  # run the Go backend locally on :8081
+make help         # all targets
+```
+
+`make check` is what CI runs. It does **not** cover `www/` (vanilla JS, no build
+step) and there is no end-to-end test, so UI and streaming changes still need a
+human to verify them against the NAS.
+
+## Branch model
+
+- Work happens on `main`; feature branches are cut from `main` and merged back
+  by PR (`feat/`, `fix/`, `docs/`, `chore/` prefixes).
+- `production` is the release branch — `main` → `production` by PR.
+- The NAS is deployed from `main`.
+
+Commits follow Conventional Commits with a scope for the surface touched
+(`feat(desktop):`, `fix(agent):`). Desktop release notes are generated from
+commit subjects, so they become the user-visible changelog.
 
 ## Chat login & history
 
@@ -387,7 +420,8 @@ scripts/deploy.sh
 ```
 With no `TUNNEL_TOKEN`, this starts **ollama + caddy + backend** (LAN mode). Once
 `TUNNEL_TOKEN` is set it also starts **cloudflared**. The backend image is built
-on the NAS (`--build`); no local Go toolchain is needed.
+on the NAS (`--build`), so no local Go toolchain is needed *to deploy* — you do
+need one to run `make check` while developing (see "Development" above).
 
 `searxng/settings.yml` is a read-only bind mount, so edits to it are **not**
 picked up by `up -d` — restart the container after a deploy that changes it:
@@ -395,59 +429,9 @@ picked up by `up -d` — restart the container after a deploy that changes it:
 ssh root@<nas-ip> "docker restart searxng"
 ```
 
-### Shipped: web-search speedup + Stop button (PR #2, merged to `production`)
-
-Merged to `production` via [PR #2](https://github.com/ObrigadoSenor/nas-llm/pull/2)
-(`main` → `production`). Deployed to the NAS and verified through the public
-Cloudflare edge (not just LAN):
-
-- `https://llm.selected.systems/v1/models` — 401 unauth, 200 auth (pure-API
-  host, extension unaffected).
-- `https://chat.selected.systems/` — 200 (chat page).
-- `https://chat.selected.systems/api/conversations/{id}/cancel` — 401 without a
-  session (the new Stop route is live and auth-gated).
-- LAN smoke test **16/16** (incl. the `/cancel` 401 check and SearXNG internal
-  JSON check). SearXNG search leg measured at 0.83–1.17s/query.
-
-The NAS is deployed from `main`; `production` is the release branch that `main`
-merges into via PR. Branch model: work on `main`, open `main` → `production`
-PRs to release.
-
-Remaining (manual, needs a magic-link session on https://chat.selected.systems):
-
-- **Speed:** 🌐 on, ask a time-sensitive question — expect `🔍 searching: <query>`
-  then a cited answer sooner than before (one round, not up to three).
-- **Stop:** send a question, click ⏹ Stop mid-generation — the reply halts and
-  the partial text is saved; send again → works normally.
-
-Optional: set `MAX_SEARCH_ROUNDS=2` in `.env` + redeploy if single-round answers
-feel too shallow for multi-part questions.
-
-### Shipped: streamed web_search tool-call pass (PR #4, merged to `main`)
-
-The tool-calling pass previously ran non-streaming, so nothing reached the page
-until that whole response completed. It now streams
-(`streamOllamaChatWithTools` in `search.go`): the model's preamble — or a full
-answer when it decides **not** to search — reaches the UI as it is produced.
-Time-to-first-token drops to ~first token instead of full-response. The
-searching path's *total* latency is unchanged: Ollama buffers the tool-call JSON
-and emits it only once that pass completes, so the search fires at the same
-moment as before; the SSE keepalive guarding against the Cloudflare 100 s edge
-timeout (524) is unchanged.
-
-Tool calls are accumulated by id/arrival order, not by `index`, so accumulation
-stays correct even when Ollama emits `index:0` for every call in a multi-call
-response. The two model passes can't be parallelized: the answer pass needs the
-tool-call pass's search results in context, and `OLLAMA_NUM_PARALLEL=1`
-serializes Ollama requests regardless; per-round searches were already
-concurrent.
-
-Verified on the NAS (🌐 on, `qwen3:1.7b`, "latest stable Python version"):
-587 content chunks streamed incrementally — first token 7.36 s, spread across
-7.36 s → 83 s; SearXNG fanned the query to Google/Bing/DuckDuckGo and the cited
-answer referenced a Python version beyond the model's training cutoff.
-`llama3.1:8b` works too but is slow to demonstrate on the N100 (≈28 s cold load
-+ CPU-rate generation); the streaming is model-independent.
+Release notes for shipped work live in `ai/` — see
+`ai/shipped-web-search-pr2-pr4.md` for the web-search speedup, the Stop button,
+and the streamed tool-call pass.
 
 ## Model management
 
