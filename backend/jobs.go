@@ -167,6 +167,11 @@ type toolExecPayload struct {
 	// means "use the repo's main working tree" — the sidecar/renderer treat a
 	// missing branch exactly like an old client that never sent one.
 	Branch string `json:"branch"`
+	// AutoApprove is the conversation's effective auto-approve setting for write
+	// tools (apply_patch/run_command/git_commit/git_push). When true the renderer
+	// runs those tools without an approval dialog; create_pr always prompts
+	// regardless. Carried per-call so a reconnect-replay still has it.
+	AutoApprove bool `json:"autoApprove,omitempty"`
 }
 
 // toolExecResponse is the browser's assembled file-tool result, delivered
@@ -272,8 +277,8 @@ func (j *job) clearPendingModelCall() {
 // Called by the agent loop when it hits a local file tool, parallel to
 // emitModelCall for local-model inference. branch is the conversation's bound
 // branch ("" for the repo's main working tree; see toolExecPayload).
-func (j *job) emitToolExec(step int, tool, args, repo, branch string) {
-	payload := toolExecPayload{ConvID: j.convID, JobID: j.id, Step: step, Tool: tool, Args: args, Repo: repo, Branch: branch}
+func (j *job) emitToolExec(step int, tool, args, repo, branch string, autoApprove bool) {
+	payload := toolExecPayload{ConvID: j.convID, JobID: j.id, Step: step, Tool: tool, Args: args, Repo: repo, Branch: branch, AutoApprove: autoApprove}
 	b, _ := json.Marshal(payload)
 	j.mu.Lock()
 	j.pendingToolExecPayload = &payload
@@ -1162,6 +1167,10 @@ func (s *server) runGeneration(j *job) error {
 			if repo, err := s.store.getRepo(j.email, repoID); err == nil && repo != nil {
 				allow = append(allow, "read_file", "list_files", "glob", "grep", "git_status", "apply_patch", "run_command", "git_commit", "git_push", "create_pr")
 				sys = injectRepoContext(sys, repo, conv.RepoBranch)
+				// Resolve the conversation's effective auto-approve once for this run;
+				// the renderer uses it to skip the approval dialog for write tools
+				// (create_pr always prompts regardless).
+				autoApprove := s.store.convAutoApprove(j.email, j.convID)
 				toolExecRelay = func(ctx context.Context, step int, tool, args string) toolOutcome {
 					respCh := make(chan toolExecResponse, 1)
 					j.mu.Lock()
@@ -1174,7 +1183,7 @@ func (s *server) runGeneration(j *job) error {
 						}
 						j.mu.Unlock()
 					}()
-					j.emitToolExec(step, tool, args, repo.FullName, conv.RepoBranch)
+					j.emitToolExec(step, tool, args, repo.FullName, conv.RepoBranch, autoApprove)
 					// apply_patch/run_command/git_* block on a user approval dialog, which
 					// can take far longer than a plain tool call — give it its own budget
 					// (TOOL_EXEC_TIMEOUT) rather than the whole-job timeout.

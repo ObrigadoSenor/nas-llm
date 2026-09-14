@@ -52,6 +52,11 @@ type Conversation struct {
 	CreatedAt   int64     `json:"createdAt"`
 	UpdatedAt   int64     `json:"updatedAt"`
 	Messages    []Message `json:"messages,omitempty"`
+	// AgentAutoApprove is the per-conversation auto-approve override for agent
+	// write tools (apply_patch/run_command/git_commit/git_push). nil = inherit
+	// the global agent_auto_approve setting; non-nil forces on/off for this chat.
+	// create_pr always prompts regardless. Exposed so the UI can show the toggle.
+	AgentAutoApprove *bool `json:"agentAutoApprove,omitempty"`
 }
 
 type Folder struct {
@@ -113,6 +118,7 @@ CREATE TABLE IF NOT EXISTS conversations (
 	title_custom INTEGER NOT NULL DEFAULT 0,
 	agent_system TEXT,
 	agent_tools TEXT,
+	agent_auto_approve INTEGER,
 	created_at INTEGER NOT NULL,
 	updated_at INTEGER NOT NULL,
 	messages TEXT NOT NULL
@@ -251,6 +257,11 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 	}
+	if !cols["agent_auto_approve"] {
+		if _, err := db.Exec(`ALTER TABLE conversations ADD COLUMN agent_auto_approve INTEGER`); err != nil {
+			return err
+		}
+	}
 	jcols, err := tableColumns(db, "jobs")
 	if err != nil {
 		return err
@@ -354,7 +365,7 @@ func (s *store) newConversationID() string {
 }
 
 func (s *store) listConversations(email string) ([]Conversation, error) {
-	rows, err := s.db.Query(`SELECT id, title, model, folder_id, repo_id, repo_branch, title_custom, created_at, updated_at FROM conversations WHERE email = ? ORDER BY updated_at DESC`, email)
+	rows, err := s.db.Query(`SELECT id, title, model, folder_id, repo_id, repo_branch, title_custom, created_at, updated_at, agent_auto_approve FROM conversations WHERE email = ? ORDER BY updated_at DESC`, email)
 	if err != nil {
 		return nil, err
 	}
@@ -364,13 +375,15 @@ func (s *store) listConversations(email string) ([]Conversation, error) {
 		var c Conversation
 		var folderID, repoID, repoBranch sql.NullString
 		var titleCustom int
-		if err := rows.Scan(&c.ID, &c.Title, &c.Model, &folderID, &repoID, &repoBranch, &titleCustom, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		var autoApprove sql.NullInt64
+		if err := rows.Scan(&c.ID, &c.Title, &c.Model, &folderID, &repoID, &repoBranch, &titleCustom, &c.CreatedAt, &c.UpdatedAt, &autoApprove); err != nil {
 			return nil, err
 		}
 		c.FolderID = folderID.String
 		c.RepoID = repoID.String
 		c.RepoBranch = repoBranch.String
 		c.TitleCustom = titleCustom != 0
+		c.AgentAutoApprove = nullBoolFromInt(autoApprove)
 		out = append(out, c)
 	}
 	return out, rows.Err()
@@ -381,8 +394,9 @@ func (s *store) getConversation(email, id string) (*Conversation, error) {
 	var msgs string
 	var folderID, repoID, repoBranch sql.NullString
 	var titleCustom int
-	err := s.db.QueryRow(`SELECT id, title, model, folder_id, repo_id, repo_branch, title_custom, created_at, updated_at, messages FROM conversations WHERE id = ? AND email = ?`, id, email).
-		Scan(&c.ID, &c.Title, &c.Model, &folderID, &repoID, &repoBranch, &titleCustom, &c.CreatedAt, &c.UpdatedAt, &msgs)
+	var autoApprove sql.NullInt64
+	err := s.db.QueryRow(`SELECT id, title, model, folder_id, repo_id, repo_branch, title_custom, created_at, updated_at, messages, agent_auto_approve FROM conversations WHERE id = ? AND email = ?`, id, email).
+		Scan(&c.ID, &c.Title, &c.Model, &folderID, &repoID, &repoBranch, &titleCustom, &c.CreatedAt, &c.UpdatedAt, &msgs, &autoApprove)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -393,6 +407,7 @@ func (s *store) getConversation(email, id string) (*Conversation, error) {
 	c.RepoID = repoID.String
 	c.RepoBranch = repoBranch.String
 	c.TitleCustom = titleCustom != 0
+	c.AgentAutoApprove = nullBoolFromInt(autoApprove)
 	if err := json.Unmarshal([]byte(msgs), &c.Messages); err != nil {
 		return nil, err
 	}
@@ -529,7 +544,7 @@ func (s *store) deleteFolder(email, id string) (bool, error) {
 // An empty folderID clears the folder (sets it to NULL). A non-empty title marks
 // the conversation as having a custom title (title_custom = 1) so later saves
 // won't overwrite it with the auto-derived first-message title.
-func (s *store) patchConversation(email, id string, title, folderID, model, agentSystem, agentTools, repoID, repoBranch *string) (*Conversation, error) {
+func (s *store) patchConversation(email, id string, title, folderID, model, agentSystem, agentTools, repoID, repoBranch *string, agentAutoApprove *bool) (*Conversation, error) {
 	now := time.Now().UnixMilli()
 	sets := []string{"updated_at = ?"}
 	args := []any{now}
@@ -572,6 +587,14 @@ func (s *store) patchConversation(email, id string, title, folderID, model, agen
 			sets = append(sets, "repo_branch = ?")
 			args = append(args, *repoBranch)
 		}
+	}
+	if agentAutoApprove != nil {
+		sets = append(sets, "agent_auto_approve = ?")
+		v := 0
+		if *agentAutoApprove {
+			v = 1
+		}
+		args = append(args, v)
 	}
 	args = append(args, id, email)
 	res, err := s.db.Exec(`UPDATE conversations SET `+strings.Join(sets, ", ")+` WHERE id = ? AND email = ?`, args...)
@@ -774,6 +797,29 @@ func (s *store) getConvAgentConfig(email, id string) (system, tools string, err 
 		return "", "", err
 	}
 	return sys.String, t.String, nil
+}
+
+// nullBoolFromInt converts a nullable INTEGER column (0/1/NULL) into a *bool:
+// nil when the column is NULL ("inherit"), otherwise a pointer to true/false.
+func nullBoolFromInt(v sql.NullInt64) *bool {
+	if !v.Valid {
+		return nil
+	}
+	b := v.Int64 != 0
+	return &b
+}
+
+// convAutoApprove resolves the effective auto-approve setting for a
+// conversation's agent write tools (apply_patch/run_command/git_commit/git_push):
+// the per-conversation override wins, then the global agent_auto_approve
+// setting, then on (the default). When true the frontend runs those tools
+// without an approval dialog; create_pr always prompts regardless.
+func (s *store) convAutoApprove(email, id string) bool {
+	var v sql.NullInt64
+	if err := s.db.QueryRow(`SELECT agent_auto_approve FROM conversations WHERE id = ? AND email = ?`, id, email).Scan(&v); err == nil && v.Valid {
+		return v.Int64 != 0
+	}
+	return s.getSetting("agent_auto_approve") != "0" // default ON
 }
 
 // getConvRepoID returns the repo_id bound to a conversation ("" if none).

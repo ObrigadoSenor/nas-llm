@@ -297,23 +297,24 @@ func (s *server) handleDeleteFolder(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) handlePatchConversation(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Title       *string `json:"title"`
-		FolderID    *string `json:"folderId"`
-		Model       *string `json:"model"`
-		AgentSystem *string `json:"agentSystem"`
-		AgentTools  *string `json:"agentTools"`
-		RepoID      *string `json:"repoId"`
-		RepoBranch  *string `json:"repoBranch"`
+		Title            *string `json:"title"`
+		FolderID         *string `json:"folderId"`
+		Model            *string `json:"model"`
+		AgentSystem      *string `json:"agentSystem"`
+		AgentTools       *string `json:"agentTools"`
+		RepoID           *string `json:"repoId"`
+		RepoBranch       *string `json:"repoBranch"`
+		AgentAutoApprove *bool   `json:"agentAutoApprove"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, "invalid request", http.StatusBadRequest)
 		return
 	}
-	if body.Title == nil && body.FolderID == nil && body.Model == nil && body.AgentSystem == nil && body.AgentTools == nil && body.RepoID == nil && body.RepoBranch == nil {
+	if body.Title == nil && body.FolderID == nil && body.Model == nil && body.AgentSystem == nil && body.AgentTools == nil && body.RepoID == nil && body.RepoBranch == nil && body.AgentAutoApprove == nil {
 		jsonError(w, "nothing to update", http.StatusBadRequest)
 		return
 	}
-	c, err := s.store.patchConversation(emailFrom(r), r.PathValue("id"), body.Title, body.FolderID, body.Model, body.AgentSystem, body.AgentTools, body.RepoID, body.RepoBranch)
+	c, err := s.store.patchConversation(emailFrom(r), r.PathValue("id"), body.Title, body.FolderID, body.Model, body.AgentSystem, body.AgentTools, body.RepoID, body.RepoBranch, body.AgentAutoApprove)
 	if err != nil {
 		log.Printf("patchConversation: %v", err)
 		jsonError(w, "server error", http.StatusInternalServerError)
@@ -929,9 +930,10 @@ func (s *server) handleAgentConfigGet(w http.ResponseWriter, r *http.Request) {
 		tools = defaultAgentTools()
 	}
 	writeJSON(w, map[string]any{
-		"system":    s.store.getSetting("agent_system"),
-		"tools":     tools,
-		"available": availableTools(s.cfg.fetchPageEnabled),
+		"system":      s.store.getSetting("agent_system"),
+		"tools":       tools,
+		"available":   availableTools(s.cfg.fetchPageEnabled),
+		"autoApprove": s.store.getSetting("agent_auto_approve") != "0", // default ON
 	})
 }
 
@@ -939,8 +941,9 @@ func (s *server) handleAgentConfigGet(w http.ResponseWriter, r *http.Request) {
 // An empty tool list clears the override (falls back to built-in defaults).
 func (s *server) handleAgentConfigPut(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		System string   `json:"system"`
-		Tools  []string `json:"tools"`
+		System      string   `json:"system"`
+		Tools       []string `json:"tools"`
+		AutoApprove *bool    `json:"autoApprove"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, "invalid request", http.StatusBadRequest)
@@ -969,7 +972,18 @@ func (s *server) handleAgentConfigPut(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "server error", http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, map[string]any{"system": body.System, "tools": valid, "available": availableTools(s.cfg.fetchPageEnabled)})
+	if body.AutoApprove != nil {
+		v := "0"
+		if *body.AutoApprove {
+			v = "1"
+		}
+		if err := s.store.setSetting("agent_auto_approve", v); err != nil {
+			log.Printf("setSetting agent_auto_approve: %v", err)
+			jsonError(w, "server error", http.StatusInternalServerError)
+			return
+		}
+	}
+	writeJSON(w, map[string]any{"system": body.System, "tools": valid, "available": availableTools(s.cfg.fetchPageEnabled), "autoApprove": s.store.getSetting("agent_auto_approve") != "0"})
 }
 
 // --- File-tool relay (desktop sidecar → backend) ---
