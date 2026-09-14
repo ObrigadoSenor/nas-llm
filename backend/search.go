@@ -121,7 +121,8 @@ func systemNudge() oaiMessage {
 		"You have a web_search tool for current or time-sensitive facts that may be past your training cutoff. " +
 			"Call it once with a well-formed query, then synthesize your answer directly from the results — do not search again. " +
 			"Only call it when the answer needs fresh information; otherwise answer directly. " +
-			"When you do search, cite the source URLs in your answer and say when you could not verify something.")}
+			"When you do search, cite the source URLs in your answer and say when you could not verify something. " +
+			"\n\n" + toolCallDiscipline())}
 }
 
 // jsonString returns a JSON-encoded string as RawMessage (safe to drop into

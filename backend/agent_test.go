@@ -23,26 +23,24 @@ func TestAgentSystemPromptInjection(t *testing.T) {
 		name      string
 		convSys   string // per-conversation agent_system override ("" = none)
 		globalSys string // global settings agent_system ("" = none)
-		want      string // expected system message content
-		exact     bool   // true = want must equal the content; false = want is a substring
+		want      string // expected system message content (asserted as a substring:
+		// runAgentLoop appends the tool-call discipline guardrail after it, so the
+		// prompt is no longer byte-equal to the configured value)
 	}{
 		{
 			name:      "per-conversation override wins over global and default",
 			convSys:   "You are a test agent. Always reply with PONG.",
 			globalSys: "You are a global agent. Be terse.",
 			want:      "You are a test agent. Always reply with PONG.",
-			exact:     true,
 		},
 		{
 			name:      "global setting wins when no per-conversation override",
 			globalSys: "You are a global test agent. Be terse.",
 			want:      "You are a global test agent. Be terse.",
-			exact:     true,
 		},
 		{
 			name:  "built-in default nudge when nothing configured",
 			want:  "You are a capable agent running on a small local server.",
-			exact: false,
 		},
 	}
 	for _, c := range cases {
@@ -115,14 +113,16 @@ func TestAgentSystemPromptInjection(t *testing.T) {
 			if sysMsg.Role != "system" {
 				t.Fatalf("messages[0].Role = %q, want %q", sysMsg.Role, "system")
 			}
-			got := contentText(sysMsg.Content)
-			if c.exact {
-				if got != c.want {
-					t.Errorf("system prompt = %q, want exactly %q", got, c.want)
-				}
-			} else if !strings.Contains(got, c.want) {
-				t.Errorf("system prompt = %q, want it to contain %q", got, c.want)
-			}
+		got := contentText(sysMsg.Content)
+		// The configured/default prompt is now a prefix: runAgentLoop appends the
+		// tool-call discipline guardrail, so check it as a substring rather than
+		// for byte equality, then assert the guardrail is present in every case.
+		if !strings.Contains(got, c.want) {
+			t.Errorf("system prompt = %q, want it to contain %q", got, c.want)
+		}
+		if !strings.Contains(got, "never invent a tool result") {
+			t.Errorf("system prompt missing the tool-call discipline guardrail: %q", got)
+		}
 
 			// Let the loop finish: the browser POSTs a final answer with no
 			// tool_calls, so the agent loop returns on step 0.
