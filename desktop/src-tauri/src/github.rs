@@ -1335,9 +1335,12 @@ async fn repos_exec(State(st): State<AppState>, Json(body): Json<ExecBody>) -> R
         "glob" => exec_glob(&root, &body.args),
         "grep" => exec_grep(&root, &body.args),
         "git_status" => exec_git_status(&root).await,
+        "git_log" => exec_git_log(&root, &body.args).await,
+        "list_prs" => exec_list_prs(&st.client, &root, &body.args).await,
         "git_commit" => exec_git_commit(&root, &body.args, body.approved).await,
         "git_push" => exec_git_push(&root, &body.args, body.approved).await,
         "create_pr" => exec_create_pr(&st.client, &root, &body.args, body.approved).await,
+        "merge_pr" => exec_merge_pr(&st.client, &root, &body.args, body.approved).await,
         "apply_patch" => exec_apply_patch(&root, &body.args, body.approved).await,
         "run_command" => exec_run_command(&root, &body.args, body.approved).await,
         other => ExecResult { observation: format!("Unknown tool: {other}"), preview: "unknown tool".into(), is_error: true, ..Default::default() },
@@ -1571,6 +1574,102 @@ async fn exec_git_status(root: &Path) -> ExecResult {
     }
 }
 
+// exec_git_log returns the last N commits (sha, author, date, subject) on the
+// current branch. Read-only — runs immediately, never approval-gated. Optional
+// `count` (default 20, clamped 1..=100) and `path` (repo-relative pathspec).
+async fn exec_git_log(root: &Path, args: &str) -> ExecResult {
+    let (count, path) = match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(v) => {
+            let count = v
+                .get("count")
+                .and_then(|c| c.as_u64())
+                .filter(|c| *c > 0)
+                .unwrap_or(20)
+                .min(100) as usize;
+            let path = v
+                .get("path")
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            (count, path)
+        }
+        Err(_) => return ExecResult {
+            observation: "Invalid args for git_log.".into(),
+            preview: "bad args".into(),
+            is_error: true,
+            ..Default::default()
+        },
+    };
+    let count_str = count.to_string();
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("-C")
+        .arg(root)
+        .arg("log")
+        .arg("-n")
+        .arg(&count_str)
+        .arg("--pretty=format:%H | %an | %ad | %s")
+        .arg("--date=short");
+    if !path.is_empty() {
+        // The `--` separator keeps a pathspec that looks like a flag safe.
+        cmd.arg("--").arg(&path);
+    }
+    let out = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout).to_string();
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                ExecResult {
+                    observation: "No commits on this branch yet.".into(),
+                    preview: "no commits".into(),
+                    is_error: false,
+                    ..Default::default()
+                }
+            } else {
+                ExecResult {
+                    observation: cap(trimmed),
+                    preview: format!("{} commits", trimmed.lines().count()),
+                    is_error: false,
+                    ..Default::default()
+                }
+            }
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            // An unborn branch (no commits yet) exits non-zero; surface the
+            // same friendly message the empty-stdout path returns.
+            if stderr.contains("does not have any commits yet") {
+                return ExecResult {
+                    observation: "No commits on this branch yet.".into(),
+                    preview: "no commits".into(),
+                    is_error: false,
+                    ..Default::default()
+                };
+            }
+            ExecResult {
+                observation: format!(
+                    "git log failed: {}",
+                    if stderr.is_empty() { "unknown error" } else { &stderr }
+                ),
+                preview: "git error".into(),
+                is_error: true,
+                ..Default::default()
+            }
+        }
+        Err(e) => ExecResult {
+            observation: format!("Could not run git: {e}"),
+            preview: "git error".into(),
+            is_error: true,
+            ..Default::default()
+        },
+    }
+}
+
 // --- Write tools (Phase 4: per-invocation approval required) ---
 
 // apply_patch applies a unified diff to the repo via `git apply`. The user
@@ -1798,6 +1897,112 @@ async fn exec_create_pr(client: &reqwest::Client, root: &Path, args: &str, appro
         Err(e) => ExecResult {
             observation: format!("create_pr failed: {}", e),
             preview: "PR failed".into(),
+            is_error: true,
+            ..Default::default()
+        },
+    }
+}
+
+// exec_list_prs returns the repo's open pull requests with CI + review state so
+// the agent can find a PR and check whether it's safe to merge before calling
+// merge_pr. Read-only — never approval-gated. github.com repos only.
+async fn exec_list_prs(client: &reqwest::Client, root: &Path, _args: &str) -> ExecResult {
+    match list_prs_for_repo(client, root).await {
+        Ok(prs) if prs.is_empty() => ExecResult {
+            observation: "No open pull requests.".into(),
+            preview: "0 open PRs".into(),
+            is_error: false,
+            ..Default::default()
+        },
+        Ok(prs) => {
+            let mut lines = Vec::with_capacity(prs.len());
+            for pr in &prs {
+                let mut s = format!("#{} \"{}\" {}→{}", pr.number, pr.title, pr.head, pr.base);
+                if pr.draft {
+                    s.push_str(" [draft]");
+                }
+                if let Some(ci) = &pr.ci_state {
+                    s.push_str(&format!(" CI={}", ci));
+                }
+                if let Some(rv) = &pr.review_state {
+                    s.push_str(&format!(" reviews={}", rv));
+                }
+                if let Some(ms) = &pr.mergeable_state {
+                    s.push_str(&format!(" mergeable={}", ms));
+                }
+                lines.push(s);
+            }
+            ExecResult {
+                observation: cap(&lines.join("\n")),
+                preview: format!("{} open PRs", prs.len()),
+                is_error: false,
+                ..Default::default()
+            }
+        }
+        Err(e) => ExecResult {
+            observation: format!("list_prs failed: {}", e),
+            preview: "PR list failed".into(),
+            is_error: true,
+            ..Default::default()
+        },
+    }
+}
+
+// exec_merge_pr merges a GitHub pull request by number. Approval-gated like
+// create_pr — never auto-approved. The not-approved path fetches the PR so the
+// approval dialog shows the title + head→base; a fetch failure falls back to a
+// minimal by-number preview. github.com repos only.
+async fn exec_merge_pr(client: &reqwest::Client, root: &Path, args: &str, approved: bool) -> ExecResult {
+    let v = match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(v) => v,
+        Err(_) => return ExecResult {
+            observation: "Invalid args for merge_pr.".into(),
+            preview: "bad args".into(),
+            is_error: true,
+            ..Default::default()
+        },
+    };
+    let number = v.get("number").and_then(|n| n.as_u64()).unwrap_or(0);
+    if number == 0 {
+        return ExecResult {
+            observation: "No PR number provided.".into(),
+            preview: "no number".into(),
+            is_error: true,
+            ..Default::default()
+        };
+    }
+    let method = v
+        .get("method")
+        .and_then(|m| m.as_str())
+        .unwrap_or("merge")
+        .to_string();
+    if !approved {
+        let preview = match pr_detail(client, root, number).await {
+            Ok(d) => format!(
+                "Merge PR #{} \"{}\": {} → {} ({})",
+                number, d.title, d.head, d.base, method
+            ),
+            Err(_) => format!("Merge PR #{} ({})", number, method),
+        };
+        return ExecResult {
+            observation: String::new(),
+            preview: "awaiting approval".into(),
+            is_error: false,
+            needs_approval: Some(true),
+            approval_kind: Some("merge_pr".into()),
+            approval_preview: Some(preview),
+        };
+    }
+    match merge_pr_for_repo(client, root, number, &method).await {
+        Ok(sha) => ExecResult {
+            observation: format!("Merged PR #{} ({}).", number, sha),
+            preview: "merged".into(),
+            is_error: false,
+            ..Default::default()
+        },
+        Err(e) => ExecResult {
+            observation: format!("merge_pr failed: {}", e),
+            preview: "merge failed".into(),
             is_error: true,
             ..Default::default()
         },
@@ -2166,6 +2371,311 @@ async fn create_pr_for_repo(
     }
 }
 
+// --- PR listing (shared by the list_prs tool and the /repos/prs UI route) ---
+
+#[derive(Serialize)]
+struct PrInfo {
+    number: u64,
+    title: String,
+    head: String,
+    base: String,
+    draft: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mergeable_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ci_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    review_state: Option<String>,
+    html_url: String,
+}
+
+// list_prs_for_repo fetches up to 10 open PRs for a github.com repo, then
+// enriches each with combined CI state (GET /commits/{sha}/status) and a
+// summarized review state (GET /pulls/{n}/reviews). Returns the raw list so the
+// agent executor can render text and the UI route can return JSON. Errors are
+// surfaced as strings (no remote, not github.com, no token, API failure).
+async fn list_prs_for_repo(
+    client: &reqwest::Client,
+    root: &Path,
+) -> Result<Vec<PrInfo>, String> {
+    let remote = git_remote_url(root)
+        .await
+        .ok_or_else(|| "no remote configured".to_string())?;
+    let full_name = github_full_name(&remote)
+        .ok_or_else(|| "list_prs is only supported for github.com repos".to_string())?;
+    let token =
+        token_get().ok_or_else(|| "no github token stored (connect github first)".to_string())?;
+    let url = format!("{GH_API}/repos/{}/pulls?state=open&per_page=10", full_name);
+    let resp = client
+        .get(&url)
+        .headers(gh_headers(&token))
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("github unreachable: {}", scrub(e.to_string(), &token)))?;
+    if resp.status() == StatusCode::UNAUTHORIZED {
+        return Err("invalid or expired token".into());
+    }
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(parse_github_error(&body)
+            .unwrap_or_else(|| format!("github returned {}", body)));
+    }
+    let prs: Vec<serde_json::Value> = resp
+        .json()
+        .await
+        .map_err(|e| format!("bad github response: {}", scrub(e.to_string(), &token)))?;
+    let mut out = Vec::with_capacity(prs.len());
+    for pr in prs {
+        let number = pr.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
+        let head_sha = pr
+            .get("head")
+            .and_then(|h| h.get("sha"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let ci_state = if head_sha.is_empty() {
+            None
+        } else {
+            pr_ci_state(client, &full_name, &head_sha, &token).await
+        };
+        let review_state = pr_review_state(client, &full_name, number, &token).await;
+        out.push(PrInfo {
+            number,
+            title: pr
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            head: pr
+                .get("head")
+                .and_then(|h| h.get("ref"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            base: pr
+                .get("base")
+                .and_then(|b| b.get("ref"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            draft: pr.get("draft").and_then(|v| v.as_bool()).unwrap_or(false),
+            // mergeable_state is only reliably computed by the single-PR GET;
+            // the list endpoint often returns null/"unknown", so filter those.
+            mergeable_state: pr
+                .get("mergeable_state")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .filter(|s| !s.is_empty() && s != "unknown"),
+            ci_state,
+            review_state,
+            html_url: pr
+                .get("html_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        });
+    }
+    Ok(out)
+}
+
+// pr_ci_state returns the combined check state for a PR's head commit
+// (success/failure/pending/error), or None when there are no check contexts.
+async fn pr_ci_state(
+    client: &reqwest::Client,
+    full_name: &str,
+    sha: &str,
+    token: &str,
+) -> Option<String> {
+    let url = format!("{GH_API}/repos/{}/commits/{}/status", full_name, sha);
+    let resp = client
+        .get(&url)
+        .headers(gh_headers(token))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: serde_json::Value = resp.json().await.ok()?;
+    let has_statuses = v
+        .get("statuses")
+        .and_then(|s| s.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    if !has_statuses {
+        return None;
+    }
+    v.get("state").and_then(|s| s.as_str()).map(String::from)
+}
+
+// pr_review_state summarizes a PR's reviews as "changes_requested",
+// "approved", "reviewed", or "none", based on the latest review per user
+// (reviews arrive chronologically, so later entries overwrite earlier ones).
+// Returns None when there are no reviews.
+async fn pr_review_state(
+    client: &reqwest::Client,
+    full_name: &str,
+    number: u64,
+    token: &str,
+) -> Option<String> {
+    let url = format!("{GH_API}/repos/{}/pulls/{}/reviews", full_name, number);
+    let resp = client
+        .get(&url)
+        .headers(gh_headers(token))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let reviews: Vec<serde_json::Value> = resp.json().await.ok()?;
+    if reviews.is_empty() {
+        return None;
+    }
+    let mut latest: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for r in reviews {
+        let user = r
+            .get("user")
+            .and_then(|u| u.get("login"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let state = r
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !user.is_empty() && !state.is_empty() {
+            latest.insert(user, state);
+        }
+    }
+    let states: Vec<String> = latest.values().cloned().collect();
+    if states.iter().any(|s| s == "CHANGES_REQUESTED") {
+        Some("changes_requested".to_string())
+    } else if states.iter().any(|s| s == "APPROVED") {
+        Some("approved".to_string())
+    } else {
+        Some("reviewed".to_string())
+    }
+}
+
+// merge_pr_for_repo merges a PR via PUT /repos/{owner}/{repo}/pulls/{n}/merge.
+// Returns the merge commit sha on success. method is normalized to
+// merge/squash/rebase (default merge). github.com repos only; the token is
+// scrubbed from any captured error text.
+async fn merge_pr_for_repo(
+    client: &reqwest::Client,
+    root: &Path,
+    number: u64,
+    method: &str,
+) -> Result<String, String> {
+    let remote = git_remote_url(root)
+        .await
+        .ok_or_else(|| "no remote configured".to_string())?;
+    let full_name = github_full_name(&remote)
+        .ok_or_else(|| "merge_pr is only supported for github.com repos".to_string())?;
+    let token =
+        token_get().ok_or_else(|| "no github token stored (connect github first)".to_string())?;
+    let method = match method.trim() {
+        "squash" => "squash",
+        "rebase" => "rebase",
+        _ => "merge",
+    };
+    let url = format!("{GH_API}/repos/{}/pulls/{}/merge", full_name, number);
+    let body = serde_json::json!({ "merge_method": method });
+    let resp = client
+        .put(&url)
+        .headers(gh_headers(&token))
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("github unreachable: {}", scrub(e.to_string(), &token)))?;
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        let v: serde_json::Value = serde_json::from_str(&body_text)
+            .map_err(|e| format!("bad github response: {}", scrub(e.to_string(), &token)))?;
+        let sha = v
+            .get("sha")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        Ok(sha)
+    } else {
+        let msg = parse_github_error(&body_text)
+            .unwrap_or_else(|| format!("github returned {}", status));
+        Err(scrub(msg, &token))
+    }
+}
+
+// pr_detail fetches a single PR for the merge approval preview (title, head,
+// base, draft, mergeable_state). CI/review state are left as None — the preview
+// doesn't need them, and list_prs already enriched the UI route. Returns an
+// error string for a non-github repo, missing token, or API failure.
+async fn pr_detail(client: &reqwest::Client, root: &Path, number: u64) -> Result<PrInfo, String> {
+    let remote = git_remote_url(root)
+        .await
+        .ok_or_else(|| "no remote configured".to_string())?;
+    let full_name = github_full_name(&remote)
+        .ok_or_else(|| "not a github.com repo".to_string())?;
+    let token =
+        token_get().ok_or_else(|| "no github token stored (connect github first)".to_string())?;
+    let url = format!("{GH_API}/repos/{}/pulls/{}", full_name, number);
+    let resp = client
+        .get(&url)
+        .headers(gh_headers(&token))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("github unreachable: {}", scrub(e.to_string(), &token)))?;
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(parse_github_error(&body)
+            .unwrap_or_else(|| format!("github returned {}", body)));
+    }
+    let pr: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("bad github response: {}", scrub(e.to_string(), &token)))?;
+    Ok(PrInfo {
+        number,
+        title: pr
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        head: pr
+            .get("head")
+            .and_then(|h| h.get("ref"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        base: pr
+            .get("base")
+            .and_then(|b| b.get("ref"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        draft: pr.get("draft").and_then(|v| v.as_bool()).unwrap_or(false),
+        mergeable_state: pr
+            .get("mergeable_state")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .filter(|s| !s.is_empty() && s != "unknown"),
+        ci_state: None,
+        review_state: None,
+        html_url: pr
+            .get("html_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
 #[derive(Deserialize)]
 struct BranchBody {
     name: String,
@@ -2495,6 +3005,50 @@ async fn repos_create_pr(State(st): State<AppState>, Json(body): Json<CreatePrBo
     }
 }
 
+// repos_prs is the UI-facing route for the session panel: returns a repo's open
+// PRs (with CI + review state) as JSON so the Merge PR control can list them.
+// Reuses list_prs_for_repo so it stays in sync with the agent's list_prs tool.
+async fn repos_prs(State(st): State<AppState>, Query(q): Query<StateQuery>) -> Response {
+    let name = q.name.trim().to_string();
+    let dest = match resolve_repo_branch(&st.data_dir, &name, &q.branch).await {
+        Ok(p) => p,
+        Err((status, e)) => return json_err(&e, status),
+    };
+    match list_prs_for_repo(&st.client, &dest).await {
+        Ok(prs) => json_ok(&serde_json::json!({ "ok": true, "prs": prs })),
+        Err(e) => json_err(&e, StatusCode::BAD_GATEWAY),
+    }
+}
+
+#[derive(Deserialize)]
+struct MergePrBody {
+    repo: String,
+    number: u64,
+    #[serde(default)]
+    method: String,
+    #[serde(default)]
+    branch: String,
+}
+
+// repos_merge_pr is the UI-facing route for the session panel's Merge PR
+// button: merges a PR by number via the GitHub API. Reuses merge_pr_for_repo
+// so it stays in sync with the agent's merge_pr tool. Returns {ok, sha} or
+// {ok:false, error}. method defaults to "merge".
+async fn repos_merge_pr(State(st): State<AppState>, Json(body): Json<MergePrBody>) -> Response {
+    let name = body.repo.trim().to_string();
+    let dest = match resolve_repo_branch(&st.data_dir, &name, &body.branch).await {
+        Ok(p) => p,
+        Err((status, e)) => return json_err(&e, status),
+    };
+    if body.number == 0 {
+        return json_ok(&serde_json::json!({ "ok": false, "sha": null, "error": "number is required" }));
+    }
+    match merge_pr_for_repo(&st.client, &dest, body.number, body.method.as_str()).await {
+        Ok(sha) => json_ok(&serde_json::json!({ "ok": true, "sha": sha })),
+        Err(e) => json_ok(&serde_json::json!({ "ok": false, "sha": null, "error": e })),
+    }
+}
+
 #[derive(Deserialize)]
 struct WorktreeBody {
     name: String,
@@ -2563,6 +3117,8 @@ pub fn router(state: AppState) -> Router {
         .route("/__sidecar/repos/checkout", post(repos_checkout))
         .route("/__sidecar/repos/commit", post(repos_commit))
         .route("/__sidecar/repos/create-pr", post(repos_create_pr))
+        .route("/__sidecar/repos/prs", get(repos_prs))
+        .route("/__sidecar/repos/merge-pr", post(repos_merge_pr))
         .route("/__sidecar/repos/worktree", post(repos_worktree))
         .with_state(state)
 }
