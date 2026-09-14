@@ -292,6 +292,16 @@ header h1{font-size:var(--fs-l);font-weight:600;margin:0}
 #send{position:absolute;right:6px;bottom:6px;width:30px;height:30px;padding:0;display:inline-flex;align-items:center;justify-content:center;border-radius:50%}
 #send.stop{border-color:#e0556b;background:color-mix(in srgb,#e0556b 22%,transparent);color:#e0556b}
 #send.stop:hover:not(:disabled){border-color:#e0556b;background:color-mix(in srgb,#e0556b 30%,transparent)}
+#pauseBtn{position:absolute;right:42px;bottom:6px;width:30px;height:30px;padding:0;display:inline-flex;align-items:center;justify-content:center;border-radius:50%;border:1px solid color-mix(in srgb,var(--warn) 50%,transparent);background:color-mix(in srgb,var(--warn) 14%,transparent);color:var(--warn)}
+#pauseBtn:hover:not(:disabled){border-color:var(--warn);background:color-mix(in srgb,var(--warn) 24%,transparent)}
+#pauseBtn.hidden{display:none!important}
+/* Paused banner shown in the assistant bubble when an agent run is paused */
+.paused-banner{display:flex;align-items:center;gap:10px;padding:10px 14px;border-radius:10px;border:1px solid color-mix(in srgb,var(--warn) 40%,transparent);background:color-mix(in srgb,var(--warn) 10%,transparent);color:var(--text);margin-bottom:8px}
+.paused-banner .paused-step{color:var(--muted);font-size:var(--fs-s)}
+.paused-banner .paused-resume{margin-left:auto;height:30px;padding:0 14px;border-radius:8px;border:1px solid color-mix(in srgb,var(--ok) 50%,transparent);background:color-mix(in srgb,var(--ok) 14%,transparent);color:var(--ok)}
+.paused-banner .paused-resume:hover{border-color:var(--ok);background:color-mix(in srgb,var(--ok) 24%,transparent)}
+.conv.paused .conv-dot{background:var(--warn)}
+.toast.paused{border-color:color-mix(in srgb,var(--warn) 45%,transparent)}
 .attach-btn{position:absolute;right:42px;bottom:6px;width:30px;height:30px;padding:0;display:inline-flex;align-items:center;justify-content:center;background:transparent;border:none;border-radius:50%;color:var(--muted)}
 .attach-btn:hover{color:var(--text);background:var(--hover)}
 .input-wrap.has-attach #input{padding-right:78px}

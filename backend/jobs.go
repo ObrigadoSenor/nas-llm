@@ -41,6 +41,22 @@ const (
 // errJobActive means a generation job is already running for a conversation.
 var errJobActive = errors.New("a generation is already running for this conversation")
 
+// errAgentPaused is the sentinel returned by runAgentLoop when the user
+// pauses an agent-mode run between steps. The worker matches it with
+// errors.Is to persist a checkpoint and finalize the job as "paused" instead
+// of "error". A *pausedError carries the transcript and step index at the
+// pause point so the checkpoint can be written and a later resume can
+// rehydrate the conversation.
+var errAgentPaused = errors.New("agent run paused")
+
+type pausedError struct {
+	transcript []oaiMessage
+	step       int
+}
+
+func (p *pausedError) Error() string        { return errAgentPaused.Error() }
+func (p *pausedError) Is(target error) bool { return target == errAgentPaused }
+
 // subEvent is a single event pushed to an SSE subscriber.
 type subEvent struct {
 	// kind is one of: chunk, phase, search, questions, tool, toolStart, thought,
@@ -67,6 +83,11 @@ type job struct {
 	webSearch bool
 	clarify   bool // Clarify extra was on for this generation (drives the agent loop)
 	agent     bool // Agent mode: general ReAct loop over a tool registry
+	// resuming marks a job enqueued by /resume: runGeneration rehydrates the
+	// transcript from the agent_checkpoints row and continues on the remaining
+	// step budget. resumeNote, when non-empty, is appended as a user turn.
+	resuming   bool
+	resumeNote string
 	// supportsTools is the frontend's verdict that the selected model can emit
 	// OpenAI tool_calls. The backend trusts it only for local (browser-relay)
 	// models, whose Ollama it cannot introspect; server models are re-checked
@@ -101,7 +122,7 @@ type job struct {
 	graceTimer *time.Timer
 
 	mu              sync.Mutex
-	status          string // queued, generating, done, error, cancelled
+	status          string // queued, generating, done, error, cancelled, paused
 	content         strings.Builder
 	errMsg          string
 	phase           string        // last phase hint (searching/answering/clarifying…): replayed on (re)connect
@@ -113,6 +134,19 @@ type job struct {
 	finished        chan struct{}      // closed when the job reaches a terminal state
 	cancelFn        context.CancelFunc // set when the job starts running
 	cancelRequested bool               // set by cancel(): survive a queued/unstarted job
+	// pauseRequested is set by pause() for an agent-mode run. runAgentLoop
+	// checks it at the top of each iteration and after each tool result and
+	// returns errAgentPaused so the worker can checkpoint the transcript.
+	pauseRequested bool
+	// roundCancel is the current inference round's child-context cancel func,
+	// installed by runAgentLoop each round. pause() calls it so pause takes
+	// effect within seconds instead of waiting out an inference round; the
+	// partial round is discarded. Guarded by mu.
+	roundCancel context.CancelFunc
+	// pausedStep is the step index at which the run was paused, read from the
+	// checkpoint by handleJob so /job and /api/jobs/active can surface "paused
+	// at step N". Set by the worker when it persists the checkpoint.
+	pausedStep int
 
 	// pendingRelay is set by browserRelay.Call while it awaits the browser's POST
 	// /model-response for the current round. handleModelResponse claims it under
@@ -658,6 +692,40 @@ func (j *job) cancel() {
 	}
 }
 
+// pause requests a pause of an agent-mode run between steps. It records the
+// request and cancels the current round's child context so pause takes effect
+// within seconds instead of waiting out an inference round; the partial round
+// is discarded. runAgentLoop checks pauseRequested at the top of each
+// iteration and after each tool result, then returns errAgentPaused carrying
+// the transcript and step index. Unlike cancel(), pause does NOT cancel the
+// job-level context — the worker finalizes the job as "paused" and writes a
+// checkpoint so the run can be resumed.
+func (j *job) pause() {
+	j.mu.Lock()
+	j.pauseRequested = true
+	rc := j.roundCancel
+	j.mu.Unlock()
+	if rc != nil {
+		rc()
+	}
+}
+
+// isPauseRequested is a lock-safe check used by runAgentLoop via a callback.
+func (j *job) isPauseRequested() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.pauseRequested
+}
+
+// setRoundCancel installs (or clears) the current round's child-context cancel
+// func on the job so pause() can abort an in-flight inference round. Used by
+// runAgentLoop via a callback; pass nil to clear after the round completes.
+func (j *job) setRoundCancel(c context.CancelFunc) {
+	j.mu.Lock()
+	j.roundCancel = c
+	j.mu.Unlock()
+}
+
 func (j *job) snapshot() (status, content, errMsg string) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -730,6 +798,35 @@ func (j *job) notifyCancelled() {
 		}
 	}
 	j.publishHubDone("cancelled")
+}
+
+// notifyPaused marks the job paused and broadcasts a terminal "done" carrying
+// status:"paused" via the hub (mirrors notifyCancelled). Subscribers treat it
+// like a normal finish — they reload the conversation, which holds the partial
+// assistant reply with its steps/thoughts, and the UI surfaces a Resume
+// affordance from the checkpoint. The per-conversation "done" event carries no
+// payload, so the frontend distinguishes paused from done/cancelled via the
+// /job status ("paused") rather than the tail event.
+func (j *job) notifyPaused() {
+	j.mu.Lock()
+	if j.status == "done" || j.status == "error" || j.status == "cancelled" || j.status == "paused" {
+		j.mu.Unlock()
+		return
+	}
+	j.status = "paused"
+	subs := make([]chan subEvent, 0, len(j.subs))
+	for ch := range j.subs {
+		subs = append(subs, ch)
+	}
+	close(j.finished)
+	j.mu.Unlock()
+	for _, ch := range subs {
+		select {
+		case ch <- subEvent{kind: "done"}:
+		default:
+		}
+	}
+	j.publishHubDone("paused")
 }
 
 // notifyError marks the job errored and broadcasts the terminal event.
@@ -1022,6 +1119,21 @@ func (jm *jobManager) cancel(convID, email string) bool {
 	return true
 }
 
+// pause requests a pause of the conversation's active agent job between steps.
+// Returns false if there is no active job for this conversation/user. Only an
+// agent-mode run is pausable (plain chat/search/clarify have nothing to
+// resume); a non-agent job is left alone and the caller surfaces a 409.
+func (jm *jobManager) pause(convID, email string) bool {
+	jm.mu.Lock()
+	j, ok := jm.active[convID]
+	jm.mu.Unlock()
+	if !ok || j.email != email || !j.agent {
+		return false
+	}
+	j.pause()
+	return true
+}
+
 func (jm *jobManager) activeByUser(email string) map[string]string {
 	jm.mu.Lock()
 	defer jm.mu.Unlock()
@@ -1097,11 +1209,39 @@ func (jm *jobManager) worker() {
 		j.mu.Lock()
 		cancelled := j.cancelRequested // set by cancel() before it fires the context
 		j.mu.Unlock()
+		// A pause surfaces as errAgentPaused carrying the transcript + step; a
+		// resumed run that pauses again upserts a fresh checkpoint over the old.
+		var paused *pausedError
+		isPaused := errors.As(err, &paused)
 
 		switch {
+		case isPaused:
+			// Paused by the user between steps: persist the partial reply (so the
+			// trace/steps survive in the conversation), write a checkpoint so the
+			// run can be resumed, and finalize as "paused" (not error/cancelled).
+			// reconcileJobs only touches queued/generating, so a paused job is
+			// still resumable after a backend restart.
+			ts := time.Now().UnixMilli()
+			if strings.TrimSpace(content) != "" {
+				_ = jm.store.setJobContent(j.id, content)
+				_ = jm.store.appendAssistantMessage(j.email, j.convID, Message{Role: "assistant", Content: content, Ts: ts, Search: smeta, Clarify: cmeta, Steps: steps, Thoughts: thoughts})
+			}
+			if paused != nil {
+				j.mu.Lock()
+				j.pausedStep = paused.step
+				j.mu.Unlock()
+				_ = jm.store.saveCheckpoint(agentCheckpoint{
+					JobID: j.id, ConvID: j.convID, Email: j.email, Step: paused.step,
+					Transcript: paused.transcript, Model: j.model, Local: j.local,
+					SupportsTools: j.supportsTools, CreatedAt: ts,
+				})
+			}
+			_ = jm.store.finalizeJob(j.id, "paused", "", ts)
+			j.notifyPaused()
 		case cancelled:
 			// Stopped by the user: persist the partial reply (if any) and report
-			// a clean "done" to subscribers rather than an error.
+			// a clean "done" to subscribers rather than an error. Keep any live
+			// checkpoint so a paused-then-cancelled run can still be resumed.
 			ts := time.Now().UnixMilli()
 			if strings.TrimSpace(content) != "" {
 				_ = jm.store.setJobContent(j.id, content)
@@ -1118,6 +1258,11 @@ func (jm *jobManager) worker() {
 			_ = jm.store.appendAssistantMessage(j.email, j.convID, Message{Role: "assistant", Content: content, Ts: ts, Search: smeta, Clarify: cmeta, Steps: steps, Thoughts: thoughts})
 			_ = jm.store.finalizeJob(j.id, "done", "", ts)
 			j.notifyDone()
+			// A clean finish completes the task: drop any live checkpoint so a
+			// resumed conversation doesn't keep a lingering "paused" state.
+			if j.agent {
+				_ = jm.store.deleteCheckpoint(j.email, j.convID)
+			}
 		}
 
 		jm.mu.Lock()
@@ -1314,7 +1459,28 @@ func (s *server) runGeneration(j *job) error {
 				}
 			}
 		}
-		return s.runAgentLoop(ctx, mb, j.model, j.email, msgs, allow, sys, j.emitChunk, j.emitPhase, j.emitTool, j.emitQuestions, j.emitThought, j.emitClear, j.addUsage, repoID, toolExecRelay)
+		// Resume: rehydrate the transcript from a live checkpoint and continue on
+		// the remaining budget. Drop the checkpoint's stale system message
+		// (messages[0]); runAgentLoop prepends a freshly built one (current
+		// date/repo/branch) so the resumed run does not inherit a stale context.
+		// Append the user's resume note (if any) as a user turn. A fresh run
+		// (no checkpoint, or a resume whose checkpoint was deleted) uses the
+		// conversation messages built above, unchanged.
+		resumeStep := 0
+		if j.resuming {
+			if cp, cpErr := s.store.loadCheckpoint(j.email, j.convID); cpErr == nil && cp != nil {
+				resumeStep = cp.Step
+				cpMsgs := cp.Transcript
+				if len(cpMsgs) > 0 && cpMsgs[0].Role == "system" {
+					cpMsgs = cpMsgs[1:]
+				}
+				if note := strings.TrimSpace(j.resumeNote); note != "" {
+					cpMsgs = append(cpMsgs, oaiMessage{Role: "user", Content: jsonString(note)})
+				}
+				msgs = cpMsgs
+			}
+		}
+		return s.runAgentLoop(ctx, mb, j.model, j.email, msgs, allow, sys, j.emitChunk, j.emitPhase, j.emitTool, j.emitQuestions, j.emitThought, j.emitClear, j.addUsage, repoID, toolExecRelay, j.isPauseRequested, j.setRoundCancel, resumeStep)
 	}
 	if j.clarify {
 		// Cap back-to-back clarifying questions at MAX_CLARIFY_ROUNDS: once the

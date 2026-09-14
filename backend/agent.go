@@ -629,7 +629,9 @@ func toolCallDiscipline() string {
 func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email string, msgs []oaiMessage, allow []string, systemPrompt string,
 	emit func(string), emitPhase func(string), emitTool func(agentStep), emitQuestions func(clarifyMeta),
 	emitThought func(string), emitClear func(), addUsage func(int, int),
-	repoID string, toolExecRelay func(ctx context.Context, step int, tool, args string) toolOutcome) error {
+	repoID string, toolExecRelay func(ctx context.Context, step int, tool, args string) toolOutcome,
+	pauseRequested func() bool, setRoundCancel func(context.CancelFunc),
+	resumeStep int) error {
 	emitPhase("agent")
 	reg := s.toolRegistry(email)
 	tools := make([]oaiTool, 0, len(allow))
@@ -677,9 +679,24 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 	// re-prompt round — which re-runs the model without making progress — does
 	// not consume a step of the budget. It increments only at the end of a real
 	// (tool-carrying or final-answer) round; the narration guard's continue
-	// skips the increment.
-	step := 0
+	// skips the increment. resumeStep is 0 for a fresh run, or the checkpoint's
+	// step index for a resumed run so it continues on the remaining budget.
+	step := resumeStep
 	for step < s.cfg.maxAgentSteps {
+		// Pause check between steps: if the user paused the run, stop before
+		// driving another inference round. The transcript and step index ride
+		// back on a *pausedError so the worker can write a checkpoint; no tool
+		// relay is left in flight because pause() also cancels this round's ctx.
+		if pauseRequested != nil && pauseRequested() {
+			return &pausedError{transcript: messages, step: step}
+		}
+		// Each round gets its own child ctx so pause() can abort an in-flight
+		// inference round (via setRoundCancel) without cancelling the whole
+		// job. Cleared at the end of the round; the partial round is discarded.
+		roundCtx, roundCancel := context.WithCancel(ctx)
+		if setRoundCancel != nil {
+			setRoundCancel(roundCancel)
+		}
 		// Warn once at 80% of the budget so the model knows the cliff is near
 		// and finishes outstanding edits before synthesizing, instead of being
 		// silently cut off mid-task when the budget forces a final answer.
@@ -694,14 +711,24 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 		// its own context window, so compaction is skipped for it (and doing the
 		// summary over the relay would stream an internal summary into the bubble).
 		if d, ok := mb.(*directOllama); ok {
-			messages = s.maybeCompact(ctx, d.chatURL, model, messages)
+			messages = s.maybeCompact(roundCtx, d.chatURL, model, messages)
 		}
 		// One inference round. For a server backend, content streams live to the
 		// answer bubble as it arrives; for a browser relay, the browser streams it
 		// directly from localhost (the backend does not re-emit chunks). The
 		// returned content drives thinking-round handling below.
-		msg, usage, err := mb.Call(ctx, model, messages, tools)
+		msg, usage, err := mb.Call(roundCtx, model, messages, tools)
 		if err != nil {
+			roundCancel()
+			if setRoundCancel != nil {
+				setRoundCancel(nil)
+			}
+			// An aborted round may be a pause (pauseRequested) rather than a real
+			// error — surface the sentinel so the worker checkpoints instead of
+			// finalizing as an error.
+			if pauseRequested != nil && pauseRequested() {
+				return &pausedError{transcript: messages, step: step}
+			}
 			return fmt.Errorf("agent step %d: %w", step+1, err)
 		}
 		if addUsage != nil {
@@ -757,6 +784,7 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 					}
 					emitClear()
 					messages = append(messages, msg, oaiMessage{Role: "system", Content: jsonString(awaitingToolNudge(awaiting))})
+					roundCancel()
 					continue
 				}
 				// Interactive fallback: the model asked the user to hand it a tool
@@ -770,6 +798,7 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 					emitClear()
 					emitQuestions(synthesizeProceedCard(roundText))
 					emitPhase("clarifying")
+					roundCancel()
 					return nil
 				}
 				// Final answer — its content was already streamed (server backend)
@@ -790,6 +819,7 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 				if roundText == "" {
 					emit("(no response)")
 				}
+				roundCancel()
 				return nil
 			}
 		}
@@ -833,7 +863,7 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 			start := time.Now()
 			var out toolOutcome
 			if tool.local && toolExecRelay != nil {
-				out = toolExecRelay(ctx, step+1, tc.Function.Name, tc.Function.Arguments)
+				out = toolExecRelay(roundCtx, step+1, tc.Function.Name, tc.Function.Arguments)
 			} else if !tool.local {
 				out = tool.execute(ctx, tc.Function.Arguments)
 			} else {
@@ -862,11 +892,24 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 					emitQuestions(*out.clarify)
 				}
 				emitPhase("clarifying")
+				roundCancel()
 				return nil
 			}
 			messages = append(messages, toolResultMsg(tc, capObservation(out.observation, agentObsMaxChars), out.isError))
 		}
+		roundCancel()
+		if setRoundCancel != nil {
+			setRoundCancel(nil)
+		}
 		step++
+		// Pause check after the round's tools completed and the step counter
+		// advanced: the transcript is consistent (every tool call has its result)
+		// and no relay is in flight, so this is the clean checkpoint point. step
+		// now equals the number of completed rounds, so a resumed run starting
+		// at it continues on exactly the remaining budget.
+		if pauseRequested != nil && pauseRequested() {
+			return &pausedError{transcript: messages, step: step}
+		}
 	}
 	// Step budget exhausted: force one final answer with tools removed so the
 	// model must synthesize. Routed through the backend so a server backend

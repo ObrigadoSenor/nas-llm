@@ -411,6 +411,10 @@ type jobState struct {
 	Questions *clarifyMeta  `json:"questions,omitempty"`
 	Steps     []agentStep   `json:"steps,omitempty"`
 	Thoughts  []string      `json:"thoughts,omitempty"`
+	// PausedStep is set when Status == "paused": the step index the run paused
+	// at, read from the agent_checkpoints row so /job and /api/jobs/active can
+	// surface "paused at step N" and a resume can continue on the remaining budget.
+	PausedStep int `json:"pausedStep,omitempty"`
 }
 
 func jobStateFrom(j *job) jobState {
@@ -422,7 +426,13 @@ func jobStateFrom(j *job) jobState {
 	if cq != nil {
 		content = clarifyAsContent(cq)
 	}
-	return jobState{ID: j.id, Status: st, Content: content, Error: errMsg, WebSearch: j.webSearch, Clarify: cq != nil, Agent: j.agent, CreatedAt: j.createdAt, Searches: j.searchSnapshot(), Questions: cq, Steps: j.stepSnapshot(), Thoughts: j.thoughtSnapshot()}
+	s := jobState{ID: j.id, Status: st, Content: content, Error: errMsg, WebSearch: j.webSearch, Clarify: cq != nil, Agent: j.agent, CreatedAt: j.createdAt, Searches: j.searchSnapshot(), Questions: cq, Steps: j.stepSnapshot(), Thoughts: j.thoughtSnapshot()}
+	if st == "paused" {
+		j.mu.Lock()
+		s.PausedStep = j.pausedStep
+		j.mu.Unlock()
+	}
+	return s
 }
 
 // handleGenerate persists the user's turn and enqueues a detached background
@@ -515,10 +525,19 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleJob reports the conversation's active job + partial content (for first
-// paint after a reload/reconnect). 204 when no job is active.
+// paint after a reload/reconnect). 204 when no job is active — except a paused
+// agent run, which has no live job but a checkpoint: surface a synthetic
+// "paused" state (with the checkpoint's step) so a reload/chat-switch/backend-
+// restart still offers the Resume affordance.
 func (s *server) handleJob(w http.ResponseWriter, r *http.Request) {
-	j := s.jobs.get(r.PathValue("id"))
-	if j == nil || j.email != emailFrom(r) {
+	convID := r.PathValue("id")
+	email := emailFrom(r)
+	j := s.jobs.get(convID)
+	if j == nil || j.email != email {
+		if cp, err := s.store.loadCheckpoint(email, convID); err == nil && cp != nil {
+			writeJSON(w, jobState{Status: "paused", Agent: true, PausedStep: cp.Step, CreatedAt: cp.CreatedAt})
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -534,6 +553,77 @@ func (s *server) handleCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]string{"status": "cancelled"})
+}
+
+// handlePause pauses the conversation's active agent run between steps. 404 if
+// there is no in-flight agent job (a plain chat/search/clarify run is not
+// pausable — there is nothing to resume). The worker checkpoints the
+// transcript and finalizes the job "paused"; subscribers see a terminal "done".
+func (s *server) handlePause(w http.ResponseWriter, r *http.Request) {
+	if !s.jobs.pause(r.PathValue("id"), emailFrom(r)) {
+		jsonError(w, "no active agent run to pause", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, map[string]string{"status": "pausing"})
+}
+
+// handleResume continues a paused agent run from its checkpoint. An optional
+// {note} is appended as a user turn (to both the conversation history and the
+// rehydrated transcript) so the user can steer the resumed run. 404 if there is
+// no checkpoint to resume; 409 if a job is already active for the conversation.
+func (s *server) handleResume(w http.ResponseWriter, r *http.Request) {
+	convID := r.PathValue("id")
+	email := emailFrom(r)
+	cp, err := s.store.loadCheckpoint(email, convID)
+	if err != nil {
+		log.Printf("loadCheckpoint: %v", err)
+		jsonError(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	if cp == nil {
+		jsonError(w, "no paused run to resume", http.StatusNotFound)
+		return
+	}
+	var body struct {
+		Note string `json:"note"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body) // best-effort; note is optional
+	if note := strings.TrimSpace(body.Note); note != "" {
+		if c, err := s.store.getConversation(email, convID); err == nil && c != nil {
+			msgs := append(c.Messages, Message{Role: "user", Content: note, Ts: time.Now().UnixMilli()})
+			_ = s.store.updateConversationMessages(email, convID, cp.Model, msgs)
+		}
+	}
+	if existing := s.jobs.get(convID); existing != nil {
+		w.WriteHeader(http.StatusConflict)
+		writeJSON(w, jobStateFrom(existing))
+		return
+	}
+	j := newJob(convID, email, cp.Model, false, false, true) // agent=true, resume
+	j.local = cp.Local
+	j.supportsTools = cp.SupportsTools
+	j.hub = s.hub
+	j.resuming = true
+	j.resumeNote = body.Note
+	c, _ := s.store.getConversation(email, convID)
+	if c != nil {
+		j.needsBrowser = cp.Local || c.RepoID != ""
+	} else {
+		j.needsBrowser = cp.Local
+	}
+	if err := s.jobs.enqueue(j); err != nil {
+		if errors.Is(err, errJobActive) {
+			if existing := s.jobs.get(convID); existing != nil {
+				w.WriteHeader(http.StatusConflict)
+				writeJSON(w, jobStateFrom(existing))
+				return
+			}
+		}
+		log.Printf("enqueue: %v", err)
+		jsonError(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, jobStateFrom(j))
 }
 
 // handleActiveJobs returns {conversationID: status} for the caller's active

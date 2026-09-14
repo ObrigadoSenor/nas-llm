@@ -272,6 +272,8 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /api/conversations/{id}/generate", s.requireAuth(s.handleGenerate))
 	mux.HandleFunc("POST /api/conversations/{id}/model-response", s.requireAuth(s.handleModelResponse))
 	mux.HandleFunc("POST /api/conversations/{id}/cancel", s.requireAuth(s.handleCancel))
+	mux.HandleFunc("POST /api/conversations/{id}/pause", s.requireAuth(s.handlePause))
+	mux.HandleFunc("POST /api/conversations/{id}/resume", s.requireAuth(s.handleResume))
 	mux.HandleFunc("GET /api/conversations/{id}/events", s.requireAuth(s.handleEvents))
 	mux.HandleFunc("GET /api/conversations/{id}/job", s.requireAuth(s.handleJob))
 	mux.HandleFunc("GET /api/folders", s.requireAuth(s.handleListFolders))

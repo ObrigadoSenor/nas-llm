@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -297,7 +298,7 @@ func TestAgentNarrationGuard(t *testing.T) {
 		err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
 			func(string) {}, func(p string) { phases = append(phases, p) },
 			func(st agentStep) { steps = append(steps, st) }, func(clarifyMeta) {},
-			func(s string) { thoughts = append(thoughts, s) }, func() {}, func(int, int) {}, "", nil)
+			func(s string) { thoughts = append(thoughts, s) }, func() {}, func(int, int) {}, "", nil, nil, nil, 0)
 		if err != nil {
 			t.Fatalf("runAgentLoop: %v", err)
 		}
@@ -342,7 +343,7 @@ func TestAgentNarrationGuard(t *testing.T) {
 		var steps []agentStep
 		err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
 			func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
-			func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil)
+			func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0)
 		if err != nil {
 			t.Fatalf("runAgentLoop: %v", err)
 		}
@@ -374,7 +375,7 @@ func TestAgentNarrationGuard(t *testing.T) {
 		)
 		err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
 			func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
-			func(clarifyMeta) {}, func(s string) { thoughts = append(thoughts, s) }, func() {}, func(int, int) {}, "", nil)
+			func(clarifyMeta) {}, func(s string) { thoughts = append(thoughts, s) }, func() {}, func(int, int) {}, "", nil, nil, nil, 0)
 		if err != nil {
 			t.Fatalf("runAgentLoop: %v", err)
 		}
@@ -429,7 +430,7 @@ func TestAgentProseToolCallRecovery(t *testing.T) {
 		)
 		err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
 			func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
-			func(clarifyMeta) {}, func(s string) { thoughts = append(thoughts, s) }, func() {}, func(int, int) {}, "", nil)
+			func(clarifyMeta) {}, func(s string) { thoughts = append(thoughts, s) }, func() {}, func(int, int) {}, "", nil, nil, nil, 0)
 		if err != nil {
 			t.Fatalf("runAgentLoop: %v", err)
 		}
@@ -480,7 +481,7 @@ func TestAgentProseToolCallRecovery(t *testing.T) {
 		var steps []agentStep
 		err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
 			func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
-			func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil)
+			func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0)
 		if err != nil {
 			t.Fatalf("runAgentLoop: %v", err)
 		}
@@ -536,7 +537,7 @@ func TestAgentAwaitingToolResultFallback(t *testing.T) {
 			func(s string) { thoughts = append(thoughts, s) },
 			func() {},
 			func(int, int) {},
-			"", nil)
+			"", nil, nil, nil, 0)
 		if err != nil {
 			t.Fatalf("runAgentLoop: %v", err)
 		}
@@ -595,7 +596,7 @@ func TestAgentAwaitingToolResultFallback(t *testing.T) {
 			func(string) {}, func(string) {},
 			func(st agentStep) { steps = append(steps, st) },
 			func(c clarifyMeta) { questions = append(questions, c) },
-			func(string) {}, func() {}, func(int, int) {}, "", nil)
+			func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0)
 		if err != nil {
 			t.Fatalf("runAgentLoop: %v", err)
 		}
@@ -809,7 +810,7 @@ func TestAgentBudgetWarning80Percent(t *testing.T) {
 	var steps []agentStep
 	err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
 		func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
-		func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil)
+		func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0)
 	if err != nil {
 		t.Fatalf("runAgentLoop: %v", err)
 	}
@@ -874,7 +875,7 @@ func TestAgentNarrationRetryDoesNotConsumeStep(t *testing.T) {
 	var steps []agentStep
 	err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
 		func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
-		func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil)
+		func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0)
 	if err != nil {
 		t.Fatalf("runAgentLoop: %v", err)
 	}
@@ -932,5 +933,145 @@ func TestLocalRepoToolsContainsGitLogAndListPrs(t *testing.T) {
 		if !tool.local {
 			t.Errorf("%s must be a local (sidecar-relayed) tool, got local=false", name)
 		}
+	}
+}
+
+// TestAgentPauseReturnsCheckpoint verifies the pause path: when pauseRequested
+// turns true after a round's tools complete, runAgentLoop returns
+// errAgentPaused carrying the transcript and the step index (the number of
+// completed rounds), so the worker can write a checkpoint and a later resume
+// can rehydrate the conversation and continue on the remaining budget. No tool
+// relay is left in flight because the check fires between steps.
+func TestAgentPauseReturnsCheckpoint(t *testing.T) {
+	const email = "user@example.com"
+	msgs := []oaiMessage{{Role: "user", Content: jsonString("Add a comment to foo.go")}}
+	st, err := newStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	defer st.close()
+	srv := &server{cfg: config{contextLength: 8192, maxAgentSteps: 10}, store: st}
+
+	mb := &fakeBackend{responses: []oaiMessage{
+		toolCallMsg("c1", "get_time", "{}"), // round 1 runs
+		toolCallMsg("c2", "get_time", "{}"), // would be round 2 (never reached)
+		finalAnswerMsg("done"),
+	}}
+	checks := 0
+	pauseRequested := func() bool {
+		checks++
+		// false for the top-of-loop check (checks=1); true on the after-tools
+		// check (checks=2) so the pause is detected once round 1 completes.
+		return checks > 1
+	}
+	err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
+		func(string) {}, func(string) {}, func(st agentStep) {},
+		func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {},
+		"", nil, pauseRequested, nil, 0)
+	if !errors.Is(err, errAgentPaused) {
+		t.Fatalf("err = %v, want errAgentPaused", err)
+	}
+	pe, ok := err.(*pausedError)
+	if !ok {
+		t.Fatalf("err is not *pausedError: %T", err)
+	}
+	// One round completed (step 0 -> 1), so the checkpoint step is 1; a
+	// resumed run starting at step 1 continues on the remaining budget.
+	if pe.step != 1 {
+		t.Errorf("paused step = %d, want 1", pe.step)
+	}
+	if mb.callCount() != 1 {
+		t.Errorf("model calls = %d, want 1 (only the pre-pause round ran)", mb.callCount())
+	}
+	if len(pe.transcript) < 4 {
+		t.Errorf("paused transcript has %d messages, want at least 4 (system + user + assistant + tool result)", len(pe.transcript))
+	}
+	last := pe.transcript[len(pe.transcript)-1]
+	if last.Role != "tool" || !strings.Contains(contentText(last.Content), "Current date") {
+		t.Errorf("last transcript message = %+v, want the get_time tool result", last)
+	}
+}
+
+// TestCheckpointRoundTrip exercises save/load/delete on agent_checkpoints,
+// including the upsert (a second pause overwrites the first) and that the
+// transcript (an []oaiMessage) round-trips through JSON.
+func TestCheckpointRoundTrip(t *testing.T) {
+	st, err := newStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	defer st.close()
+	const email = "user@example.com"
+	convID := "conv-cp"
+	cp := agentCheckpoint{
+		JobID: "job1", ConvID: convID, Email: email, Step: 3,
+		Transcript: []oaiMessage{{Role: "system", Content: jsonString("sys")}, {Role: "user", Content: jsonString("hi")}},
+		Model:      "test-model", Local: true, SupportsTools: true, CreatedAt: 12345,
+	}
+	if err := st.saveCheckpoint(cp); err != nil {
+		t.Fatalf("saveCheckpoint: %v", err)
+	}
+	loaded, err := st.loadCheckpoint(email, convID)
+	if err != nil || loaded == nil {
+		t.Fatalf("loadCheckpoint: err=%v loaded=%v", err, loaded)
+	}
+	if loaded.Step != 3 || loaded.Model != "test-model" || !loaded.Local || !loaded.SupportsTools {
+		t.Errorf("loaded = %+v, want step 3 / model test-model / local / supportsTools", loaded)
+	}
+	if len(loaded.Transcript) != 2 || contentText(loaded.Transcript[1].Content) != "hi" {
+		t.Errorf("loaded transcript = %+v, want 2 messages with hi", loaded.Transcript)
+	}
+	// A second save upserts over the first (a re-pause replaces the checkpoint).
+	cp2 := cp
+	cp2.Step = 5
+	if err := st.saveCheckpoint(cp2); err != nil {
+		t.Fatalf("saveCheckpoint2: %v", err)
+	}
+	loaded2, _ := st.loadCheckpoint(email, convID)
+	if loaded2 == nil || loaded2.Step != 5 {
+		t.Errorf("upserted checkpoint step = %v, want 5", loaded2)
+	}
+	if err := st.deleteCheckpoint(email, convID); err != nil {
+		t.Fatalf("deleteCheckpoint: %v", err)
+	}
+	gone, _ := st.loadCheckpoint(email, convID)
+	if gone != nil {
+		t.Errorf("checkpoint still present after delete")
+	}
+}
+
+// TestReconcileJobsLeavesPausedAlone guards restart-safety: reconcileJobs only
+// errors queued/generating jobs, so a paused job (whose in-memory state died
+// with the process) is still resumable from its checkpoint after a backend
+// restart.
+func TestReconcileJobsLeavesPausedAlone(t *testing.T) {
+	st, err := newStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	defer st.close()
+	const email = "user@example.com"
+	now := time.Now().UnixMilli()
+	// Insert a paused job (should survive reconcile) and a generating job (should
+	// be errored by reconcile) after newStore's initial reconcile ran.
+	_, err = st.db.Exec(`INSERT INTO jobs(id, conversation_id, email, status, model, created_at) VALUES(?, ?, ?, 'paused', ?, ?)`, "j-pause", "c1", email, "m", now)
+	if err != nil {
+		t.Fatalf("insert paused: %v", err)
+	}
+	_, err = st.db.Exec(`INSERT INTO jobs(id, conversation_id, email, status, model, created_at) VALUES(?, ?, ?, 'generating', ?, ?)`, "j-gen", "c2", email, "m", now)
+	if err != nil {
+		t.Fatalf("insert generating: %v", err)
+	}
+	if err := reconcileJobs(st.db); err != nil {
+		t.Fatalf("reconcileJobs: %v", err)
+	}
+	var pausedStatus, genStatus string
+	_ = st.db.QueryRow(`SELECT status FROM jobs WHERE id = ?`, "j-pause").Scan(&pausedStatus)
+	_ = st.db.QueryRow(`SELECT status FROM jobs WHERE id = ?`, "j-gen").Scan(&genStatus)
+	if pausedStatus != "paused" {
+		t.Errorf("paused job status = %q, want paused — reconcile must not touch it", pausedStatus)
+	}
+	if genStatus != "error" {
+		t.Errorf("generating job status = %q, want error", genStatus)
 	}
 }

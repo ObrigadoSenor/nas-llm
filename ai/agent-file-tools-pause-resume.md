@@ -108,54 +108,54 @@ Section 3 of the spec.
   containing `git_log`/`list_prs`.
 - [x] Validated: `make check` clean.
 
-## Phase 3 — Pause and resume 🚧
+## Phase 3 — Pause and resume ✅
 
 Section 4 of the spec. Checkpointing applies to agent-mode runs only; plain
 chat, search, and clarify turns keep the existing Stop behaviour.
 
-- [ ] Backend `jobs.go`: `pauseRequested` on `job` + a `roundCancel
+- [x] Backend `jobs.go`: `pauseRequested` on `job` + a `roundCancel
   context.CancelFunc`; `pause()` sets the flag and cancels the current round's
   child context so pause takes effect within seconds, not after a full
   inference round. The partial round is discarded.
-- [ ] Backend `agent.go`: `runAgentLoop` derives a per-round child ctx, stores
+- [x] Backend `agent.go`: `runAgentLoop` derives a per-round child ctx, stores
   `roundCancel` on the job under `j.mu`, checks `pauseRequested` at the top of
   each iteration and after each tool result, and on pause returns a sentinel
   `errAgentPaused` carrying the transcript and step index. Pausing between
   steps means no tool relay is ever left in flight.
-- [ ] Backend `store.go`: new `agent_checkpoints(job_id, conversation_id,
+- [x] Backend `store.go`: new `agent_checkpoints(job_id, conversation_id,
   email, step, transcript, model, created_at)` table + `migrate` guard;
   `saveCheckpoint`/`loadCheckpoint`/`deleteCheckpoint`. `transcript` is the
   JSON `[]oaiMessage` list.
-- [ ] Backend `jobs.go` worker: on `errAgentPaused`, persist the checkpoint,
+- [x] Backend `jobs.go` worker: on `errAgentPaused`, persist the checkpoint,
   persist the partial assistant message (with steps + thoughts), finalize the
   job `paused`, and `notifyPaused` (terminal SSE `done` carrying
   `status:paused` via the hub). `reconcileJobs` is unchanged — `paused` rows
   are untouched, so a paused run is still resumable after a backend restart.
-- [ ] Backend routes: `POST /api/conversations/{id}/pause` → `handlePause`;
+- [x] Backend routes: `POST /api/conversations/{id}/pause` → `handlePause`;
   `POST /api/conversations/{id}/resume` → `handleResume` (optional note
   appended as a user turn). `GET /api/conversations/{id}/job` and
   `GET /api/jobs/active` expose the `paused` status and the checkpoint's step
   index.
-- [ ] Backend `runGeneration` resume path: rehydrates the transcript, rebuilds
+- [x] Backend `runGeneration` resume path: rehydrates the transcript, rebuilds
   the system prompt from scratch (date/repo/branch current), continues on the
   remaining step budget, deletes the checkpoint once the run finishes cleanly.
-- [ ] Backend tests: checkpoint round-trip + resume rehydration; pause
+- [x] Backend tests: checkpoint round-trip + resume rehydration; pause
   requested during a tool round (relay not left in flight); `reconcileJobs`
   leaves `paused` alone.
-- [ ] Frontend `www/app.js` + `www/lib.js`: while an agent job runs the Stop
+- [x] Frontend `www/app.js` + `www/lib.js`: while an agent job runs the Stop
   control gains a Pause action; Pause POSTs `/pause`; the bubble switches to a
   paused phase showing "Paused at step N" with a Resume button. `tailJob`
   learns the `paused` terminal status; `finishJob` and the sidebar show a
   paused badge instead of a spinner. On load a conversation whose newest
   assistant turn has a live checkpoint renders the Resume affordance (survives
   reload, chat switch, backend restart).
-- [ ] Frontend: `pause` icon in `lib.js` ICONS; cache-bust `app.js?v=N`,
+- [x] Frontend: `pause` icon in `lib.js` ICONS; cache-bust `app.js?v=N`,
   `lib.js?v=N` in the `app.js:3` import (and `styles.css?v=N` if CSS touched)
   in `www/index.html`.
-- [ ] Docs: `www/AGENTS.md` (new routes + `paused` SSE status),
+- [x] Docs: `www/AGENTS.md` (new routes + `paused` SSE status),
   `backend/AGENTS.md` (new table + routes + pause/resume lifecycle).
-- [ ] Validated: `make check` clean.
-- [ ] Manual pass (desktop app): a long run paused mid-way and resumed after an
+- [x] Validated: `make check` clean.
+- [x] Manual pass (desktop app): a long run paused mid-way and resumed after an
   app reload.
 
 ## Implementation order
