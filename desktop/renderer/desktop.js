@@ -66,6 +66,20 @@ function el(tag, cls, text) {
 (function installToolExecShim() {
   const OrigES = window.EventSource;
   if (!OrigES) return;
+  // The backend broadcasts each toolExec to BOTH the job's per-conversation
+  // tail AND the owner's global /api/events hub, so a foreground agent chat's
+  // file-tool call arrives on two EventSources at once. Without dedupe the
+  // shim would run runToolExec twice for the same call — two sidecar execs
+  // and, for write tools (apply_patch/run_command/git_*/create_pr), two
+  // approval dialogs for one call. Whichever dialog the user acted on second
+  // delivered a spurious "user rejected" observation and stalled the agent
+  // (the "they cancel out and don't reply" symptom). Keyed by jobId+step
+  // (jobId is globally unique; step identifies the call within the run) and
+  // held for the life of runToolExec so a reconnect-replay while an approval
+  // is still pending doesn't start a second run either. Checked synchronously
+  // before the first await so the second listener (a separate dispatch) sees
+  // the key already set and skips.
+  const inFlightToolExec = new Set();
   function patched(url) {
     const es = new OrigES(url);
     // Extract the conversation ID from the /api/conversations/:id/events URL,
@@ -75,13 +89,17 @@ function el(tag, cls, text) {
     es.addEventListener("toolExec", async (e) => {
       let d = {}; try { d = JSON.parse(e.data); } catch { return; }
       if (!d.jobId || !d.tool) return;
+      const key = d.jobId + ":" + (d.step ?? 0);
+      if (inFlightToolExec.has(key)) return;   // another stream already picked this round up
+      inFlightToolExec.add(key);
       // The global /api/events stream (multiple concurrent chats) tags every
       // payload with convId; fall back to the id parsed from the per-conv
       // stream's URL. toolExec is owned exclusively by this shim — never by
       // www/app.js — so this is the only path a background chat's tool calls
       // get routed correctly, whichever stream they arrive on.
       const convId = d.convId || urlConvId;
-      await runToolExec(convId, d);
+      try { await runToolExec(convId, d); }
+      finally { inFlightToolExec.delete(key); }
     });
     return es;
   }
