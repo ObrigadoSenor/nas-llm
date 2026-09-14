@@ -185,22 +185,29 @@ connected repo is a workspace with **Pull**, **Ship** (versioned release), and
 
 **+ New chat** starts an agent work session against that repo on its **own
 branch** so `main` is never dirtied:
-- The sidecar provisions a **git worktree** for a fresh `agent/<repo>-<id>`
-branch (cut from the repo's default branch) and stores `repo_branch` on the
-conversation. Your repo folder is left exactly as it is — same branch, same
-uncommitted work — because the chat gets its own directory. The `<id>` suffix is
-a slice of the conversation id, so two chats on one repo never collide. If
-provisioning fails you get the git error and a choice to continue on the repo
-folder's current branch instead — nothing is forced.
+- The sidecar cuts a fresh `agent/<repo>-<id>` branch from the repo's default
+  branch and stores `repo_branch` on the conversation. No git worktree is
+  provisioned upfront — a new chat is just a branch from main. When the repo
+  folder is clean the folder is switched onto that branch (so the chat's tools
+  run there directly); when the folder is dirty the branch is created without
+  switching, and the chat's tool calls lazily provision an **isolated git
+  worktree** — so another chat's or your uncommitted edits are never carried
+  onto the new branch, and two chats on two branches stay isolated. The `<id>`
+  suffix is a slice of the conversation id, so two chats on one repo never
+  collide. The new chat appears under its repo in the sidebar the moment it's
+  created (the dropdown auto-expands), not only after you send the first
+  message. If branch creation fails you get the git error and a choice to
+  continue on the repo folder's current branch instead — nothing is forced.
 - The chat is titled `owner/repo (agent <id>)` with that same `<id>`, so chats on
-one repo are tellable apart in the sidebar — and so the approval dialog and the
-completion notification, which both name the chat, actually identify it. Rename
-it whenever you like; a rename sticks and nothing overwrites it.
+  one repo are tellable apart in the sidebar — and so the approval dialog and the
+  completion notification, which both name the chat, actually identify it. The
+  chat you're viewing is highlighted in the sidebar repo dropdown. Rename it
+  whenever you like; a rename sticks and nothing overwrites it.
 - A small **status line** below the input field shows the repo, branch, and git
-state (`owner/repo · ⎇ branch · ●N dirty · ↑a ↓b`, plus `no remote` when there
-isn't one) while a repo-bound chat is open — polled every few seconds and
-refreshed after each tool call. Click it to open the **session panel**; click
-the **⎇ branch chip** to change which branch this chat works on.
+  state (`owner/repo · ⎇ branch · ●N dirty · ↑a ↓b`, plus `no remote` when there
+  isn't one) while a repo-bound chat is open — polled every few seconds and
+  refreshed after each tool call. Click it to open the **session panel**; click
+  the **⎇ branch chip** to change which branch this chat works on.
 - Agent edits arrive as `apply_patch`/`run_command` calls, each shown in an
 approval dialog prefixed with the asking chat and `tool → owner/repo @ branch`,
 so you see which chat wants to write and where before approving. Approvals from
@@ -243,21 +250,24 @@ Each chat is pinned to a branch (`repo_branch`), and every tool call it makes is
 executed against **that** branch — not whatever the repo happens to be on:
 
 - If the chat's branch is the one checked out in the repo folder, tools run
-  there, exactly as before.
-- Otherwise the sidecar provisions a **git worktree** for that branch under
-  `<app-data>/nas-llm-desktop/worktrees/<repo>/<branch>` and runs there. Git
-  allows a branch in at most one worktree, which is what keeps two chats on two
-  branches from treading on each other.
+  there, exactly as before — no worktree is involved.
+- Otherwise the sidecar lazily provisions a **git worktree** for that branch
+  under `<app-data>/nas-llm-desktop/worktrees/<repo>/<branch>` and runs there.
+  Git allows a branch in at most one worktree, which is what keeps two chats on
+  two branches from treading on each other. This happens on the first tool call
+  that needs it, not when the chat is created.
 - Change a chat's branch any time with the **⎇ chip** under the input: pick an
-  existing branch or create a new one. It provisions the worktree and re-points
-  the chat in one step.
+  existing branch or create a new one. A clean folder is switched onto the
+  chosen branch; a dirty folder is left untouched and the chat runs in an
+  isolated worktree instead, so other chats' branches are never disturbed.
 - The per-repo **⋯ → Branch…** picker is unchanged and still switches the repo
   folder itself — that is the tree you have open in your editor.
 
-**Worktrees start clean.** A newly created worktree contains tracked files only:
-no `node_modules`, no `.env`, no build caches. The first `run_command` on a new
-branch may need an install step. Remove ones you are done with via
-`git worktree remove <path>` (or `git worktree prune` after deleting by hand).
+**Isolated worktrees start clean.** A worktree created for a dirty-folder chat
+contains tracked files only: no `node_modules`, no `.env`, no build caches. The
+first `run_command` in it may need an install step. Remove ones you are done
+with via `git worktree remove <path>` (or `git worktree prune` after deleting by
+hand).
 
 **Chats created before this change** share one `agent/<slug-of-title>` branch,
 because the old naming derived from the chat title and every chat on a repo was

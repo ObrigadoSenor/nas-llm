@@ -314,14 +314,14 @@ async fn index_html(State(st): State<AppState>) -> Response {
             if !html.contains("/__sidecar/desktop.css") {
                 html = html.replacen(
                     "</head>",
-                    "<link rel=\"stylesheet\" href=\"/__sidecar/desktop.css?v=18\">\n</head>",
+                    "<link rel=\"stylesheet\" href=\"/__sidecar/desktop.css?v=19\">\n</head>",
                     1,
                 );
             }
             if !html.contains("/__sidecar/desktop.js") {
                 html = html.replacen(
                     "</body>",
-                    "<script type=\"module\" src=\"/__sidecar/desktop.js?v=23\"></script>\n</body>",
+                    "<script type=\"module\" src=\"/__sidecar/desktop.js?v=24\"></script>\n</body>",
                     1,
                 );
             }

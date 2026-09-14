@@ -425,6 +425,7 @@ async function logout(){
   notifiedJobIds.clear(); stoppedByUser.clear(); finishedIds=new Set();
   try{ await fetch("/api/auth/logout",{method:"POST"}); }catch{}
   me=null; activeId=null; messages=[]; conversations=[]; selectedModel="";
+  try{ window.dispatchEvent(new CustomEvent("nasllm:activeConv",{detail:null})); }catch{}
   showLogin(); renderSend();
 }
 $("logout").addEventListener("click", logout);
@@ -969,6 +970,11 @@ async function openConversation(id){
     if(!r.ok) return;
     const c=await r.json();
     activeId=c.id; messages=c.messages||[];
+    // Tell the desktop bridge which chat is now active so it can highlight it
+    // in the repo sidebar and bind the branch rail to a repo-bound chat
+    // (repo chats are filtered out of #convList, so the DOM-only signal the
+    // bridge used before can't see them). No-op on the plain web UI.
+    try{ window.dispatchEvent(new CustomEvent("nasllm:activeConv",{detail:c.id})); }catch{}
     histIndex=inputHistory.length; draft="";
     if(models.includes(c.model)) selectedModel=c.model;
     syncVision();
@@ -1402,6 +1408,7 @@ async function onGenerationDone(convId){
 function newChat(){
   closeTail(); activeJobConvId=null; renderSend();
   activeId=null; messages=[]; chat.innerHTML=""; histIndex=inputHistory.length; draft="";
+  try{ window.dispatchEvent(new CustomEvent("nasllm:activeConv",{detail:null})); }catch{}
   pendingImages=[]; renderImgPills();
   renderSidebar(); updateHeader(); input.focus();
 }

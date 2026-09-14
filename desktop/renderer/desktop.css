@@ -253,6 +253,11 @@
   padding: 5px 8px; border-radius: 6px; cursor: pointer;
 }
 .ds-repo-chat:hover { background: #1b1f27; }
+/* Active chat in the repo dropdown (mirrors #convList .conv.active) so the
+   chat you're viewing is highlighted under its repo. */
+.ds-repo-chat.active { background: #1a2436; }
+.ds-repo-chat.active .ds-repo-chat-title { color: #8ab4f8; }
+.ds-repo-chat.active:hover { background: #1f2a40; }
 .ds-repo-chat-title { flex: 1; min-width: 0; font-size: 12px; color: #c7ccd4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ds-repo-chat-time { font-size: 10px; color: #6b707a; }
 /* Per-chat delete button: borderless icon, subtle until hovered, red on hover. */

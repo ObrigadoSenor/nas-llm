@@ -406,7 +406,7 @@ async function runToolExec(convId, d) {
   // A write tool may have changed the working tree — refresh the branch rail,
   // but only when it's for the chat currently on screen; a background chat's
   // tool call shouldn't repaint the foreground rail with unrelated state.
-  if (!convId || convId === activeConvIdFromDOM()) refreshRailState();
+  if (!convId || convId === getActiveConvId()) refreshRailState();
 }
 
 // showApprovalDialog returns a Promise<boolean> — true if the user clicks
@@ -610,7 +610,7 @@ async function ensureNotifyPermission() {
 function isConvOnScreen(convId) {
   if (!convId) return false;
   if (document.visibilityState !== "visible" || !document.hasFocus()) return false;
-  return activeConvIdFromDOM() === convId;
+  return getActiveConvId() === convId;
 }
 
 window.addEventListener("nasllm:jobDone", async (e) => {
@@ -829,11 +829,13 @@ async function ensureWorkspaceFolder(name) {
 }
 
 // --- Branch rail + no-reload navigation (desktop-only) ---
-// The active conversation's id is owned by app.js (module-private). We detect
-// it from the sidebar DOM: app.js marks the active conv row with `.active` and
-// gives its title element id `ct-<convId>` (renderConv in app.js). A
-// MutationObserver on #convList + the `nasllm:openConv` event tell us when to
-// re-derive it. The rail then polls /__sidecar/repos/state for the bound repo.
+// The active conversation's id is owned by app.js (module-private). app.js
+// announces it via the `nasllm:activeConv` event (dispatched by
+// openConversation/newChat), which we capture in activeConvId below. A
+// MutationObserver on #convList + the `nasllm:openConv` event are kept as
+// fallbacks/re-triggers. The rail then polls /__sidecar/repos/state for the
+// bound repo. Repo-bound chats are filtered out of #convList, so activeConvId
+// (not activeConvIdFromDOM) is what makes the rail bind to a repo chat.
 let railRepo = null;       // full_name of the repo the active repo-bound chat is on
 let railState = null;      // last repos/state result for railRepo
 let railConvId = null;     // id of the active conversation the rail is bound to
@@ -874,6 +876,16 @@ function activeConvIdFromDOM() {
   if (!t || !t.id) return null;
   return t.id.slice(3);
 }
+
+// activeConvId is the active conversation id, tracked from app.js's
+// `nasllm:activeConv` event (dispatched by openConversation/newChat). Repo-bound
+// chats are filtered OUT of #convList (renderSidebar skips c.repoId when the
+// desktop repo sidebar is present), so activeConvIdFromDOM() — which reads
+// #convList's .conv.active row — returns null for them. activeConvId is the
+// reliable source for every chat, repo-bound or not; activeConvIdFromDOM()
+// stays as a boot fallback before app.js has announced anything.
+let activeConvId = null;
+function getActiveConvId() { return activeConvId || activeConvIdFromDOM(); }
 
 // Resolve the branch for a repo: prefer the ACTIVE CHAT's own branch (its
 // worktree) when this is the rail's bound repo — that's the isolation unit,
@@ -1007,7 +1019,7 @@ async function actualSyncBranchRail() {
   railSyncTimer = null;
   const app = $("app");
   if (!app || app.classList.contains("hidden")) { hideBranchRail(); return; }
-  const convId = activeConvIdFromDOM();
+  const convId = getActiveConvId();
   if (!convId) { hideBranchRail(); return; }
   let conv = railMaps.convById.get(convId);
   if (!conv) { await loadWorkspaceMaps(); conv = railMaps.convById.get(convId); }
@@ -1023,9 +1035,10 @@ async function actualSyncBranchRail() {
   renderComposerStatus();
 }
 
-// Create a repo-bound agent chat in its own git worktree on its own branch,
-// place it in the workspace folder, enable agent mode with file + git tools,
-// and navigate to it without a full page reload. Reused by "+ New chat".
+// Create a repo-bound agent chat on its own branch cut from the repo's
+// default branch, place it in the workspace folder, enable agent mode with
+// file + git tools, and navigate to it without a full page reload. Reused by
+// "+ New chat".
 //
 // Order matters: we register the repo with the backend and confirm its id
 // BEFORE creating any conversation. If registration fails we surface the real
@@ -1088,40 +1101,42 @@ async function createRepoChat(r) {
   // the completion notification both identify a chat by its title, identical
   // titles actively cost you ("which chat wants to run this command?"). Tag
   // each chat with a short slice of its conversation id. The branch below uses
-  // the same slice, so a chat, its title, and its worktree all carry one handle
+  // the same slice, so a chat, its title, and its branch all carry one handle
   // you can match by eye.
   const shortId = String(convId).slice(0, 7);
   const title = fullName + " (agent " + shortId + ")";
 
-  // Give this chat its own branch in its own git worktree.
+  // Give this chat its own branch cut from the repo's default branch. No git
+  // worktree is provisioned upfront — a new chat is just a branch from main.
   //
-  // Two things matter here. First, the name must be unique per chat. Branch
-  // names used to come from a slug of the chat title, and since every chat on a
-  // repo shared one title, every chat shared ONE branch — "a branch per chat"
-  // was really a branch per repo. The conversation-id slice fixes that.
+  // The name must be unique per chat. Branch names used to come from a slug of
+  // the chat title, and since every chat on a repo shared one title, every chat
+  // shared ONE branch — "a branch per chat" was really a branch per repo. The
+  // conversation-id slice fixes that.
   //
-  // Second, we provision a worktree rather than `git switch`-ing the repo
-  // folder. Switching moved the branch of the checkout the user has open in
-  // their editor, and carried any uncommitted changes there onto the new
-  // branch. A worktree is a separate directory, so the repo folder is left
-  // exactly as it was and two chats can hold two branches at once.
+  // repos/create-branch switches the repo folder onto the new branch when the
+  // folder is clean (so this chat's tools run there directly), and creates the
+  // branch ref without switching when the folder is dirty (so another chat's /
+  // the user's uncommitted edits are never carried onto the new branch). In the
+  // dirty case this chat's tool calls lazily provision an isolated worktree via
+  // repos_exec, which keeps concurrent chats on different branches isolated.
   const shortName = (fullName.split("/").pop() || fullName);
   const branchName = "agent/" + slugifyTitle(shortName) + "-" + shortId;
   let branch = "";
   let branchErr = "";
   try {
-    const wr = await sid("repos/worktree", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: fullName, branch: branchName, create: true }) });
-    const wd = (wr && wr.data) || {};
-    if (wr.ok && wd.ok && wd.branch) branch = wd.branch;
-    else branchErr = wd.error || wr.status || "unknown error";
+    const cr = await sid("repos/create-branch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: fullName, branch: branchName }) });
+    const cd = (cr && cr.data) || {};
+    if (cr.ok && cd.ok && cd.branch) branch = cd.branch;
+    else branchErr = cd.error || cr.status || "unknown error";
   } catch (e) { branchErr = String((e && e.message) || e); }
 
   if (!branch) {
-    // Provisioning failed (unwritable worktrees dir, a stale directory git no
-    // longer tracks, a repo that moved). Surface the real git error and let the
-    // user fall back to the repo folder's current branch rather than silently
-    // landing the agent's edits somewhere they don't expect. Never force.
-    flashDsErr("Could not create this chat's worktree: " + branchErr);
+    // Branch creation failed (invalid name, a repo that moved, git refused).
+    // Surface the real git error and let the user fall back to the repo
+    // folder's current branch rather than silently landing the agent's edits
+    // somewhere they don't expect. Never force.
+    flashDsErr("Could not create this chat's branch: " + branchErr);
     const cont = await dsConfirm(
       "Continue on the repo's current branch instead?",
       "The agent's edits will land in the repo folder on whatever branch it has checked out, shared with anything else using it."
@@ -1150,12 +1165,15 @@ async function createRepoChat(r) {
     if (!extras.includes("agent")) { extras.push("agent"); localStorage.setItem("nas-llm-extras", JSON.stringify(extras)); }
     localStorage.setItem("nas-llm-conv", convId);
   } catch {}
-  // Navigate to the new chat without a full location.reload(): the app.js
-  // listener for `nasllm:openConv` runs the existing openConversation path.
-  // Refresh the repo dropdown first so the new chat appears under its repo
-  // immediately (refreshLocal re-fetches /api/conversations and re-renders
-  // the dropdown; the repo stays expanded via the persisted expandedRepos set).
-  refreshLocal();
+  // Expand the repo's dropdown so the new chat is visible immediately, then
+  // refresh the repo dropdown (re-fetches /api/conversations and re-renders)
+  // and sync app.js's conversation list before navigating. Awaiting
+  // refreshLocal here — instead of firing it and navigating straight away — is
+  // what makes the new chat appear under its repo the moment it's created,
+  // rather than only after the first message is typed.
+  if (!expandedRepos.has(fullName)) { expandedRepos.add(fullName); saveExpandedRepos(); }
+  await refreshLocal();
+  try { window.dispatchEvent(new CustomEvent("nasllm:refreshConvs")); } catch {}
   navigateToConv(convId);
 }
 
@@ -1346,13 +1364,15 @@ function slugifyTitle(title) {
   return slug || "chat";
 }
 
-// openChatBranchPicker lets the user move THIS CHAT (not the repo's shared
-// checkout) onto a different git worktree: pick an existing branch, or create
-// a new one (defaulting to agent/<slug of the chat title>, but editable).
-// Either path ends in POST /__sidecar/repos/worktree to ensure the worktree
-// exists, then PATCHes the conversation's repoBranch — the pair that makes
-// this chat's tools actually run in that tree (see runToolExec). Distinct
-// from openBranchPicker, which switches the repo's single shared checkout.
+// openChatBranchPicker lets the user re-point THIS CHAT at a different
+// branch: pick an existing branch, or create a new one (defaulting to
+// agent/<slug of the chat title>, but editable). A local/new branch goes
+// through repos/create-branch (switches the repo folder when clean, else
+// creates the branch for a lazy isolated worktree); a remote-only branch goes
+// through repos/checkout (tracking checkout). Either path then PATCHes the
+// conversation's repoBranch, which is what makes this chat's future tool calls
+// run on that branch (see runToolExec). Distinct from openBranchPicker, which
+// switches the repo's single shared checkout for the editor view.
 async function openChatBranchPicker(convId, repoName, currentBranch) {
   const title = await titleForConv(convId);
   let overlay = $("dsChatBranchOverlay");
@@ -1371,7 +1391,7 @@ async function openChatBranchPicker(convId, repoName, currentBranch) {
     card.appendChild(head);
     const sub = el("div", "ds-note"); sub.id = "dsChatBranchSub";
     card.appendChild(sub);
-    card.appendChild(el("div", "ds-note", "Each chat gets its own git worktree, isolated from other chats on this repo — switching here never touches another chat's branch."));
+    card.appendChild(el("div", "ds-note", "Switching moves the repo folder onto this chat's branch when it's clean. If the folder has uncommitted changes, the chat runs in its own isolated worktree instead, so other chats' branches are never touched."));
     card.appendChild(el("div", "ds-label", "Existing branches"));
     list = el("div", "ds-branch-list"); list.id = "dsChatBranchList";
     card.appendChild(list);
@@ -1381,7 +1401,7 @@ async function openChatBranchPicker(convId, repoName, currentBranch) {
     createBtn = el("button", "ds-btn", "Create & switch"); createBtn.id = "dsChatBranchCreateBtn";
     row.appendChild(newInput); row.appendChild(createBtn);
     card.appendChild(row);
-    card.appendChild(el("div", "ds-note", "A new worktree starts clean — no node_modules, .env, or build caches — so the first run may need an install step."));
+    card.appendChild(el("div", "ds-note", "A chat that runs in an isolated worktree starts clean — no node_modules, .env, or build caches — so its first run may need an install step."));
     const out = el("div", "ds-note"); out.id = "dsChatBranchOut";
     card.appendChild(out);
     overlay.appendChild(card);
@@ -1398,7 +1418,7 @@ async function openChatBranchPicker(convId, repoName, currentBranch) {
   const out = $("dsChatBranchOut"); if (out) out.textContent = "";
   newInput.value = "agent/" + slugifyTitle(title);
   overlay._ctx = { convId, repoName, currentBranch };
-  createBtn.onclick = () => switchChatBranch(overlay, newInput.value.trim(), true);
+  createBtn.onclick = () => switchChatBranch(overlay, newInput.value.trim(), false);
   list.innerHTML = "";
   list.appendChild(el("div", "ds-note", "Loading branches…"));
   overlay.classList.add("open");
@@ -1411,35 +1431,53 @@ async function openChatBranchPicker(convId, repoName, currentBranch) {
   branches.forEach((b) => {
     const bname = typeof b === "string" ? b : (b.name || "");
     if (!bname) return;
+    const isRemote = typeof b === "object" && !!b.remote;
     const isCur = bname === currentBranch;
     const row = el("div", "ds-branch-item" + (isCur ? " current" : ""));
-    row.title = isCur ? "This chat's current branch" : "Switch this chat to " + bname;
+    row.title = isCur ? "This chat's current branch" : (isRemote ? "Track & switch this chat to origin/" + bname : "Switch this chat to " + bname);
     row.appendChild(el("span", "ds-branch-name", bname));
     if (isCur) row.appendChild(el("span", "ds-branch-badge ds-branch-cur", "current"));
-    if (!isCur) row.onclick = () => switchChatBranch(overlay, bname, false);
+    else if (isRemote) row.appendChild(el("span", "ds-branch-badge ds-branch-remote", "remote"));
+    if (!isCur) row.onclick = () => switchChatBranch(overlay, bname, isRemote);
     list.appendChild(row);
   });
 }
 
-// Ensures the worktree exists (creating the branch too when `create`), then
-// PATCHes the conversation's repoBranch so runToolExec/branchForRepo pick it
-// up immediately — that PATCH, not the worktree itself, is what actually
-// isolates this chat's future tool calls.
-async function switchChatBranch(overlay, branchName, create) {
+// Re-points this chat at `branchName`. A remote-only branch is checked out with
+// `git checkout -t origin/<branch>` (repos/checkout); any other branch goes
+// through repos/create-branch, which switches the repo folder onto it when the
+// folder is clean, or creates the branch for a lazy isolated worktree when the
+// folder is dirty. Then PATCHes the conversation's repoBranch — that PATCH,
+// more than the switch, is what makes this chat's future tool calls run on the
+// new branch (see runToolExec).
+async function switchChatBranch(overlay, branchName, isRemote) {
   const out = $("dsChatBranchOut");
   if (!branchName) { if (out) out.textContent = "Enter a branch name."; return; }
   const ctx = overlay._ctx || {};
   const { convId, repoName } = ctx;
   if (!convId || !repoName) return;
-  if (out) out.textContent = create ? "Creating worktree…" : "Switching…";
-  const wr = await sid("repos/worktree", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: repoName, branch: branchName, create }) });
-  const wd = (wr && wr.data) || {};
-  if (!wr.ok || !wd.ok) { if (out) out.textContent = "Failed: " + (wd.error || wr.status || "unknown error"); return; }
-  const finalBranch = wd.branch || branchName;
+  if (out) out.textContent = isRemote ? "Tracking & switching…" : "Switching…";
+  let finalBranch = branchName;
+  let ok = false;
+  let err = "";
+  if (isRemote) {
+    const cr = await sid("repos/checkout", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repo: repoName, branch: branchName, remote: true }) });
+    const cd = (cr && cr.data) || {};
+    ok = !!(cr.ok && cd.ok);
+    finalBranch = cd.branch || branchName;
+    if (!ok) err = cd.error || cr.status || "git refused — commit or stash your changes first";
+  } else {
+    const cr = await sid("repos/create-branch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: repoName, branch: branchName }) });
+    const cd = (cr && cr.data) || {};
+    ok = !!(cr.ok && cd.ok && cd.branch);
+    finalBranch = cd.branch || branchName;
+    if (!ok) err = cd.error || cr.status || "unknown error";
+  }
+  if (!ok) { if (out) out.textContent = "Failed: " + err; return; }
   try {
     await fetch("/api/conversations/" + encodeURIComponent(convId), { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repoBranch: finalBranch }) });
   } catch (e) {
-    if (out) out.textContent = "Worktree ready, but could not update the chat: " + String((e && e.message) || e);
+    if (out) out.textContent = "Branch ready, but could not update the chat: " + String((e && e.message) || e);
     return;
   }
   // Update the cached conversation record so the composer chip and sidebar
@@ -1451,6 +1489,18 @@ async function switchChatBranch(overlay, branchName, create) {
   refreshRailState();
   overlay.classList.remove("open");
   flashDsOk("Chat now on ⎇ " + finalBranch);
+}
+
+// Toggle the .active highlight on the repo dropdown's chat rows to match the
+// active conversation. Called when app.js signals a new active chat
+// (nasllm:activeConv) and after refreshLocal re-renders the dropdown — so the
+// chat you're viewing is highlighted in the sidebar repo list, the same way
+// #convList highlights the active non-repo chat.
+function highlightActiveRepoChat() {
+  const id = getActiveConvId();
+  document.querySelectorAll(".ds-repo-chat[data-conv-id]").forEach((row) => {
+    row.classList.toggle("active", row.getAttribute("data-conv-id") === id);
+  });
 }
 
 // localRow renders one connected repo as a dropdown: a header with the repo
@@ -1507,7 +1557,8 @@ function localRow(r, chats) {
   const chatsEl = el("div", "ds-repo-chats");
   if (chats && chats.length) {
     chats.forEach((c) => {
-      const cr = el("div", "ds-repo-chat");
+      const cr = el("div", "ds-repo-chat" + (c.id === getActiveConvId() ? " active" : ""));
+      cr.setAttribute("data-conv-id", c.id);
       const cmain = el("div", "ds-repo-chat-main");
       const t = el("span", "ds-repo-chat-title", c.title || "New chat");
       cmain.appendChild(t);
@@ -1577,6 +1628,7 @@ async function refreshLocal() {
       const chats = rp ? (chatsByRepoId.get(rp.id) || []) : [];
       body.appendChild(localRow(r, chats));
     });
+    highlightActiveRepoChat();
   } else {
     body.appendChild(el("div", "ds-note", "Could not load local repos."));
   }
@@ -2240,6 +2292,15 @@ async function bootDesktop() {
   const convListEl = $("convList");
   if (convListEl) new MutationObserver(() => syncBranchRail()).observe(convListEl, { childList: true, subtree: true });
   window.addEventListener("nasllm:openConv", () => syncBranchRail());
+  // app.js announces the active conversation (openConversation/newChat) so the
+  // repo sidebar can highlight the chat you're viewing and the branch rail can
+  // bind to a repo-bound chat — both need the active id, and repo chats are
+  // filtered out of #convList so activeConvIdFromDOM() can't see them.
+  window.addEventListener("nasllm:activeConv", (e) => {
+    activeConvId = (e && e.detail) ? String(e.detail) : null;
+    highlightActiveRepoChat();
+    syncBranchRail();
+  });
   // Auto-start a local Ollama if installed but not running, so local models are
   // discoverable through the /__ollama proxy by the time the web UI needs them.
   // If the app is already authed and Ollama just came up, reload once so app.js

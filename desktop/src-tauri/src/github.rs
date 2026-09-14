@@ -2235,6 +2235,120 @@ async fn repos_branch(State(st): State<AppState>, Json(body): Json<BranchBody>) 
 }
 
 #[derive(Deserialize)]
+struct CreateBranchBody {
+    name: String,
+    branch: String,
+    #[serde(default)]
+    base: String,
+}
+
+// repos_create_branch starts a chat on its own branch cut from the repo's
+// default branch (or `base`), WITHOUT provisioning a git worktree upfront.
+// This is the per-chat branch model: a new chat is just a branch from main.
+//
+// Two cases, keyed on whether the repo folder has uncommitted changes:
+//  - Clean folder: `git switch -c <branch> <base>` (or `git switch <branch>`
+//    if the branch already exists) moves the folder onto the chat's branch so
+//    its tool calls run there directly — no worktree is ever created for it.
+//  - Dirty folder: the working tree is never moved (switching would carry
+//    another chat's / the user's uncommitted edits onto the new branch). For
+//    a new branch we `git branch <branch> <base>` (create the ref only, no
+//    checkout); for an existing branch we do nothing. In both sub-cases the
+//    chat's tool calls lazily provision an isolated worktree via repos_exec
+//    (ensure_worktree, create=false), which keeps concurrent chats on
+//    different branches from treading on each other.
+//
+// Returns {ok, branch, isolated, error}. `isolated` is true when the folder
+// was left on a different branch and the chat will run in a lazy worktree.
+// Idempotent: if the folder is already on `branch`, returns ok immediately.
+// The registry is updated and repo context re-pushed only when the folder is
+// actually switched (isolated=false), since the folder's branch is unchanged
+// otherwise.
+async fn repos_create_branch(State(st): State<AppState>, Json(body): Json<CreateBranchBody>) -> Response {
+    let name = body.name.trim().to_string();
+    let branch = body.branch.trim().to_string();
+    if branch.is_empty() {
+        return json_ok(&serde_json::json!({ "ok": false, "branch": "", "isolated": false, "error": "branch is required" }));
+    }
+    let main = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_ok(&serde_json::json!({ "ok": false, "branch": branch, "isolated": false, "error": "not found locally" })),
+    };
+    let token = token_get().unwrap_or_default();
+    let current = git_branch(&main).await;
+    if current == branch {
+        return json_ok(&serde_json::json!({ "ok": true, "branch": branch, "isolated": false, "error": null }));
+    }
+    let dirty = git_dirty_count(&main).await;
+    let has_local = git_has_ref(&main, &format!("refs/heads/{branch}")).await;
+    let base = if body.base.trim().is_empty() {
+        git_default_branch(&main).await
+    } else {
+        body.base.trim().to_string()
+    };
+
+    // Dirty folder: never move the working tree. Create the ref only (new
+    // branch) so repos_exec can lazily check it out into an isolated worktree;
+    // for an existing branch, leave the folder as-is (the lazy worktree handles
+    // it). No registry/context update — the folder's branch is unchanged.
+    if dirty > 0 {
+        if !has_local {
+            let out = tokio::process::Command::new("git")
+                .arg("-C").arg(&main)
+                .arg("branch").arg(&branch).arg(&base)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output().await;
+            return match out {
+                Ok(o) if o.status.success() => json_ok(&serde_json::json!({ "ok": true, "branch": branch, "isolated": true, "error": null })),
+                Ok(o) => {
+                    let msg = scrub(String::from_utf8_lossy(&o.stderr).trim().to_string(), &token);
+                    let emsg = if msg.is_empty() { "git branch failed".to_string() } else { msg };
+                    json_ok(&serde_json::json!({ "ok": false, "branch": branch, "isolated": false, "error": emsg }))
+                }
+                Err(e) => json_ok(&serde_json::json!({ "ok": false, "branch": branch, "isolated": false, "error": format!("git branch: {e}") })),
+            };
+        }
+        return json_ok(&serde_json::json!({ "ok": true, "branch": branch, "isolated": true, "error": null }));
+    }
+
+    // Clean folder: switch onto the chat's branch (create from base if new).
+    let out = if has_local {
+        tokio::process::Command::new("git")
+            .arg("-C").arg(&main)
+            .arg("switch").arg(&branch)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output().await
+    } else {
+        tokio::process::Command::new("git")
+            .arg("-C").arg(&main)
+            .arg("switch").arg("-c").arg(&branch).arg(&base)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output().await
+    };
+    match out {
+        Ok(o) if o.status.success() => {
+            let head = git_head(&main).await;
+            let tree = top_level_tree(&main);
+            if let Some(rec) = load_registry(&st.data_dir).into_iter().find(|r| r.full_name == name) {
+                upsert_registry(&st.data_dir, &RepoRecord { branch: branch.clone(), ..rec });
+            }
+            let _ = push_repo_context(&st, &name, &main, &branch, &head, &tree).await;
+            json_ok(&serde_json::json!({ "ok": true, "branch": branch, "isolated": false, "error": null }))
+        }
+        Ok(o) => {
+            let combined = format!("{}\n{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+            let msg = scrub(combined.trim().to_string(), &token);
+            let emsg = if msg.is_empty() { "git switch failed".to_string() } else { msg };
+            json_ok(&serde_json::json!({ "ok": false, "branch": branch, "isolated": false, "error": emsg }))
+        }
+        Err(e) => json_ok(&serde_json::json!({ "ok": false, "branch": branch, "isolated": false, "error": format!("git switch: {e}") })),
+    }
+}
+
+#[derive(Deserialize)]
 struct StateQuery {
     name: String,
     #[serde(default)]
@@ -2443,6 +2557,7 @@ pub fn router(state: AppState) -> Router {
         .route("/__sidecar/repos/ship", post(repos_ship))
         .route("/__sidecar/repos/set-folder", post(repos_set_folder))
         .route("/__sidecar/repos/branch", post(repos_branch))
+        .route("/__sidecar/repos/create-branch", post(repos_create_branch))
         .route("/__sidecar/repos/state", get(repos_state))
         .route("/__sidecar/repos/branches", post(repos_branches))
         .route("/__sidecar/repos/checkout", post(repos_checkout))
