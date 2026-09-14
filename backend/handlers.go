@@ -634,6 +634,13 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		tedata, _ := json.Marshal(te)
 		writeSSE("event: toolExec\ndata: " + string(tedata) + "\n\n")
 	}
+	// Replay a pending toolStart so a browser that attaches mid-execution reopens
+	// the running command block (spinner) on reconnect, instead of seeing nothing
+	// until the result lands.
+	if ts := j.toolStartSnapshot(); ts != nil {
+		tsdata, _ := json.Marshal(ts)
+		writeSSE("event: toolStart\ndata: " + string(tsdata) + "\n\n")
+	}
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -684,6 +691,9 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	flushToolExec := func(text string) {
 		writeSSE("event: toolExec\ndata: " + text + "\n\n")
 	}
+	flushToolStart := func(text string) {
+		writeSSE("event: toolStart\ndata: " + text + "\n\n")
+	}
 	flushError := func(text string) {
 		d, _ := json.Marshal(text)
 		writeSSE("event: joberror\ndata: " + string(d) + "\n\n")
@@ -724,6 +734,8 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 				flushModelCall(ev.text)
 			case "toolExec":
 				flushToolExec(ev.text)
+			case "toolStart":
+				flushToolStart(ev.text)
 			case "clear":
 				flushClear()
 			case "done":
@@ -757,6 +769,8 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 						flushModelCall(ev.text)
 					case "toolExec":
 						flushToolExec(ev.text)
+					case "toolStart":
+						flushToolStart(ev.text)
 					case "clear":
 						flushClear()
 					case "done":
@@ -1003,6 +1017,10 @@ func (s *server) handleToolResponse(w http.ResponseWriter, r *http.Request) {
 		Preview     string `json:"preview"`
 		IsError     bool   `json:"isError"`
 		Error       string `json:"error,omitempty"`
+		ExitCode    int    `json:"exitCode,omitempty"`
+		Output      string `json:"output,omitempty"`
+		Cwd         string `json:"cwd,omitempty"`
+		Branch      string `json:"branch,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, "invalid request", http.StatusBadRequest)
@@ -1027,7 +1045,7 @@ func (s *server) handleToolResponse(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "no pending tool call for this job", http.StatusConflict)
 		return
 	}
-	ch <- toolExecResponse{Observation: body.Observation, Preview: body.Preview, IsError: body.IsError, Error: body.Error}
+	ch <- toolExecResponse{Observation: body.Observation, Preview: body.Preview, IsError: body.IsError, Error: body.Error, ExitCode: body.ExitCode, Output: body.Output, Cwd: body.Cwd, Branch: body.Branch}
 	writeJSON(w, map[string]string{"status": "ok"})
 }
 

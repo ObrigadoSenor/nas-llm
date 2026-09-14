@@ -261,23 +261,242 @@ function truncateArgs(s) {
   if (s.length > 80) return s.slice(0, 80) + '…';
   return s;
 }
+// --- Warp-style command blocks (run_command/apply_patch/git_commit/git_push/create_pr) ---
+// A command block replaces the flat step row for command-shaped tools: a
+// header (icon + label + command/target in mono + a status chip), a
+// scroll-locked output body, and a footer (copy/expand + inline approval).
+// Read-only tools (read_file/grep/glob/list_files/git_status) keep the
+// compact step row so a run doesn't become a wall of blocks. Live blocks are
+// driven by the window.nasllm.blocks hook (open on toolStart, append on
+// streamed output, close on exit/result, requestApproval for inline Approve/Reject).
+const COMMAND_TOOLS = new Set(['run_command','apply_patch','git_commit','git_push','create_pr']);
+export function isCommandTool(tool){ return COMMAND_TOOLS.has(tool); }
+
+// DOM-side cap so a chatty command can't grow the page unbounded (keep last ~64KB).
+const BLOCK_OUTPUT_CAP = 65536;
+const ANSI_RE = /\x1b\[[0-9;?]*[ -\/]*[@-~]/g;
+function stripAnsi(s){ return String(s||'').replace(ANSI_RE, ''); }
+
+function toolLabel(tool){
+  return ({ run_command:'Run command', apply_patch:'Apply patch', git_commit:'Commit', git_push:'Push', create_pr:'Open PR' })[tool] || tool;
+}
+function commandTarget(tool, args){
+  try{
+    const v = JSON.parse(args||'{}');
+    if(tool==='run_command') return v.command||'';
+    if(tool==='apply_patch') return v.patch ? '(unified diff)' : '';
+    if(tool==='git_commit') return v.message||'';
+    if(tool==='create_pr') return v.title||'';
+  }catch{}
+  return '';
+}
+
+// buildToolBlock builds one command block element. live=true -> a running
+// block (spinner chip, empty body, approval buttons added later via
+// requestApproval); live=false -> a finalized block (exit chip + duration,
+// body from st.output, collapsed on success / open on failure). key tags the
+// element for the registry.
+export function buildToolBlock(st, { key='', live=false } = {}){
+  const block = document.createElement('div');
+  block.className = 'tool-block running' + (st && st.isError ? ' err' : '');
+  if(key) block.dataset.key = key;
+  const rail = document.createElement('div'); rail.className = 'tool-block-rail';
+  block.appendChild(rail);
+  const main = document.createElement('div'); main.className = 'tool-block-main';
+  const head = document.createElement('div'); head.className = 'tool-block-head';
+  const ic = document.createElement('span'); ic.className = 'status-ic'; ic.innerHTML = icon(stepIcon(st && st.tool), 14);
+  const label = document.createElement('span'); label.className = 'tool-block-label'; label.textContent = toolLabel(st && st.tool);
+  head.appendChild(ic); head.appendChild(label);
+  const target = commandTarget(st && st.tool, st && st.args);
+  if(target){
+    const cmd = document.createElement('code'); cmd.className = 'tool-block-cmd'; cmd.textContent = truncateArgs(target); cmd.title = target;
+    head.appendChild(cmd);
+  }
+  const chip = document.createElement('span'); chip.className = 'tool-block-chip';
+  if(live){
+    chip.appendChild(thinkingDots());
+  } else {
+    const code = (st && st.exitCode!=null) ? st.exitCode : (st && st.isError ? 1 : 0);
+    chip.textContent = (st && st.durationMs) ? ('exit '+code+' · '+st.durationMs+'ms') : ('exit '+code);
+  }
+  head.appendChild(chip);
+  // Expand/collapse chevron lives in the header (always visible, even when
+  // collapsed) so a collapsed block can be reopened — putting it in the footer
+  // made collapse irreversible because .collapsed hides the footer.
+  const expand = document.createElement('button'); expand.type='button'; expand.className='tool-block-expand'; expand.setAttribute('aria-label','Toggle output');
+  expand.innerHTML = icon('chevron-down',13);
+  expand.addEventListener('click', ()=>{ block.classList.toggle('collapsed'); expand.innerHTML = block.classList.contains('collapsed') ? icon('chevron-down',13) : icon('chevron-up',13); });
+  head.appendChild(expand);
+  main.appendChild(head);
+  const body = document.createElement('div'); body.className = 'tool-block-body';
+  const pre = document.createElement('pre'); pre.className = 'tool-block-output';
+  if(!live && st && st.output) pre.textContent = st.output;
+  body.appendChild(pre);
+  main.appendChild(body);
+  const foot = document.createElement('div'); foot.className = 'tool-block-foot';
+  const copyCmd = document.createElement('button'); copyCmd.type='button'; copyCmd.className='tool-block-copy cmd'; copyCmd.setAttribute('aria-label','Copy command'); copyCmd.innerHTML = icon('copy',13);
+  copyCmd.addEventListener('click', async ()=>{ try{ await navigator.clipboard.writeText(target); copyCmd.classList.add('copied'); copyCmd.innerHTML=icon('check',13); setTimeout(()=>{copyCmd.classList.remove('copied');copyCmd.innerHTML=icon('copy',13);},1200);}catch{} });
+  if(target) foot.appendChild(copyCmd);
+  const copyOut = document.createElement('button'); copyOut.type='button'; copyOut.className='tool-block-copy out'; copyOut.setAttribute('aria-label','Copy output'); copyOut.innerHTML = icon('copy',13);
+  copyOut.addEventListener('click', async ()=>{ try{ await navigator.clipboard.writeText(pre.textContent); copyOut.classList.add('copied'); copyOut.innerHTML=icon('check',13); setTimeout(()=>{copyOut.classList.remove('copied');copyOut.innerHTML=icon('copy',13);},1200);}catch{} });
+  foot.appendChild(copyOut);
+  main.appendChild(foot);
+  block.appendChild(main);
+  if(!live && st && !st.isError) block.classList.add('collapsed');
+  if(!live) block.classList.remove('running');
+  // Set the initial chevron direction to match the collapsed state.
+  expand.innerHTML = block.classList.contains('collapsed') ? icon('chevron-down',13) : icon('chevron-up',13);
+  return block;
+}
+
+// buildStepView picks a command block (command-shaped tools) or the compact
+// row (read-only/other tools) for a finalized step.
+function buildStepView(st){
+  if(st && isCommandTool(st.tool)) return buildToolBlock(st, { live:false });
+  return buildStepRow(st);
+}
+
+// --- window.nasllm.blocks: live command-block registry (renderer→app bridge) ---
+// activeBlocks: keys with a running block (appendable while output streams).
+// blockEls: every block element opened this job (persists after close so the
+//   late `tool` SSE event can refine a block already closed by nasllm:toolExit).
+// seenBlocks: keys ever opened this job (so tailJob's `tool` handler knows to
+//   close the block instead of appending a compact row).
+const blockEls = new Map();
+const activeBlocks = new Set();
+const seenBlocks = new Set();
+
+export function isBlockStep(key){ return seenBlocks.has(key); }
+export function resetBlocks(){ blockEls.clear(); activeBlocks.clear(); seenBlocks.clear(); }
+
+// openBlock opens a running command block (spinner) in container and registers
+// it under key. Called by tailJob's toolStart handler.
+export function openBlock(key, info){
+  const container = info && info.container;
+  if(!container) return;
+  const block = buildToolBlock({ step:info.step, tool:info.tool, args:info.args, cwd:info.cwd, branch:info.branch }, { key, live:true });
+  block._buf = '';
+  container.appendChild(block);
+  blockEls.set(key, block);
+  activeBlocks.add(key);
+  seenBlocks.add(key);
+  container.classList.remove('hidden');
+}
+
+// appendBlock appends streamed output text to a running block's body, with a
+// DOM-side cap and ANSI stripping. Called by the nasllm:toolOutput listener.
+export function appendBlock(key, text){
+  if(!activeBlocks.has(key) || !text) return;
+  const block = blockEls.get(key);
+  if(!block) return;
+  block._buf = (block._buf||'') + stripAnsi(text);
+  if(block._buf.length > BLOCK_OUTPUT_CAP) block._buf = block._buf.slice(-BLOCK_OUTPUT_CAP);
+  const pre = block.querySelector('.tool-block-output');
+  if(pre) pre.textContent = block._buf;
+  const body = block.querySelector('.tool-block-body');
+  if(body){ body.classList.remove('hidden'); body.scrollTop = body.scrollHeight; }
+}
+
+// closeBlock finalizes a block: sets the exit chip, fills the body from output
+// if no output streamed, collapses on success / stays open on failure. Called
+// by nasllm:toolExit (early, with {exitCode,durationMs}) and tailJob's `tool`
+// handler (with the full agentStep). Idempotent: the second call refines.
+export function closeBlock(key, result){
+  const block = blockEls.get(key);
+  if(!block) return;
+  activeBlocks.delete(key);
+  result = result || {};
+  const chip = block.querySelector('.tool-block-chip');
+  if(chip){
+    chip.replaceChildren();
+    const code = (result.exitCode!=null) ? result.exitCode : (result.isError ? 1 : 0);
+    chip.textContent = result.durationMs ? ('exit '+code+' · '+result.durationMs+'ms') : ('exit '+code);
+  }
+  const pre = block.querySelector('.tool-block-output');
+  if(pre && result.output && !block._buf) pre.textContent = result.output;
+  const failed = result.isError || (result.exitCode!=null && result.exitCode!==0);
+  block.classList.remove('running');
+  block.classList.toggle('err', !!failed);
+  block.classList.toggle('collapsed', !failed);
+}
+
+// requestApprovalBlock renders inline Approve/Reject buttons in a running
+// block's footer (and an optional preview element the renderer built, e.g. the
+// diff for apply_patch). Returns true if the block was on screen. The renderer
+// (desktop.js) calls this via window.nasllm.blocks.requestApproval; for
+// background chats whose block is not in the DOM it returns false and the
+// renderer falls back to the FIFO modal.
+export function requestApprovalBlock(key, opts){
+  const block = blockEls.get(key);
+  if(!block) return false;
+  const foot = block.querySelector('.tool-block-foot');
+  if(!foot) return false;
+  foot.querySelectorAll('.tool-approve,.tool-reject,.tool-block-preview').forEach(n=>n.remove());
+  const o = opts || {};
+  if(o.previewEl){
+    const pv = document.createElement('div'); pv.className='tool-block-preview'; pv.appendChild(o.previewEl);
+    const mainEl = block.querySelector('.tool-block-main');
+    mainEl.insertBefore(pv, foot);
+    block.classList.remove('collapsed');
+  }
+  if(o.onApprove){ const a=document.createElement('button'); a.type='button'; a.className='tool-approve'; a.textContent='Approve'; a.addEventListener('click', ()=>o.onApprove()); foot.appendChild(a); }
+  if(o.onReject){ const r=document.createElement('button'); r.type='button'; r.className='tool-reject'; r.textContent='Reject'; r.addEventListener('click', ()=>o.onReject()); foot.appendChild(r); }
+  block.classList.remove('collapsed');
+  return true;
+}
+
+// installBlocksHook exposes window.nasllm.blocks so the desktop renderer (the
+// only desktop-aware code) can drive live blocks it cannot reach via the ES
+// module imports (streamed output, inline approval). www/ itself uses the
+// exported functions above directly.
+export function installBlocksHook(){
+  window.nasllm = window.nasllm || {};
+  window.nasllm.blocks = {
+    open: openBlock,
+    append: appendBlock,
+    close: closeBlock,
+    requestApproval: requestApprovalBlock,
+  };
+}
+
+// stepArgSummary extracts the one meaningful argument from a read-only tool's
+// args as a plain string (no braces/quotes), so the compact row reads
+// "glob **/*.go" instead of "glob { \"pattern\": \"**/*.go\" }". Returns "" for
+// tools with no key arg, or when the preview already conveys it (read_file).
+function stepArgSummary(tool, args){
+  try{
+    const v = JSON.parse(args||'{}');
+    switch(tool){
+      case 'glob': return v.pattern||'';
+      case 'grep': return v.pattern ? (v.path ? v.pattern+' in '+v.path : v.pattern) : '';
+      case 'list_files': return (v.path && v.path!=='.') ? v.path : '';
+      case 'calculator': return v.expression||'';
+      case 'memory_read': case 'memory_write': return v.key||'';
+      case 'fetch_page': return v.url||'';
+      default: return '';
+    }
+  }catch{ return ''; }
+}
+
 function buildStepRow(st) {
   const row = document.createElement('div');
   row.className = 'step' + (st.isError ? ' err' : '');
   const head = document.createElement('div'); head.className = 'step-head';
-  const num = document.createElement('span'); num.className = 'step-num'; num.textContent = String(st.step ?? '');
-  const ic = document.createElement('span'); ic.className = 'status-ic'; ic.innerHTML = icon(stepIcon(st.tool), 14);
+  const ic = document.createElement('span'); ic.className = 'status-ic'; ic.innerHTML = icon(stepIcon(st.tool), 13);
   const name = document.createElement('span'); name.className = 'step-tool'; name.textContent = st.tool || '';
-  head.appendChild(num); head.appendChild(ic); head.appendChild(name);
+  head.appendChild(ic); head.appendChild(name);
   // Hide raw args when the step renders a readable query/question payload
-  // (search sources / clarify card) — the args JSON just duplicates it.
+  // (search sources / clarify card); otherwise show the one plain key arg.
   const hasNicePayload = !!(st.search || st.clarify);
-  if (st.args && !hasNicePayload) {
-    const a = document.createElement('span'); a.className = 'step-args'; a.textContent = truncateArgs(st.args);
-    head.appendChild(a);
+  if (!hasNicePayload) {
+    const arg = stepArgSummary(st.tool, st.args);
+    if (arg) {
+      const a = document.createElement('span'); a.className = 'step-args'; a.textContent = truncateArgs(arg);
+      head.appendChild(a);
+    }
   }
   if (st.durationMs && st.durationMs > 0) {
-    const d = document.createElement('span'); d.className = 'step-dur muted'; d.textContent = st.durationMs + 'ms';
+    const d = document.createElement('span'); d.className = 'step-dur'; d.textContent = st.durationMs + 'ms';
     head.appendChild(d);
   }
   row.appendChild(head);
@@ -304,12 +523,12 @@ export function renderAgentSteps(container, steps) {
   container.replaceChildren();
   if (!steps || !steps.length) { container.classList.add('hidden'); return; }
   container.classList.remove('hidden');
-  steps.forEach(st => container.appendChild(buildStepRow(st)));
+  steps.forEach(st => container.appendChild(buildStepView(st)));
 }
 export function appendAgentStep(container, st) {
   if (!container || !st) return;
   container.classList.remove('hidden');
-  container.appendChild(buildStepRow(st));
+  container.appendChild(buildStepView(st));
 }
 
 // --- Agent thinking drawer (per-round reasoning, minimal + collapsible) ----------
@@ -318,12 +537,14 @@ export function appendAgentStep(container, st) {
 // a mutable label span (setThoughtsSummary) so callers can show "Thinking" +
 // animated dots while reasoning streams, then swap to "Thought for Xs" and
 // collapse the drawer when it completes. Each thought is a small, dim block.
+// buildThoughtRow renders one reasoning round as sanitized markdown (so the
+// model's **bold**, [links], and numbered lists format properly) instead of
+// raw text — without this the thinking drawer shows literal asterisks/brackets.
 function buildThoughtRow(text) {
   const div = document.createElement('div');
   div.className = 'thought';
-  const t = document.createElement('span'); t.className = 'thought-text';
-  t.textContent = String(text || '');
-  div.appendChild(t);
+  div.innerHTML = parseAndSanitize(text);
+  polishLinks(div);
   return div;
 }
 export function renderThoughts(container, thoughts) {
@@ -570,6 +791,32 @@ export class StreamRenderer {
     return wrap;
   }
 
+  // _displayText returns what the bubble should show while streaming: the
+  // accumulated text with any JSON tool-call blob the model is narrating as
+  // prose stripped, so only the preamble (the model's reasoning) renders —
+  // not the {"name":"...","arguments":{...}} syntax. In agent mode any `{`
+  // that starts a JSON object (followed by a quote) is treated as the start of
+  // a tool-call blob and hidden from that point — inline or at a line boundary.
+  // A genuine agent answer is prose, not JSON, so this rarely over-strips; and
+  // the preamble before the `{` still shows. Returns '' when only the JSON blob
+  // has streamed so far, so _flush shows the phase status instead.
+  _displayText() {
+    const acc = this.acc || '';
+    if (!acc) return '';
+    // Only suppress in agent mode so a plain-chat JSON example renders.
+    const isAgent = this.phase === 'agent' || (this.phase && this.phase.startsWith('tool:'));
+    if (!isAgent) return acc;
+    // First { that starts a JSON object (a { followed by optional whitespace
+    // and a quote). Catches both `text\n{...}` and inline `text {"name":...}`.
+    const m = acc.match(/\{[\s]*"/);
+    if (!m) return acc;
+    let preamble = acc.slice(0, m.index);
+    // Strip a trailing ``` fence line from the preamble (the JSON blob was
+    // inside a fenced code block) so a dangling fence doesn't render.
+    preamble = preamble.replace(/[ \t]*```[a-zA-Z]*[ \t]*\n?$/, '');
+    return preamble.replace(/\s+$/, '');
+  }
+
   _flush() {
     this.scheduled = false;
     if (this._suspended) return;
@@ -580,8 +827,9 @@ export class StreamRenderer {
     // after the update would mistake a big frame of new text for a scroll-up.
     const sp = this._scrollAncestor();
     const follow = sp ? (sp.scrollHeight - sp.scrollTop - sp.clientHeight < 160) : false;
-    if (this.acc) {
-      this.container.innerHTML = parseAndSanitize(this.acc);
+    const display = this._displayText();
+    if (display) {
+      this.container.innerHTML = parseAndSanitize(display);
       polishLinks(this.container);
     } else {
       this.container.replaceChildren(this._statusEl());

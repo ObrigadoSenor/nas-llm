@@ -16,12 +16,17 @@ use axum::{
     body::Body,
     extract::{Query, State},
     http::{header, HeaderValue, StatusCode},
-    response::Response,
+    response::{sse::{Event, Sse}, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
 use std::path::{Path, PathBuf};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::sync::mpsc;
+
+use futures_util::stream::{iter, unfold, StreamExt};
 
 use crate::sidecar::AppState;
 
@@ -1345,6 +1350,138 @@ async fn repos_exec(State(st): State<AppState>, Json(body): Json<ExecBody>) -> R
     json_ok(&result)
 }
 
+// repos_exec_stream is the streaming variant of repos_exec for run_command
+// only: it pipes the command's stdout+stderr to the renderer as SSE `chunk`
+// events as they arrive (so the Warp-style command block fills live) and
+// finishes with one terminal `exit` event carrying the exit code + wall-clock
+// duration. stdin is null so a command that waits for input fails fast instead
+// of parking the run until TOOL_EXEC_TIMEOUT. Approval is handled client-side
+// (the renderer has the command from the toolExec args and shows Approve/Reject
+// in the block); this route runs the command only when approved=true. The
+// buffered /repos/exec stays for every other tool and as the fallback.
+async fn repos_exec_stream(State(st): State<AppState>, Json(body): Json<ExecBody>) -> Response {
+    if body.tool != "run_command" {
+        return sse_error("Streaming exec is for run_command only.");
+    }
+    let repo_name = body.repo.trim().to_string();
+    let main = match resolve_repo(&st.data_dir, &repo_name) {
+        Some(p) => p,
+        None => return sse_error(&format!("Repository {repo_name} is not available locally.")),
+    };
+    let dest = if body.branch.trim().is_empty() {
+        main
+    } else {
+        match ensure_worktree(&st.data_dir, &repo_name, &main, &body.branch, false).await {
+            Ok((p, _created)) => p,
+            Err(e) => return sse_error(&format!("Branch worktree unavailable: {e}")),
+        }
+    };
+    let root = match std::fs::canonicalize(&dest) {
+        Ok(r) => r,
+        Err(e) => return sse_error(&format!("repo dir: {e}")),
+    };
+    let command = match serde_json::from_str::<serde_json::Value>(&body.args) {
+        Ok(v) => v.get("command").and_then(|p| p.as_str()).unwrap_or("").to_string(),
+        Err(_) => return sse_error("Invalid args for run_command."),
+    };
+    if command.is_empty() {
+        return sse_error("No command provided.");
+    }
+    if !body.approved {
+        // Approval is handled client-side (inline in the block); refuse to run
+        // an unapproved command. The renderer calls /stream only after approve.
+        return sse_error("Command not approved.");
+    }
+
+    let (tx, rx) = mpsc::channel::<StreamMsg>(64);
+    let root_for_task = root.clone();
+    let command_for_task = command.clone();
+    tokio::spawn(async move {
+        let start = std::time::Instant::now();
+        let mut child = match tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command_for_task)
+            .current_dir(&root_for_task)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx.send(StreamMsg::Chunk(format!("Could not run command: {e}\n"))).await;
+                let _ = tx.send(StreamMsg::Exit(-1, 0)).await;
+                return;
+            }
+        };
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let stdout_task = tokio::spawn(pipe_lines(stdout, tx.clone()));
+        let stderr_task = tokio::spawn(pipe_lines(stderr, tx.clone()));
+        let status = child.wait().await;
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+        let dur = start.elapsed().as_millis() as i64;
+        let code = status.ok().and_then(|s| s.code()).unwrap_or(-1) as i64;
+        let _ = tx.send(StreamMsg::Exit(code, dur)).await;
+    });
+
+    let sse_stream = unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|msg| (msg, rx))
+    })
+    .map(|msg| -> Result<Event, Infallible> { Ok(stream_msg_to_event(msg)) });
+    Sse::new(sse_stream).into_response()
+}
+
+// StreamMsg is one frame of the streaming exec SSE: a piped output chunk, or the
+// terminal exit carrying the command's exit code + wall-clock duration.
+enum StreamMsg {
+    Chunk(String),
+    Exit(i64, i64),
+}
+
+fn stream_msg_to_event(msg: StreamMsg) -> Event {
+    match msg {
+        StreamMsg::Chunk(text) => Event::default().event("chunk").data(serde_json::json!({ "text": text }).to_string()),
+        StreamMsg::Exit(code, dur) => Event::default().event("exit").data(serde_json::json!({ "code": code, "durationMs": dur }).to_string()),
+    }
+}
+
+// sse_error short-circuits a pre-execution failure as a one-shot SSE stream
+// (one chunk with the error text, then a terminal exit with no code) so the
+// renderer always sees the same text/event-stream shape from /repos/exec/stream.
+fn sse_error(msg: &str) -> Response {
+    let sse_stream = iter(vec![
+        StreamMsg::Chunk(format!("{msg}\n")),
+        StreamMsg::Exit(-1, 0),
+    ])
+    .map(|msg| -> Result<Event, Infallible> { Ok(stream_msg_to_event(msg)) });
+    Sse::new(sse_stream).into_response()
+}
+
+// pipe_lines reads a child's piped stream line-by-line and forwards each line
+// (with its trailing newline) as a Chunk. Returns at EOF (the child closed the
+// pipe), so joining the two pipe tasks before sending the terminal exit
+// guarantees all output is flushed before the exit event.
+async fn pipe_lines<R: AsyncRead + Unpin + Send>(reader: R, tx: mpsc::Sender<StreamMsg>) {
+    let mut reader = BufReader::new(reader);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf).await {
+            Ok(0) => break,
+            Ok(_) => {
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if tx.send(StreamMsg::Chunk(text)).await.is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
 // safe_path resolves a repo-relative path and guards against traversal outside
 // the repo root. Returns the canonicalized absolute path, or an error.
 fn safe_path(root: &Path, rel: &str) -> Result<PathBuf, String> {
@@ -1598,25 +1735,58 @@ async fn exec_apply_patch(root: &Path, args: &str, approved: bool) -> ExecResult
             approval_preview: Some(preview),
         };
     }
-    // Write the patch to a temp file and apply it with `git apply`.
+    // Write the patch to a temp file and apply it with `git apply`. Small
+    // models often emit diffs with wrong hunk line counts or whitespace
+    // drift that strict `git apply` rejects ("corrupt patch", "patch does not
+    // apply"); retry with --recount (recomputes counts) then --3way (tolerates
+    // context drift via a 3-way merge) before giving up.
     let patch_file = root.join(".nas-llm-patch.tmp");
     if let Err(e) = std::fs::write(&patch_file, &patch) {
         return ExecResult { observation: format!("Could not write patch file: {e}"), preview: "write error".into(), is_error: true, needs_approval: None, approval_kind: None, approval_preview: None };
     }
+    let mut last_err = String::new();
+    let mut applied = false;
+    // Strict first.
     let out = tokio::process::Command::new("git")
         .arg("-C").arg(root)
         .arg("apply").arg(&patch_file)
         .output().await;
+    if let Ok(o) = &out {
+        if o.status.success() { applied = true; }
+        else { last_err = String::from_utf8_lossy(&o.stderr).trim().to_string(); }
+    } else if let Err(e) = &out {
+        last_err = format!("Could not run git: {e}");
+    }
+    // Fallback: --recount fixes wrong hunk line counts (the most common
+    // small-model diff error). --whitespace=nowarn ignores trailing-
+    // whitespace drift.
+    if !applied {
+        let out2 = tokio::process::Command::new("git")
+            .arg("-C").arg(root)
+            .arg("apply").arg("--recount").arg("--whitespace=nowarn").arg(&patch_file)
+            .output().await;
+        if let Ok(o) = &out2 {
+            if o.status.success() { applied = true; }
+            else { last_err = String::from_utf8_lossy(&o.stderr).trim().to_string(); }
+        }
+    }
+    // Fallback: --3way tolerates context drift by falling back to a 3-way
+    // merge using the indexed blobs.
+    if !applied {
+        let out3 = tokio::process::Command::new("git")
+            .arg("-C").arg(root)
+            .arg("apply").arg("--3way").arg(&patch_file)
+            .output().await;
+        if let Ok(o) = &out3 {
+            if o.status.success() { applied = true; }
+            else { last_err = String::from_utf8_lossy(&o.stderr).trim().to_string(); }
+        }
+    }
     let _ = std::fs::remove_file(&patch_file);
-    match out {
-        Ok(o) if o.status.success() => {
-            ExecResult { observation: "Patch applied successfully.".into(), preview: "applied".into(), is_error: false, needs_approval: None, approval_kind: None, approval_preview: None }
-        }
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
-            ExecResult { observation: format!("git apply failed: {stderr}"), preview: "apply failed".into(), is_error: true, needs_approval: None, approval_kind: None, approval_preview: None }
-        }
-        Err(e) => ExecResult { observation: format!("Could not run git: {e}"), preview: "git error".into(), is_error: true, needs_approval: None, approval_kind: None, approval_preview: None },
+    if applied {
+        ExecResult { observation: "Patch applied successfully.".into(), preview: "applied".into(), is_error: false, needs_approval: None, approval_kind: None, approval_preview: None }
+    } else {
+        ExecResult { observation: format!("git apply failed: {last_err}"), preview: "apply failed".into(), is_error: true, needs_approval: None, approval_kind: None, approval_preview: None }
     }
 }
 
@@ -2551,6 +2721,7 @@ pub fn router(state: AppState) -> Router {
         .route("/__sidecar/repos/refresh", post(repos_refresh))
         .route("/__sidecar/repos/open", post(repos_open))
         .route("/__sidecar/repos/exec", post(repos_exec))
+        .route("/__sidecar/repos/exec/stream", post(repos_exec_stream))
         .route("/__sidecar/repos/diff", post(repos_diff))
         .route("/__sidecar/repos/revert", post(repos_revert))
         .route("/__sidecar/repos/changelog", post(repos_changelog))

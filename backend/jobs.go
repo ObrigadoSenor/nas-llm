@@ -43,11 +43,13 @@ var errJobActive = errors.New("a generation is already running for this conversa
 
 // subEvent is a single event pushed to an SSE subscriber.
 type subEvent struct {
-	// kind is one of: chunk, phase, search, questions, tool, thought, clear,
-	// modelCall, toolExec, done, error. "modelCall" is the browser-relay cue for
-	// local-model inference; "toolExec" is the browser-relay cue for local file
-	// tools (the browser runs the tool via the sidecar and POSTs the observation
-	// back to /tool-response). Both carry a JSON payload in text.
+	// kind is one of: chunk, phase, search, questions, tool, toolStart, thought,
+	// clear, modelCall, toolExec, done, error. "modelCall" is the browser-relay
+	// cue for local-model inference; "toolExec" is the browser-relay cue for local
+	// file tools (the browser runs the tool via the sidecar and POSTs the
+	// observation back to /tool-response); "toolStart" is the UI cue that a tool
+	// is about to run so the command block opens before the result arrives. All
+	// carry a JSON payload in text (except clear, which has none).
 	kind string
 	text string
 }
@@ -130,6 +132,12 @@ type job struct {
 	// Replayed on (re)connect so a browser that attaches after the cue fired still
 	// runs the tool. Cleared once the response arrives.
 	pendingToolExecPayload *toolExecPayload
+	// pendingToolStart is the tool currently mid-execution (the toolStart cue has
+	// fired but the matching tool/result event has not). Replayed on (re)connect
+	// so a browser that attaches mid-run reopens the running command block
+	// (spinner) instead of seeing nothing until the result lands. Cleared by
+	// emitTool once the tool's result step is recorded.
+	pendingToolStart *toolStartPayload
 }
 
 // relayResponse is the browser's assembled inference result for one local-model
@@ -180,6 +188,21 @@ type toolExecPayload struct {
 	AutoApprove bool `json:"autoApprove,omitempty"`
 }
 
+// toolStartPayload is the SSE `toolStart` event body: the UI's cue that a tool
+// is about to run, so the Warp-style command block can open (spinner) the
+// moment execution begins — before the result arrives. Only command-shaped
+// tools (run_command/apply_patch/git_commit/git_push/create_pr) render a block;
+// the UI ignores toolStart for read-only tools. Mirrors toolExecPayload's
+// identity fields so a reconnect can reopen a running block, but carries no
+// repo/branch/autoApprove (those are relay concerns on the toolExec event).
+type toolStartPayload struct {
+	ConvID string `json:"convId"`
+	JobID  string `json:"jobId"`
+	Step   int    `json:"step"`
+	Tool   string `json:"tool"`
+	Args   string `json:"args"`
+}
+
 // toolExecResponse is the browser's assembled file-tool result, delivered
 // through the job's pendingToolExec channel. Observation is the tool output fed
 // back to the model; Preview is a short summary for the trace; IsError marks a
@@ -190,6 +213,15 @@ type toolExecResponse struct {
 	Preview     string `json:"preview"`
 	IsError     bool   `json:"isError"`
 	Error       string `json:"error,omitempty"`
+	// ExitCode/Output/Cwd/Branch carry a command's result for the Warp-style
+	// command block: exit status, (capped) display-only output, and the cwd/branch
+	// it ran in. Populated by the renderer for command-shaped tools; empty for
+	// read-only tools. Output is display-only and capped (~4 KB) — it is NOT the
+	// model observation (that is Observation).
+	ExitCode int    `json:"exitCode,omitempty"`
+	Output   string `json:"output,omitempty"`
+	Cwd      string `json:"cwd,omitempty"`
+	Branch   string `json:"branch,omitempty"`
 }
 
 // broadcastControl sends ev to every live subscriber, blocking up to
@@ -295,6 +327,10 @@ func (j *job) clearPendingModelCall() {
 // emitModelCall for local-model inference. branch is the conversation's bound
 // branch ("" for the repo's main working tree; see toolExecPayload).
 func (j *job) emitToolExec(step int, tool, args, repo, branch string, autoApprove bool) {
+	// Open the command block the moment the tool starts — before the relay cue
+	// fires — so streamed output has a block to land in. (Read-only tools get a
+	// toolStart too; the UI only opens a block for command-shaped tools.)
+	j.emitToolStart(step, tool, args)
 	payload := toolExecPayload{ConvID: j.convID, JobID: j.id, Step: step, Tool: tool, Args: args, Repo: repo, Branch: branch, AutoApprove: autoApprove}
 	b, _ := json.Marshal(payload)
 	j.mu.Lock()
@@ -447,6 +483,10 @@ func (j *job) clarifySnapshot() *clarifyMeta {
 func (j *job) emitTool(st agentStep) {
 	j.mu.Lock()
 	j.steps = append(j.steps, st)
+	// A tool's result step closes the running-tool window opened by emitToolStart:
+	// drop the stashed toolStart so a later reconnect does not reopen a block for
+	// a tool that has already finished.
+	j.pendingToolStart = nil
 	subs := make([]chan subEvent, 0, len(j.subs))
 	for ch := range j.subs {
 		subs = append(subs, ch)
@@ -473,6 +513,38 @@ func (j *job) stepSnapshot() []agentStep {
 	out := make([]agentStep, len(j.steps))
 	copy(out, j.steps)
 	return out
+}
+
+// emitToolStart stashes the tool that is about to run on the job (so a browser
+// that attaches after the cue fired reopens the running block on reconnect)
+// and broadcasts a "toolStart" event to every live subscriber so the UI can
+// open the command block the moment execution begins. Per-job only (not the
+// /api/events hub): a backgrounded chat's foreground tail replays this on
+// subscribe, and toolStart is a transient UI hint, not a relay control event.
+func (j *job) emitToolStart(step int, tool, args string) {
+	payload := toolStartPayload{ConvID: j.convID, JobID: j.id, Step: step, Tool: tool, Args: args}
+	b, _ := json.Marshal(payload)
+	j.mu.Lock()
+	j.pendingToolStart = &payload
+	subs := make([]chan subEvent, 0, len(j.subs))
+	for ch := range j.subs {
+		subs = append(subs, ch)
+	}
+	j.mu.Unlock()
+	ev := subEvent{kind: "toolStart", text: string(b)}
+	j.broadcastControl(ev, subs)
+}
+
+// toolStartSnapshot returns a copy of the pending toolStart for SSE replay on
+// (re)connect, or nil if no tool is mid-execution.
+func (j *job) toolStartSnapshot() *toolStartPayload {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.pendingToolStart == nil {
+		return nil
+	}
+	cp := *j.pendingToolStart
+	return &cp
 }
 
 // addUsage accumulates token counts reported by the agent loop (one call per
@@ -1210,7 +1282,15 @@ func (s *server) runGeneration(j *job) error {
 							return toolOutcome{observation: resp.Error, preview: trimPreview(resp.Error), isError: true}
 						}
 						j.clearPendingToolExec()
-						return toolOutcome{observation: capObservation(resp.Observation, agentObsMaxChars), preview: resp.Preview, isError: resp.IsError}
+						return toolOutcome{
+							observation: capObservation(resp.Observation, agentObsMaxChars),
+							preview:     resp.Preview,
+							isError:     resp.IsError,
+							exitCode:    resp.ExitCode,
+							output:      capObservation(resp.Output, agentOutputMaxChars),
+							cwd:         resp.Cwd,
+							branch:      resp.Branch,
+						}
 					case <-timer.C:
 						return toolOutcome{observation: "tool execution timed out", preview: "timeout", isError: true}
 					case <-ctx.Done():

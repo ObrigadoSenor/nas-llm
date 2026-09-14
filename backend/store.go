@@ -155,6 +155,10 @@ CREATE TABLE IF NOT EXISTS agent_steps (
 	args TEXT NOT NULL DEFAULT '',
 	result_preview TEXT NOT NULL DEFAULT '',
 	duration_ms INTEGER NOT NULL DEFAULT 0,
+	exit_code INTEGER NOT NULL DEFAULT 0,
+	output TEXT NOT NULL DEFAULT '',
+	cwd TEXT NOT NULL DEFAULT '',
+	branch TEXT NOT NULL DEFAULT '',
 	created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_agent_steps_job ON agent_steps(job_id, step);
@@ -283,6 +287,33 @@ func migrate(db *sql.DB) error {
 	}
 	if !cols["repo_branch"] {
 		if _, err := db.Exec(`ALTER TABLE conversations ADD COLUMN repo_branch TEXT`); err != nil {
+			return err
+		}
+	}
+	// agent_steps analytics parity for the Warp-style command block: a command's
+	// exit code, (capped) output, and the cwd/branch it ran in. No-op for fresh
+	// installs (the schema above already includes them).
+	asCols, err := tableColumns(db, "agent_steps")
+	if err != nil {
+		return err
+	}
+	if !asCols["exit_code"] {
+		if _, err := db.Exec(`ALTER TABLE agent_steps ADD COLUMN exit_code INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	if !asCols["output"] {
+		if _, err := db.Exec(`ALTER TABLE agent_steps ADD COLUMN output TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	if !asCols["cwd"] {
+		if _, err := db.Exec(`ALTER TABLE agent_steps ADD COLUMN cwd TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	if !asCols["branch"] {
+		if _, err := db.Exec(`ALTER TABLE agent_steps ADD COLUMN branch TEXT NOT NULL DEFAULT ''`); err != nil {
 			return err
 		}
 	}
@@ -706,9 +737,13 @@ func (s *store) addAgentStep(jobID string, st agentStep) error {
 	if len(preview) > 500 {
 		preview = preview[:500]
 	}
-	_, err := s.db.Exec(`INSERT INTO agent_steps(job_id, step, tool, args, result_preview, duration_ms, created_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?)`,
-		jobID, st.Step, st.Tool, st.Args, preview, st.DurationMs, time.Now().UnixMilli())
+	output := st.Output
+	if len(output) > agentOutputMaxChars {
+		output = output[:agentOutputMaxChars]
+	}
+	_, err := s.db.Exec(`INSERT INTO agent_steps(job_id, step, tool, args, result_preview, duration_ms, exit_code, output, cwd, branch, created_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		jobID, st.Step, st.Tool, st.Args, preview, st.DurationMs, st.ExitCode, output, st.Cwd, st.Branch, time.Now().UnixMilli())
 	return err
 }
 
