@@ -33,34 +33,89 @@ Endpoint: **`https://llm.selected.systems`** (OpenAI-compatible: `/v1/chat/compl
 
 Chat UI: **`https://chat.selected.systems`** — a minimal streaming chat page (static HTML in `www/`, no secrets baked in). Sign-in is passwordless: enter your email, click a magic link, and a signed session cookie is set. Chat history lives server-side in SQLite on the NAS, so you can resume conversations from any browser. The page calls same-origin `/api/*` (auth, history, and an Ollama proxy) on the Go `backend` container; the bearer token never reaches the browser. Both hostnames route through the same Cloudflare Tunnel to the same Caddy instance, which routes by Host header — this keeps `llm.selected.systems` pure-API.
 
-## Files
+## Repository layout
 
-| File | Purpose |
-|------|---------|
-| `docker-compose.yml` | ollama (no `ports:`), caddy (`:8080`), backend (`:8081`, no `ports:`), searxng (no `ports:`), cloudflared (`tunnel` profile) |
-| `Caddyfile` | `/v1/*` bearer auth + CORS for the API host; `/api/*` → backend for the chat host; static `www/` otherwise |
-| `backend/` | Go service: magic-link auth, SQLite history, Ollama proxy, web_search tool loop (`search.go`), and in-UI model management — pull/remove/benchmark/catalog (`models.go`; Dockerfile builds a static binary) |
-| `searxng/settings.yml` | SearXNG config — internal-only meta-search backend for the `web_search` tool (JSON output enabled, limiter off) |
-| `.env.example` / `.env` | NAS access, volume, tunnel token, bearer token, model, CORS origin, session secret, Brevo key, allowlist, SearXNG URL, NAS RAM/reserve for fit guidance |
-| `scripts/deploy.sh` | sync the stack to the NAS and `docker compose up -d --build` |
-| `scripts/pull-models.sh` | `docker exec ollama ollama ...` over SSH |
-| `scripts/smoke-test.sh` | API auth/CORS/allowlist/port-isolation/streaming + chat `/api/*` 401 + SearXNG internal JSON checks |
-| `ai/` | task lists, design docs, and release logs (`ai/tasks.md` is the phased task list) |
-| `desktop/` | Tauri 2 desktop shell around the chat UI (sign-in, repos, in-app updates); see `desktop/README.md` for the release process |
-| `scripts/bump-desktop-version.sh` | bump the desktop app version (patch/minor/major) and tag a release |
-| `.github/workflows/ci.yml` | run the Go and Rust checks on every push and pull request |
-| `.github/workflows/desktop-release.yml` | build + sign + publish the desktop app to a GitHub Release on a `v*` tag push |
-| `AGENTS.md` | contributor/agent brief: code map, conventions, verification loop. `backend/`, `www/`, and `desktop/` each have their own |
-| `Makefile` | `make check` — the verification loop (Go fmt/vet/test + `cargo check`) |
+```
+.
+├── AGENTS.md               agent/contributor brief — read before changing code
+├── Makefile                `make check` — the verification loop
+├── docker-compose.yml      ollama · caddy · backend · searxng · cloudflared (tunnel profile)
+├── Caddyfile               Host-based routing: /v1/* → ollama (bearer), /api/* → backend, else www/
+├── .env.example            every configurable variable, documented (.env is gitignored)
+│
+├── backend/                Go service — owns every /api/* route
+│   ├── AGENTS.md           file-by-file map + the full /api/* route table
+│   ├── main.go             config struct, routes(), requireAuth
+│   ├── agent.go            agent mode: ReAct loop + tool registry
+│   ├── jobs.go             background generation, job queue, SSE event hub
+│   ├── handlers.go         auth / conversation / folder / SSE handlers
+│   ├── models.go           model catalog, pulls, benchmarks
+│   ├── store.go            SQLite schema + queries
+│   ├── search.go           web_search loop against SearXNG
+│   ├── clarify.go          ask_user clarifying-question cards
+│   ├── relay.go            browser relay for local models
+│   ├── hosts.go            multi-host Ollama routing (NAS + optional Mac)
+│   ├── registry.go         OCI manifest sizing / download preflight
+│   ├── library.go          ollama.com library scraper
+│   ├── auth.go             magic-link tokens + signed session cookies
+│   ├── email.go            Brevo mailer
+│   ├── *_test.go           run with `go test ./...`
+│   └── Dockerfile          multi-stage static build (golang:1.22-alpine → alpine)
+│
+├── www/                    browser chat UI — vanilla JS, ES modules, no build step
+│   ├── AGENTS.md           app.js section map + the backend REST/SSE contract
+│   ├── index.html          page shell; holds the styles.css and app.js cache-bust versions
+│   ├── app.js              all application logic and state
+│   ├── lib.js              presentational helpers (markdown, icons, stream renderer)
+│   ├── styles.css
+│   └── vendor/             highlight.js, marked, DOMPurify
+│
+├── desktop/                Tauri 2 shell wrapping the same www/
+│   ├── AGENTS.md           sidecar architecture + renderer section map
+│   ├── README.md           prerequisites, dev run, signing, release process
+│   ├── renderer/           desktop.js / desktop.css — an additive overlay on www/
+│   └── src-tauri/
+│       ├── src/main.rs     bind a port, spawn the sidecar, create the WebView window
+│       ├── src/sidecar.rs  axum server: serves www/, proxies /api/*, injects the overlay
+│       ├── src/github.rs   repo clone / branch / commit / PR operations
+│       └── src/updater.rs  in-app update commands
+│
+├── scripts/
+│   ├── deploy.sh           live NAS — sync the stack and restart production containers
+│   ├── smoke-test.sh       live NAS — curls the public endpoint with the real bearer token
+│   ├── pull-models.sh      live NAS — docker exec against the NAS's Ollama
+│   └── bump-desktop-version.sh   bump the three desktop version files and tag
+│
+├── searxng/settings.yml    internal-only meta-search (JSON output on, limiter off)
+├── ai/                     task lists, design docs, release logs
+└── .github/workflows/
+    ├── ci.yml              Go + Rust checks on every push and pull request
+    └── desktop-release.yml build + sign + publish the desktop app on a `v*` tag
+```
 
-## Development
+The three `scripts/` entries marked *live NAS* read secrets from `.env` and act
+on the running production stack over SSH. None of them is a test.
 
-This README covers running the deployed system. For working on the code —
-where a feature lives, how to verify a change, the branch and commit
-conventions — read `AGENTS.md` first. Each code directory (`backend/`, `www/`,
-`desktop/`) has its own `AGENTS.md` with a file-level map.
+## How this repo is set up for agents
 
-The short version:
+Most of the work here is done by coding agents, so the repo carries the context
+an agent needs rather than assuming it. Four things make that work:
+
+- **`AGENTS.md` at the root** is the entry point: the four surfaces, the
+  verification loop, branch and commit conventions, the conventions that are
+  easy to get wrong, and an explicit list of scripts that must never be run. It
+  is self-contained — you should not need this README to make a correct change.
+- **A per-directory `AGENTS.md`** in `backend/`, `www/`, and `desktop/` maps
+  files to responsibilities, so locating a feature is not a grep through
+  thousands of lines. `backend/AGENTS.md` also carries the full `/api/*` route
+  table, which all three front-ends consume.
+- **`make check` is the single verification command**, and CI runs exactly the
+  same checks on every push and pull request — so "it passes" means the same
+  thing locally and remotely.
+- **The traps are written down.** The one that catches people most often:
+  static assets are cache-busted by hand, and the version number lives in a
+  *different file* from the asset — for the desktop app, inside Rust source.
+  Miss the bump and your change never reaches a cached browser.
 
 ```sh
 make check        # gofmt + go vet + go test, then cargo check
@@ -68,9 +123,12 @@ make run-backend  # run the Go backend locally on :8081
 make help         # all targets
 ```
 
-`make check` is what CI runs. It does **not** cover `www/` (vanilla JS, no build
-step) and there is no end-to-end test, so UI and streaming changes still need a
-human to verify them against the NAS.
+`make check` does **not** cover `www/` (vanilla JS, no build step) and there is
+no end-to-end test, so UI and streaming changes still need a human to verify
+them against the NAS.
+
+If you are changing code, read `AGENTS.md` first. The rest of this README is
+about operating the deployed system.
 
 ## Branch model
 
@@ -421,7 +479,8 @@ scripts/deploy.sh
 With no `TUNNEL_TOKEN`, this starts **ollama + caddy + backend** (LAN mode). Once
 `TUNNEL_TOKEN` is set it also starts **cloudflared**. The backend image is built
 on the NAS (`--build`), so no local Go toolchain is needed *to deploy* — you do
-need one to run `make check` while developing (see "Development" above).
+need one to run `make check` while developing (see "How this repo is set up for
+agents" above).
 
 `searxng/settings.yml` is a read-only bind mount, so edits to it are **not**
 picked up by `up -d` — restart the container after a deploy that changes it:
