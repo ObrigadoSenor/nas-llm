@@ -416,6 +416,51 @@
 .ds-pr-open:hover { text-decoration: underline; }
 .ds-pr-url { color: #6b707a; font-size: 11px; word-break: break-all; }
 
+/* --- Chat session panel (tabbed, minimalistic) --- */
+.ds-session-card { width: 480px; max-width: 92vw; padding: 16px 18px; }
+.ds-session-head { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 12px; }
+.ds-session-title-wrap { flex: 1; min-width: 0; }
+.ds-session-title {
+  margin: 0; font-size: 15px; font-weight: 600; color: #e6e6e6;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ds-session-sub {
+  font-size: 11px; color: #6b707a; margin-top: 2px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ds-tabs { display: flex; gap: 0; border-bottom: 1px solid #2a2e37; margin-bottom: 14px; }
+.ds-tab {
+  background: transparent; border: 0; border-bottom: 2px solid transparent;
+  color: #8b909a; padding: 7px 12px 8px; font-size: 13px; cursor: pointer;
+  margin-bottom: -1px; transition: color .12s, border-color .12s;
+}
+.ds-tab:hover { color: #c7ccd4; }
+.ds-tab.active { color: #e6e6e6; border-bottom-color: #4c8dff; }
+.ds-tab-panels { min-height: 120px; }
+.ds-tab-panel { display: none; }
+.ds-tab-panel.active { display: block; }
+.ds-session-diff { max-height: 32vh; margin-bottom: 12px; }
+.ds-session-input {
+  width: 100%; box-sizing: border-box; display: block; margin-bottom: 10px;
+  background: #0e1014; border: 1px solid #2a2e37; color: #e6e6e6;
+  border-radius: 8px; padding: 8px 10px; font-size: 13px; font-family: inherit;
+}
+.ds-session-input:focus { outline: none; border-color: #3a4150; }
+.ds-session-input textarea { resize: vertical; }
+.ds-session-select {
+  flex: none; width: auto; min-width: 90px; margin-bottom: 0;
+  background: #0e1014; border: 1px solid #2a2e37; color: #e6e6e6;
+  border-radius: 8px; padding: 8px 10px; font-size: 13px; font-family: inherit;
+}
+.ds-session-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.ds-session-foot { margin-top: 14px; padding-top: 12px; border-top: 1px solid #1a1d24; display: flex; justify-content: flex-end; }
+.ds-session-link {
+  background: transparent; border: 0; color: #6b707a; padding: 2px 4px;
+  font-size: 12px; cursor: pointer; text-decoration: none;
+}
+.ds-session-link:hover { color: #9aa0aa; text-decoration: underline; }
+
 /* --- Inline approval inside a Warp-style command block ---
    The block's diff preview reuses the modal's .ds-diff-* styles; just bound
    its height so a large diff doesn't push the block off the page. */

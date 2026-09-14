@@ -1376,7 +1376,6 @@ function repoMenu(r, anchor) {
   };
   add("Pull", "git pull --ff-only", () => pullRepo(r));
   add("Branch…", "Switch to a different branch (local or remote)", () => openBranchPicker(r));
-  add("Session…", "Diff, commit & push, open PR, revert", () => openSessionPanel(r.name));
   add("Ship…", "Versioned release (changelog + commit/push)", () => openShipChanges(r));
   document.body.appendChild(menu);
   const rect = anchor.getBoundingClientRect();
@@ -2023,75 +2022,107 @@ async function shipCommit(r, push) {
   }
 }
 
-// --- Repo session panel (desktop-only) ---
-// One per-repo view opened from the branch rail / per-repo ⋯ that merges the
-// working-changes review with commit/push/open-PR/ship. Modeled on the Ship
-// overlay: built once and reused; loadSessionPanel refreshes state + diff.
+// --- Chat session panel (desktop-only) ---
+// A per-chat panel opened from the composer status line (the branch rail below
+// the input). It operates on THIS CHAT's branch (conversation.repoBranch), not
+// the repo's shared checkout — commit/push/PR/merge/revert all target the chat's
+// own worktree. Tabbed: Changes | Pull request | Merge.
 function openSessionPanel(repoName) {
+  const branch = (railConv && railConv.repoBranch) || "";
+  const chatTitle = (railConv && railConv.title) || "";
   let overlay = $("dsSessionOverlay");
   if (!overlay) {
     overlay = el("div", "ds-overlay");
     overlay.id = "dsSessionOverlay";
     overlay.setAttribute("role", "dialog");
     overlay.setAttribute("aria-modal", "true");
-    overlay.setAttribute("aria-label", "Repo session");
-    const card = el("div", "ds-card ds-card-wide");
-    const head = el("div", "ds-head");
-    head.appendChild(el("h2", null, "Repo session"));
+    overlay.setAttribute("aria-label", "Chat session");
+    const card = el("div", "ds-card ds-session-card");
+    const head = el("div", "ds-session-head");
+    const titleWrap = el("div", "ds-session-title-wrap");
+    const h2 = el("h2", "ds-session-title", chatTitle || "Session"); h2.id = "dsSessionTitle";
+    titleWrap.appendChild(h2);
+    const sub = el("div", "ds-session-sub"); sub.id = "dsSessionSub";
+    titleWrap.appendChild(sub);
+    head.appendChild(titleWrap);
     const x = el("button", "ds-x"); x.textContent = "×"; x.title = "Close"; x.setAttribute("aria-label", "Close");
     x.onclick = () => overlay.classList.remove("open");
     head.appendChild(x);
     card.appendChild(head);
-    const status = el("div", "ds-note"); status.id = "dsSessionStatus";
-    card.appendChild(status);
-    const diffWrap = el("div", "ds-approval-pre-wrap"); diffWrap.id = "dsSessionDiff";
-    card.appendChild(diffWrap);
-    card.appendChild(el("div", "ds-label", "Commit message"));
-    const msgInput = document.createElement("input"); msgInput.id = "dsSessionMsg"; msgInput.type = "text"; msgInput.placeholder = "Describe what changed";
-    card.appendChild(msgInput);
-    const commitRow = el("div", "ds-row ds-approval-row");
+    const tabs = el("div", "ds-tabs");
+    const tabChanges = el("button", "ds-tab active", "Changes");
+    const tabPR = el("button", "ds-tab", "Pull request");
+    const tabMerge = el("button", "ds-tab", "Merge");
+    tabs.appendChild(tabChanges); tabs.appendChild(tabPR); tabs.appendChild(tabMerge);
+    card.appendChild(tabs);
+    const panels = el("div", "ds-tab-panels");
+    // — Changes —
+    const pChanges = el("div", "ds-tab-panel active");
+    const diffWrap = el("div", "ds-approval-pre-wrap ds-session-diff"); diffWrap.id = "dsSessionDiff";
+    pChanges.appendChild(diffWrap);
+    const msgInput = document.createElement("input"); msgInput.id = "dsSessionMsg"; msgInput.type = "text"; msgInput.placeholder = "Commit message"; msgInput.className = "ds-session-input";
+    pChanges.appendChild(msgInput);
+    const commitRow = el("div", "ds-session-actions");
     const commitBtn = el("button", "ds-btn", "Commit");
     const pushBtn = el("button", "ds-btn ds-btn-approve", "Commit & push");
     commitRow.appendChild(commitBtn); commitRow.appendChild(pushBtn);
-    card.appendChild(commitRow);
+    pChanges.appendChild(commitRow);
     const commitOut = el("div", "ds-note"); commitOut.id = "dsSessionCommitOut";
-    card.appendChild(commitOut);
-    card.appendChild(el("div", "ds-label", "Open pull request"));
-    const prTitle = document.createElement("input"); prTitle.id = "dsSessionPrTitle"; prTitle.type = "text"; prTitle.placeholder = "PR title";
-    card.appendChild(prTitle);
-    const prBody = document.createElement("textarea"); prBody.id = "dsSessionPrBody"; prBody.rows = 4; prBody.placeholder = "PR body (markdown)";
-    card.appendChild(prBody);
-    const prRow = el("div", "ds-row ds-approval-row");
+    pChanges.appendChild(commitOut);
+    const revertBtn = el("button", "ds-btn ds-btn-ghost ds-session-link", "Revert all changes");
+    pChanges.appendChild(revertBtn);
+    panels.appendChild(pChanges);
+    // — Pull request —
+    const pPR = el("div", "ds-tab-panel");
+    const prTitle = document.createElement("input"); prTitle.id = "dsSessionPrTitle"; prTitle.type = "text"; prTitle.placeholder = "PR title"; prTitle.className = "ds-session-input";
+    pPR.appendChild(prTitle);
+    const prBody = document.createElement("textarea"); prBody.id = "dsSessionPrBody"; prBody.rows = 4; prBody.placeholder = "Description"; prBody.className = "ds-session-input";
+    pPR.appendChild(prBody);
+    const prRow = el("div", "ds-session-actions");
     const prBtn = el("button", "ds-btn ds-btn-approve", "Open PR");
     prRow.appendChild(prBtn);
-    card.appendChild(prRow);
+    pPR.appendChild(prRow);
     const prOut = el("div", "ds-note"); prOut.id = "dsSessionPrOut";
-    card.appendChild(prOut);
-    card.appendChild(el("div", "ds-label", "Merge pull request"));
-    const prSelect = document.createElement("select"); prSelect.id = "dsSessionPrSelect";
-    card.appendChild(prSelect);
-    const mergeRow = el("div", "ds-row ds-approval-row");
-    const mergeMethod = document.createElement("select"); mergeMethod.id = "dsSessionMergeMethod";
+    pPR.appendChild(prOut);
+    panels.appendChild(pPR);
+    // — Merge —
+    const pMerge = el("div", "ds-tab-panel");
+    const prSelect = document.createElement("select"); prSelect.id = "dsSessionPrSelect"; prSelect.className = "ds-session-input";
+    pMerge.appendChild(prSelect);
+    const mergeRow = el("div", "ds-session-actions");
+    const mergeMethod = document.createElement("select"); mergeMethod.id = "dsSessionMergeMethod"; mergeMethod.className = "ds-session-select";
     ["merge", "squash", "rebase"].forEach((m) => { const o = document.createElement("option"); o.value = m; o.textContent = m; mergeMethod.appendChild(o); });
-    const mergeBtn = el("button", "ds-btn ds-btn-approve", "Merge PR"); mergeBtn.id = "dsSessionMergeBtn";
+    const mergeBtn = el("button", "ds-btn ds-btn-approve", "Merge"); mergeBtn.id = "dsSessionMergeBtn";
     mergeRow.appendChild(mergeMethod); mergeRow.appendChild(mergeBtn);
-    card.appendChild(mergeRow);
+    pMerge.appendChild(mergeRow);
     const mergeOut = el("div", "ds-note"); mergeOut.id = "dsSessionMergeOut";
-    card.appendChild(mergeOut);
-    const actRow = el("div", "ds-row ds-approval-row");
-    const revertBtn = el("button", "ds-btn ds-btn-ghost", "Revert");
-    const shipBtn = el("button", "ds-btn ds-btn-ghost", "Ship…");
-    actRow.appendChild(revertBtn); actRow.appendChild(shipBtn);
-    card.appendChild(actRow);
+    pMerge.appendChild(mergeOut);
+    panels.appendChild(pMerge);
+    card.appendChild(panels);
+    const foot = el("div", "ds-session-foot");
+    const shipBtn = el("button", "ds-btn-ghost ds-session-link", "Ship a release…");
+    foot.appendChild(shipBtn);
+    card.appendChild(foot);
     overlay.appendChild(card);
     document.body.appendChild(overlay);
     overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.classList.remove("open"); });
-    overlay._rebind = (name) => {
+    const switchTab = (active, panel) => {
+      [tabChanges, tabPR, tabMerge].forEach((t) => t.classList.remove("active"));
+      [pChanges, pPR, pMerge].forEach((p) => p.classList.remove("active"));
+      active.classList.add("active"); panel.classList.add("active");
+    };
+    tabChanges.onclick = () => switchTab(tabChanges, pChanges);
+    tabPR.onclick = () => switchTab(tabPR, pPR);
+    tabMerge.onclick = () => switchTab(tabMerge, pMerge);
+    overlay._switchTab = switchTab;
+    overlay._tabs = { tabChanges, pChanges };
+    overlay._rebind = (name, br) => {
       overlay._repo = name;
-      overlay._commit = (push) => sessionCommit(name, push);
-      overlay._createPR = () => sessionCreatePR(name);
-      overlay._mergePR = () => sessionMergePR(name);
-      overlay._revert = () => sessionRevert(name);
+      overlay._branch = br;
+      overlay._commit = (push) => sessionCommit(name, br, push);
+      overlay._createPR = () => sessionCreatePR(name, br);
+      overlay._mergePR = () => sessionMergePR(name, br);
+      overlay._revert = () => sessionRevert(name, br);
       overlay._ship = () => { overlay.classList.remove("open"); openShipChanges({ name }); };
     };
     commitBtn.onclick = () => overlay._commit(false);
@@ -2102,7 +2133,8 @@ function openSessionPanel(repoName) {
     shipBtn.onclick = () => overlay._ship();
   }
   const prev = overlay._repo;
-  overlay._rebind(repoName);
+  overlay._rebind(repoName, branch);
+  const h2 = $("dsSessionTitle"); if (h2) h2.textContent = chatTitle || "Session";
   if (prev !== repoName) {
     const m = $("dsSessionMsg"); if (m) m.value = "";
     const pt = $("dsSessionPrTitle"); if (pt) pt.value = "";
@@ -2111,57 +2143,61 @@ function openSessionPanel(repoName) {
   const co = $("dsSessionCommitOut"); if (co) co.textContent = "";
   const po = $("dsSessionPrOut"); if (po) po.textContent = "";
   const mo = $("dsSessionMergeOut"); if (mo) mo.textContent = "";
+  // Reset to the Changes tab on each open.
+  if (overlay._tabs) overlay._switchTab(overlay._tabs.tabChanges, overlay._tabs.pChanges);
   overlay.classList.add("open");
-  loadSessionPanel(repoName);
+  loadSessionPanel(repoName, branch);
 }
 
-async function loadSessionPanel(repoName) {
+async function loadSessionPanel(repoName, branch) {
   const overlay = $("dsSessionOverlay"); if (!overlay) return;
-  const status = $("dsSessionStatus");
+  const sub = $("dsSessionSub");
   const diffWrap = $("dsSessionDiff");
-  if (status) status.textContent = "Loading repo state…";
+  if (sub) sub.textContent = "Loading…";
   if (diffWrap) diffWrap.innerHTML = "";
-  const sr = await sid("repos/state?name=" + encodeURIComponent(repoName));
+  const qp = "name=" + encodeURIComponent(repoName) + (branch ? "&branch=" + encodeURIComponent(branch) : "");
+  const sr = await sid("repos/state?" + qp);
   const sd = (sr && sr.data) || {};
-  const dr = await sid("repos/diff", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: repoName }) });
+  const diffBody = { name: repoName }; if (branch) diffBody.branch = branch;
+  const dr = await sid("repos/diff", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(diffBody) });
   const dd = (dr && dr.data) || {};
-  if (status) {
+  if (sub) {
     const segs = [repoName];
     if (sd.branch) segs.push("⎇ " + sd.branch);
-    if (sd.dirty) segs.push("●" + sd.dirty + " dirty");
+    if (sd.dirty) segs.push("●" + sd.dirty);
     if (sd.ahead) segs.push("↑" + sd.ahead);
     if (sd.behind) segs.push("↓" + sd.behind);
     if (sd.hasRemote === false) segs.push("no remote");
-    status.textContent = segs.join(" · ");
+    sub.textContent = segs.join(" · ");
   }
   if (diffWrap) {
     if (dr.ok && dd.diff && dd.diff.trim()) renderApprovalContent(diffWrap, "apply_patch", dd.diff);
     else diffWrap.appendChild(el("div", "ds-note", "No uncommitted changes."));
   }
-  // Commit & push + Open PR both need a remote.
   const hasRemote = sd.hasRemote !== false;
   overlay.querySelectorAll(".ds-btn-approve").forEach((b) => {
     if (!hasRemote) { b.disabled = true; b.title = "No remote configured for this repo."; }
     else { b.disabled = false; b.title = ""; }
   });
-  loadSessionPRs(repoName);
+  loadSessionPRs(repoName, branch);
 }
 
-async function sessionCommit(repoName, push) {
+async function sessionCommit(repoName, branch, push) {
   const out = $("dsSessionCommitOut");
   const msg = ($("dsSessionMsg") && $("dsSessionMsg").value.trim()) || "";
   if (!msg) { if (out) out.textContent = "Enter a commit message."; return; }
   if (push) {
-    const ok = await dsConfirm("Push to the remote?", "This commits and pushes " + repoName + " to its origin.");
+    const ok = await dsConfirm("Push to the remote?", "This commits and pushes " + repoName + (branch ? " (" + branch + ")" : "") + " to its origin.");
     if (!ok) return;
   }
   if (out) out.textContent = push ? "Committing and pushing…" : "Committing…";
-  const res = await sid("repos/commit", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repo: repoName, message: msg, push }) });
+  const body = { repo: repoName, message: msg, push }; if (branch) body.branch = branch;
+  const res = await sid("repos/commit", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   const d = (res && res.data) || {};
   if (d.ok) {
     const head = (d.head || "").slice(0, 7);
     if (out) out.textContent = push ? (d.pushed ? "Pushed ✓ (head " + head + ")" : ("Committed, but push failed: " + (d.error || "unknown"))) : "Committed ✓ (head " + head + ")";
-    loadSessionPanel(repoName);
+    loadSessionPanel(repoName, branch);
     refreshRailState();
     refreshLocal();
   } else {
@@ -2169,13 +2205,14 @@ async function sessionCommit(repoName, push) {
   }
 }
 
-async function sessionCreatePR(repoName) {
+async function sessionCreatePR(repoName, branch) {
   const out = $("dsSessionPrOut");
   const title = ($("dsSessionPrTitle") && $("dsSessionPrTitle").value.trim()) || "";
   const body = ($("dsSessionPrBody") && $("dsSessionPrBody").value) || "";
   if (!title) { if (out) out.textContent = "Enter a PR title."; return; }
   if (out) out.textContent = "Pushing branch and opening PR…";
-  const res = await sid("repos/create-pr", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repo: repoName, title, body }) });
+  const reqBody = { repo: repoName, title, body }; if (branch) reqBody.branch = branch;
+  const res = await sid("repos/create-pr", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(reqBody) });
   const d = (res && res.data) || {};
   if (d.ok && d.url) {
     if (out) {
@@ -2191,26 +2228,24 @@ async function sessionCreatePR(repoName) {
   }
 }
 
-async function sessionRevert(repoName) {
-  const ok = await dsConfirm("Revert all working changes in " + repoName + "?", "This runs git checkout -- . && git clean -fd, discarding all uncommitted edits.");
+async function sessionRevert(repoName, branch) {
+  const ok = await dsConfirm("Revert all working changes?", "This runs git checkout -- . && git clean -fd in " + repoName + (branch ? " (" + branch + ")" : "") + ", discarding all uncommitted edits.");
   if (!ok) return;
-  const res = await sid("repos/revert", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: repoName }) });
+  const body = { name: repoName }; if (branch) body.branch = branch;
+  const res = await sid("repos/revert", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   const d = (res && res.data) || {};
   if (!d.ok) flashDsErr(d.error || res.status);
-  loadSessionPanel(repoName);
+  loadSessionPanel(repoName, branch);
   refreshRailState();
   refreshLocal();
 }
 
-// loadSessionPRs populates the session panel's Merge PR picker from the
-// /__sidecar/repos/prs route (shared with the agent's list_prs tool). Each
-// option is "#N title [draft] · CI=state". The Merge button is disabled when
-// there are no PRs or the list can't be loaded.
-async function loadSessionPRs(repoName) {
+async function loadSessionPRs(repoName, branch) {
   const sel = $("dsSessionPrSelect"); if (!sel) return;
   const mergeBtn = $("dsSessionMergeBtn");
   sel.innerHTML = "";
-  const r = await sid("repos/prs?name=" + encodeURIComponent(repoName));
+  const qp = "name=" + encodeURIComponent(repoName) + (branch ? "&branch=" + encodeURIComponent(branch) : "");
+  const r = await sid("repos/prs?" + qp);
   const d = (r && r.data) || {};
   if (!r.ok || !Array.isArray(d.prs)) {
     const o = document.createElement("option");
@@ -2238,9 +2273,7 @@ async function loadSessionPRs(repoName) {
   if (mergeBtn) { mergeBtn.disabled = false; mergeBtn.title = ""; }
 }
 
-// sessionMergePR merges the PR selected in the picker via /__sidecar/repos/merge-pr.
-// Confirms first (merge is irreversible), then refreshes the PR list + rail.
-async function sessionMergePR(repoName) {
+async function sessionMergePR(repoName, branch) {
   const out = $("dsSessionMergeOut");
   const sel = $("dsSessionPrSelect");
   const number = sel && sel.value ? parseInt(sel.value, 10) : 0;
@@ -2249,12 +2282,13 @@ async function sessionMergePR(repoName) {
   const ok = await dsConfirm("Merge PR #" + number + "?", "This merges PR #" + number + " in " + repoName + " via " + method + ". This is irreversible.");
   if (!ok) return;
   if (out) out.textContent = "Merging…";
-  const res = await sid("repos/merge-pr", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repo: repoName, number, method }) });
+  const body = { repo: repoName, number, method }; if (branch) body.branch = branch;
+  const res = await sid("repos/merge-pr", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   const d = (res && res.data) || {};
   if (d.ok) {
     const sha = (d.sha || "").slice(0, 7);
     if (out) out.textContent = "Merged ✓ PR #" + number + (sha ? " (sha " + sha + ")" : "");
-    loadSessionPRs(repoName);
+    loadSessionPRs(repoName, branch);
     refreshRailState();
   } else {
     if (out) out.textContent = "Failed: " + (d.error || res.status || "unknown");
