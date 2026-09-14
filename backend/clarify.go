@@ -51,7 +51,7 @@ var askUserTool = oaiTool{
 	Type: "function",
 	Function: oaiToolFunction{
 		Name:        "ask_user",
-		Description: "Ask the user a clarifying question when their request is ambiguous or missing a key detail. Provide concrete, distinct options the user can pick from. Only call this when you genuinely need more information before you can help; otherwise answer directly.",
+		Description: "Ask the user a clarifying question about THEIR intent, preferences, or requirements when a request is genuinely ambiguous and you cannot proceed without the answer. Provide concrete, distinct options. Never use this to ask about the codebase (which files, where something is, how it works) — discover that yourself with grep, glob, read_file, list_files, and git_status. Only call ask_user when the request is truly unclear; otherwise act directly.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

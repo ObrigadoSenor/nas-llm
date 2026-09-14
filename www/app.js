@@ -1444,25 +1444,28 @@ function addMsg(role, text, ts, searches, images, clarify, answered, steps, thou
   // snippets), then the answer bubble, then a meta row (date/time + source-link
   // chips + tool badge + copy icon) below. Left-aligned.
   //
-  // Live (streaming / resume) renders the thinking/steps/search wraps inline so
-  // tailJob can fill them in real time. Finalized (rerenderChat) compacts them
-  // into a single tool-badge icon in the meta row; clicking it opens a popup
-  // with the full detail. Clarify turns render an interactive card in the
+  // The thinking accordion is always built inline — for live turns it streams
+  // open then collapses on done; for finalized/reloaded turns it renders
+  // collapsed with a static "Thinking" label and small dim text behind the
+  // accordion (no longer hidden behind the tool-badge popup). Steps and search
+  // evidence stay inline for live turns and compact into the tool-badge popup
+  // for finalized turns. Clarify turns render an interactive card in the
   // bubble, so they get no badge. The wraps live outside the StreamRenderer's
   // container so streaming re-parses never wipe them.
   const hasClarify = !!(clarify && clarify.questions && clarify.questions.length);
   let thoughtsWrap=null, thoughtsDet=null, stepsWrap=null, searchWrap=null, srcLinks=null;
+  // Thinking accordion — inline for both live and finalized turns.
+  const built=buildThoughtsWrap(); thoughtsWrap=built.wrap; thoughtsDet=built.det;
+  if(thoughts && thoughts.length){
+    // Persisted/reloaded reasoning: render collapsed with a static "Thinking"
+    // label (no live timer). A live resume (resumeIfGenerating -> tailJob)
+    // flips it open with the streaming summary; fresh live turns have none.
+    renderThoughts(thoughtsWrap, thoughts);
+    setThoughtsSummary(thoughtsDet,"Thinking",{streaming:false});
+    if(thoughtsDet) thoughtsDet.open=false;
+  } else thoughtsWrap.classList.add("hidden");
+  d.appendChild(thoughtsWrap);
   if(live){
-    const built=buildThoughtsWrap(); thoughtsWrap=built.wrap; thoughtsDet=built.det;
-    if(thoughts && thoughts.length){
-      // Persisted/reloaded reasoning: render collapsed with a static "Thinking"
-      // label (no live timer). A live resume (resumeIfGenerating -> tailJob)
-      // flips it open with the streaming summary; fresh live turns have none.
-      renderThoughts(thoughtsWrap, thoughts);
-      setThoughtsSummary(thoughtsDet,"Thinking",{streaming:false});
-      if(thoughtsDet) thoughtsDet.open=false;
-    } else thoughtsWrap.classList.add("hidden");
-    d.appendChild(thoughtsWrap);
     stepsWrap=document.createElement("div"); stepsWrap.className="msg-steps";
     if(steps && steps.length) renderAgentSteps(stepsWrap, steps);
     else stepsWrap.classList.add("hidden");
@@ -1489,8 +1492,8 @@ function addMsg(role, text, ts, searches, images, clarify, answered, steps, thou
   if(searches && searches.length) renderSourceLinks(srcLinks, searches);
   meta.appendChild(srcLinks);
   if(!live && !hasClarify){
-    const badge=toolBadgeFor({searches, steps, thoughts});
-    if(badge){ badge.addEventListener("click",e=>{ e.stopPropagation(); openToolPopup(badge, {searches, steps, thoughts}); }); meta.appendChild(badge); }
+    const badge=toolBadgeFor({searches, steps});
+    if(badge){ badge.addEventListener("click",e=>{ e.stopPropagation(); openToolPopup(badge, {searches, steps}); }); meta.appendChild(badge); }
   }
   if(text && !hasClarify) addCopyMsg(meta, text);
   d.appendChild(meta);
@@ -1513,9 +1516,10 @@ function addCopyMsg(roleRow, text){
 }
 // --- Tool-usage indicator (finalized answers) -----------------------------
 // makeToolBadge builds the small meta-row icon button; toolBadgeFor picks the
-// icon from the persisted tool data. Agent (steps or thoughts) → sparkles;
-// pure web search → globe, dimmed when the only entry is a skipped/no-op marker
-// (the old "Web search on — model answered without searching" text). Plain
+// icon from the persisted tool data. Agent steps → sparkles; pure web search
+// → globe, dimmed when the only entry is a skipped/no-op marker (the old "Web
+// search on — model answered without searching" text). Thinking is rendered
+// inline (collapsed accordion), so it no longer drives the badge. Plain
 // answers and clarify cards get no badge.
 function makeToolBadge(iconName, title){
   const btn=document.createElement("button"); btn.type="button";
@@ -1523,8 +1527,8 @@ function makeToolBadge(iconName, title){
   btn.innerHTML=icon(iconName,14);
   return btn;
 }
-function toolBadgeFor({searches, steps, thoughts}){
-  if((steps && steps.length) || (thoughts && thoughts.length)) return makeToolBadge("sparkles","Agent mode");
+function toolBadgeFor({searches, steps}){
+  if(steps && steps.length) return makeToolBadge("sparkles","Agent mode");
   if(searches && searches.length){
     const b=makeToolBadge("globe","Web search");
     if(searches.every(e=>e && e.skipped)) b.classList.add("dim");
@@ -1532,15 +1536,15 @@ function toolBadgeFor({searches, steps, thoughts}){
   }
   return null;
 }
-// openToolPopup builds a floating panel with the full search/steps/thoughts
-// detail (rendered by the same lib helpers used inline) and closes on
-// outside-click, mirroring the row action menus (closeMenu/positionMenu).
+// openToolPopup builds a floating panel with the full search/steps detail
+// (rendered by the same lib helpers used inline) and closes on outside-click,
+// mirroring the row action menus (closeMenu/positionMenu). Thinking is not
+// included — it renders inline as a collapsed accordion on the message.
 function openToolPopup(anchor, data){
   closeMenu();
   const m=document.createElement("div"); m.className="tool-popup";
   if(data.searches && data.searches.length){ const sw=document.createElement("div"); sw.className="msg-search"; renderSearchBlock(sw, data.searches); m.appendChild(sw); }
   if(data.steps && data.steps.length){ const st=document.createElement("div"); st.className="msg-steps"; renderAgentSteps(st, data.steps); m.appendChild(st); }
-  if(data.thoughts && data.thoughts.length){ const tw=buildThoughtsWrap(); renderThoughts(tw.wrap, data.thoughts); setThoughtsSummary(tw.det,"Thinking",{streaming:false}); if(tw.det) tw.det.open=false; m.appendChild(tw.wrap); }
   if(!m.children.length) return;
   document.body.appendChild(m);
   const r=anchor.getBoundingClientRect();

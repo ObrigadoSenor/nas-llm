@@ -22,8 +22,14 @@ const (
 	// this bounds the backend<->Ollama leg so a stuck generation can't hang a
 	// worker slot forever.
 	genTimeout     = 5 * time.Minute
-	subBufferSize  = 512 // ~50s of tokens at 10 tok/s on the N100; live clients read far faster
+	subBufferSize  = 2048 // generous: a long narration stream must not fill the buffer and cause a dropped toolExec/modelCall event
 	keepaliveEvery = 5 * time.Second
+	// controlSendTimeout bounds the blocking send for critical control events
+	// (toolExec, modelCall, questions). Short so a truly stuck client is still
+	// skipped, but long enough that a healthy client briefly behind after a burst
+	// of chunk events still receives the event instead of silently losing it
+	// (which would hang the agent relay loop for TOOL_EXEC_TIMEOUT).
+	controlSendTimeout = 2 * time.Second
 	// defaultAgentJobTimeout/defaultToolExecTimeout back-stop a zero-value
 	// s.cfg.agentJobTimeout/toolExecTimeout (e.g. a *server built directly in a
 	// test without going through main's envDuration defaulting). Mirrors the
@@ -186,6 +192,22 @@ type toolExecResponse struct {
 	Error       string `json:"error,omitempty"`
 }
 
+// broadcastControl sends ev to every live subscriber, blocking up to
+// controlSendTimeout per subscriber so a critical control event (toolExec,
+// modelCall, questions) is never silently dropped when the channel is near-full
+// from a burst of chunk events. A stuck client that can't drain within the
+// timeout is still skipped (matching the non-blocking semantics of chunk sends)
+// — but a healthy client that's briefly behind gets the event delivered instead
+// of a hung agent loop.
+func (j *job) broadcastControl(ev subEvent, subs []chan subEvent) {
+	for _, ch := range subs {
+		select {
+		case ch <- ev:
+		case <-time.After(controlSendTimeout):
+		}
+	}
+}
+
 func newJobID() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
@@ -242,12 +264,7 @@ func (j *job) emitModelCall(model string, messages []oaiMessage, tools []oaiTool
 	}
 	j.mu.Unlock()
 	ev := subEvent{kind: "modelCall", text: string(b)}
-	for _, ch := range subs {
-		select {
-		case ch <- ev:
-		default:
-		}
-	}
+	j.broadcastControl(ev, subs)
 	j.publishHub(ev)
 }
 
@@ -288,12 +305,7 @@ func (j *job) emitToolExec(step int, tool, args, repo, branch string, autoApprov
 	}
 	j.mu.Unlock()
 	ev := subEvent{kind: "toolExec", text: string(b)}
-	for _, ch := range subs {
-		select {
-		case ch <- ev:
-		default:
-		}
-	}
+	j.broadcastControl(ev, subs)
 	j.publishHub(ev)
 }
 
@@ -414,12 +426,7 @@ func (j *job) emitQuestions(meta clarifyMeta) {
 	j.mu.Unlock()
 	b, _ := json.Marshal(meta)
 	ev := subEvent{kind: "questions", text: string(b)}
-	for _, ch := range subs {
-		select {
-		case ch <- ev:
-		default:
-		}
-	}
+	j.broadcastControl(ev, subs)
 }
 
 // clarifySnapshot returns a copy of the stashed clarifying question(s) for

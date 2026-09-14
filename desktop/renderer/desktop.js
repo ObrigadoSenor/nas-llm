@@ -362,9 +362,10 @@ async function titleForConv(convId) {
 // opening a PR is external/irreversible, so it always prompts regardless.
 const AUTO_APPROVE_TOOLS = new Set(["apply_patch", "run_command", "git_commit", "git_push"]);
 async function runToolExec(convId, d) {
+  const autoApproved = !!(d.autoApprove && AUTO_APPROVE_TOOLS.has(d.tool));
   const execBody = { repo: d.repo, tool: d.tool, args: d.args || "" };
   if (d.branch) execBody.branch = d.branch;
-  if (d.autoApprove && AUTO_APPROVE_TOOLS.has(d.tool)) execBody.approved = true;
+  if (autoApproved) execBody.approved = true;
   let execRes;
   try {
     const r = await fetch("/__sidecar/repos/exec", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(execBody) });
@@ -391,10 +392,15 @@ async function runToolExec(convId, d) {
     }
   }
   // Post the observation back to the backend so the agent loop continues.
+  // When auto-approve fired, tag the preview so the trace step shows the tool
+  // ran without an approval dialog — a visible signal that auto-approve worked
+  // (and a diagnostic when it doesn't).
+  const preview = execRes.preview || "";
+  const postedPreview = autoApproved && preview ? preview + " (auto-approved)" : preview;
   try {
     await fetch("/api/conversations/" + encodeURIComponent(convId) + "/tool-response", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ jobId: d.jobId, observation: execRes.observation || "", preview: execRes.preview || "", isError: !!execRes.is_error })
+      body: JSON.stringify({ jobId: d.jobId, observation: execRes.observation || "", preview: postedPreview, isError: !!execRes.is_error })
     });
   } catch {}
   // A write tool may have changed the working tree — refresh the branch rail,
