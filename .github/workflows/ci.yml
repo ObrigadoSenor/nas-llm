@@ -1,0 +1,78 @@
+name: CI
+
+# The repo's only other workflow (desktop-release.yml) runs on `v*` tags, so
+# nothing validated ordinary pushes or pull requests. This is that gate: the
+# same checks `make check` runs locally. See AGENTS.md.
+
+on:
+  push:
+    branches: ["main", "production"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (Go)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to the version in backend/go.mod, which backend/Dockerfile also
+      # builds with (golang:1.22-alpine). gofmt rules change between releases,
+      # so the formatting gate is only meaningful on the pinned version.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: gofmt
+        working-directory: backend
+        run: |
+          out="$(gofmt -l .)"
+          if [ -n "$out" ]; then
+            echo "These files need gofmt:"
+            echo "$out"
+            echo
+            gofmt -d .
+            exit 1
+          fi
+          echo "gofmt: clean"
+
+      - name: go vet
+        working-directory: backend
+        run: go vet ./...
+
+      - name: go test
+        working-directory: backend
+        run: go test ./...
+
+  desktop:
+    name: Desktop sidecar (Rust)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Tauri's Linux build needs GTK/WebKit headers; the macOS release build
+      # gets these from the system SDK.
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: cargo check
+        working-directory: desktop/src-tauri
+        run: cargo check
