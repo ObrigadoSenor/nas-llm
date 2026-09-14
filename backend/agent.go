@@ -30,8 +30,9 @@ import (
 // the current date injected so the model doesn't hallucinate "today".
 
 const (
-	agentObsMaxChars = 4000 // cap a tool observation fed back to the model
-	agentDupLimit    = 3    // same tool+args this many times -> nudge to answer
+	agentObsMaxChars      = 4000 // cap a tool observation fed back to the model
+	agentDupLimit         = 3    // same tool+args this many times -> nudge to answer
+	agentNarrationRetries = 1    // re-prompt a narrating model this many times before accepting prose
 
 	// Context compaction (Tier 3). Triggered when the estimated token count of
 	// the running message list crosses 70% of the configured context window.
@@ -427,7 +428,7 @@ func injectRepoContext(sys string, r *Repo, convBranch string) string {
 	} else {
 		b.WriteString("(empty)")
 	}
-	b.WriteString(". Use the read_file, list_files, glob, grep, and git_status tools to explore the codebase. Make changes directly with apply_patch, run commands with run_command, and when the work is done commit with git_commit, push with git_push, and open a pull request with create_pr. Paths are repository-relative. Do not write diffs or commands as prose — call the tool so the change is actually applied. Keep answers grounded in what you read — do not guess at file contents.\n\n")
+	b.WriteString(". Use the read_file, list_files, glob, grep, and git_status tools to explore the codebase and discover what you need yourself — do NOT ask the user about the codebase (which files, where something is, how it works); look it up. Make changes directly with apply_patch, run commands with run_command, and when the work is done commit with git_commit, push with git_push, and open a pull request with create_pr. Paths are repository-relative. Do not write diffs or commands as prose — call the tool so the change is actually applied. Keep answers grounded in what you read — do not guess at file contents.\n\n")
 	b.WriteString(sys)
 	return b.String()
 }
@@ -448,10 +449,15 @@ func agentSystemNudge() string {
 	return "You are a capable agent running on a small local server. Today is " + now + ". " +
 		"You have tools to help with tasks. Use a tool only when it is genuinely needed to make " +
 		"progress; otherwise answer directly. When the user asks you to change code or run something, " +
-		"do it directly with the tools — do not just describe or quote the changes. Only call ask_user " +
-		"to clarify when the request is genuinely ambiguous and you cannot proceed without the answer; " +
-		"otherwise act. After one or two tool calls, synthesize a clear final answer for the user. " +
-		"Do not repeat the same tool call with the same arguments. If a tool returns an error, read " +
+		"do it directly with the tools — do not just describe or quote the changes. Discover codebase " +
+		"facts yourself with grep, glob, read_file, list_files, and git_status — never ask the user " +
+		"about the codebase (which files to touch, where something lives, how it works); look it up. " +
+		"Reserve ask_user for the user's own intent, preferences, or requirements that are genuinely " +
+		"ambiguous and that you cannot discover from the codebase or conversation; if the request is " +
+		"clear enough to act, act. If the task requires editing files or running commands, your FIRST response MUST be a " +
+		"structured tool call (apply_patch / run_command), not an explanation of what you plan to do — never say \"I will\" " +
+		"or \"Let me\" without immediately emitting the tool call. After the work is done, synthesize a clear final " +
+		"answer for the user. Do not repeat the same tool call with the same arguments. If a tool returns an error, read " +
 		"it and adjust — do not retry blindly. Keep answers concise."
 }
 
@@ -529,6 +535,7 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 	sys = sys + "\n\n" + toolCallDiscipline()
 	messages := append([]oaiMessage{{Role: "system", Content: jsonString(sys)}}, msgs...)
 	seen := map[string]int{}
+	narrationRetries := 0
 	for step := 0; step < s.cfg.maxAgentSteps; step++ {
 		// Bound the running transcript before each model call so a long multi-step
 		// run can't overflow the context window (Tier 3 compaction). Only a
@@ -552,20 +559,79 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 		}
 		roundText := contentText(msg.Content)
 		if len(msg.ToolCalls) == 0 {
-			// Final answer — its content was already streamed (server backend) or
-			// rendered by the browser (relay), and stays in the bubble + j.content
-			// (the answer, not thinking).
-			emitPhase("answering")
-			// If the model answered on its very first turn without ever calling a
-			// tool, surface that as a trace step so a tool-capable model declining to
-			// use tools reads as model behavior, not a silent "agent did nothing".
-			if step == 0 {
-				emitTool(agentStep{Step: 1, Tool: "(direct)", Preview: "Answered directly — no tools were needed."})
+			// Prose tool-call recovery: a small model that reports a tools
+			// capability but can't emit structured tool_calls deltas often
+			// writes the call as a JSON block in prose ("I'll list the files:
+			// ```{ "name": "list_files", "arguments": {"path":"src"} }```").
+			// The narration guard's re-prompt can't fix this — the model
+			// physically can't switch to the structured format — so parse the
+			// JSON out of the prose and execute it as a real tool call. The run
+			// then continues with a real observation instead of dead-ending on
+			// the narration. Only the first parseable call to an offered tool is
+			// recovered (the model often writes it twice); the preamble stays as
+			// thinking. If no parseable call is found, fall through to the
+			// narration guard / final-answer path.
+			if tc, ok := extractProseToolCall(roundText, added); ok {
+				msg.ToolCalls = []oaiToolCall{tc}
+				// Fall through to the tool-execution path below (do not return):
+				// the preamble is moved to thinking and the recovered call runs
+				// exactly like a real one.
+			} else {
+				// Narration guard: a small local model often describes what it
+				// would do ("I'll edit foo.go to...") instead of emitting a
+				// structured tool_call. Without this guard the loop treats that
+				// prose as the final answer and returns at step 0 — the "agent
+				// explains but never does anything" symptom. When no tool has run
+				// yet (step == 0) and the text reads like an intention/plan, move
+				// the narration to the thinking drawer and feed back a corrective
+				// system message forcing a real tool call, then re-run. Bounded to
+				// agentNarrationRetries so a model that keeps narrating eventually
+				// falls through to a real answer instead of looping. A genuine
+				// final answer (no first-person intention phrasing) returns as
+				// before. This runs only when prose-recovery found nothing to
+				// execute — pure intention prose with no JSON tool call.
+			// Also catch second-person "hand me the tool output / run this for
+			// me" prose (looksLikeAwaitingToolResult) — the dead-end that
+			// neither prose-recovery nor the intention-narration guard matches.
+			awaiting := looksLikeAwaitingToolResult(roundText)
+			if step == 0 && (looksLikeNarration(roundText) || awaiting) && narrationRetries < agentNarrationRetries {
+				narrationRetries++
+				if roundText != "" {
+					emitThought(roundText)
+				}
+				emitClear()
+				messages = append(messages, msg, oaiMessage{Role: "system", Content: jsonString(awaitingToolNudge(awaiting))})
+				continue
 			}
-			if roundText == "" {
-				emit("(no response)")
+			// Interactive fallback: the model asked the user to hand it a tool
+			// output or run a command for it even after the re-prompt, or on a
+			// later step. Don't stream that dead-end prose as the answer —
+			// surface a clickable "proceed" clarify card (reusing the ask_user
+			// card UI + answer path) so the user can nudge the agent back to
+			// running its tools itself. Pure narration that exhausted the guard
+			// falls through to the normal final-answer path below, unchanged.
+			if awaiting {
+				emitClear()
+				emitQuestions(synthesizeProceedCard(roundText))
+				emitPhase("clarifying")
+				return nil
 			}
-			return nil
+				// Final answer — its content was already streamed (server backend)
+				// or rendered by the browser (relay), and stays in the bubble +
+				// j.content (the answer, not thinking).
+				emitPhase("answering")
+				// If the model answered on its very first turn without ever calling a
+				// tool, surface that as a trace step so a tool-capable model
+				// declining to use tools reads as model behavior, not a silent
+				// "agent did nothing".
+				if step == 0 {
+					emitTool(agentStep{Step: 1, Tool: "(direct)", Preview: "Answered directly — no tools were needed."})
+				}
+				if roundText == "" {
+					emit("(no response)")
+				}
+				return nil
+			}
 		}
 		// Thinking round (had tool calls): move this round's text to the thinking
 		// drawer and clear the answer bubble so it ends up holding only the final
@@ -673,6 +739,170 @@ func trimPreview(s string) string {
 		return s[:120] + "…"
 	}
 	return s
+}
+
+// extractProseToolCall scans text for the first JSON object shaped like a tool
+// call ({"name": "...", "arguments": {...}}) whose name is an offered tool, and
+// returns a synthesized oaiToolCall to execute. It recovers tool calls a small
+// model wrote as prose (often in a fenced code block) because it could not emit
+// structured tool_calls deltas — without this the agent loop dead-ends on the
+// narration. offered is the set of tool names actually sent to the model this
+// run (so a call to a filtered-out local tool is not recovered). Only the first
+// parseable call is returned; the model frequently writes the same call twice.
+func extractProseToolCall(text string, offered map[string]bool) (oaiToolCall, bool) {
+	for i := 0; i < len(text); i++ {
+		if text[i] != '{' {
+			continue
+		}
+		end := findJSONEnd(text, i)
+		if end < 0 {
+			break
+		}
+		blob := text[i : end+1]
+		var parsed struct {
+			Name      string          `json:"name"`
+			Arguments json.RawMessage `json:"arguments"`
+		}
+		if json.Unmarshal([]byte(blob), &parsed) == nil && offered[parsed.Name] {
+			args := strings.TrimSpace(string(parsed.Arguments))
+			if args == "" {
+				args = "{}"
+			}
+			var tc oaiToolCall
+			tc.ID = "prose_" + parsed.Name
+			tc.Type = "function"
+			tc.Function.Name = parsed.Name
+			tc.Function.Arguments = args
+			return tc, true
+		}
+		i = end
+	}
+	return oaiToolCall{}, false
+}
+
+// findJSONEnd returns the index of the closing '}' that balances the '{' at
+// start, accounting for nested objects and string literals. Returns -1 if the
+// object is unbalanced. Used by extractProseToolCall to carve JSON blobs out of
+// prose without a full JSON tokenizer.
+func findJSONEnd(s string, start int) int {
+	depth := 0
+	inStr := false
+	esc := false
+	for i := start; i < len(s); i++ {
+		c := s[i]
+		if inStr {
+			if esc {
+				esc = false
+			} else if c == '\\' {
+				esc = true
+			} else if c == '"' {
+				inStr = false
+			}
+			continue
+		}
+		if c == '"' {
+			inStr = true
+			continue
+		}
+		if c == '{' {
+			depth++
+		}
+		if c == '}' {
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// looksLikeNarration reports whether text reads like the model describing an
+// action it intends to take ("I'll edit...", "Let me change...") rather than a
+// genuine final answer. Used by the agent loop's narration guard to re-prompt a
+// small model that narrates a tool call instead of emitting one. Conservative:
+// only first-person intention phrasing triggers it, so a real answer ("The file
+// is X", "Done") is left alone and returned as the final answer.
+func looksLikeNarration(text string) bool {
+	t := strings.ToLower(strings.TrimSpace(text))
+	if t == "" {
+		return false
+	}
+	for _, p := range []string{
+		"i'll", "i will", "i would", "i'd like", "i'd go", "let me", "i'm going to",
+		"i am going to", "i plan to", "here's what i", "i could edit", "i can edit",
+		"i will edit", "i'll edit", "i'll change", "i will change", "i'll add",
+		"i will add", "i'll create", "i will create", "i'll run", "i will run",
+		"i'll update", "i will update", "i'll modify", "i will modify", "i'll replace",
+		"i will replace", "i'll remove", "i will remove", "i'll fix", "i will fix",
+	} {
+		if strings.Contains(t, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// looksLikeAwaitingToolResult reports whether text reads like the agent
+// asking the user to hand it a tool output or run a command for it ("Please
+// provide the output from the tool response so I can proceed…") — the prose
+// dead-end that neither extractProseToolCall (no JSON blob) nor
+// looksLikeNarration (first-person intention only) catches, so it would
+// otherwise be streamed to the user as the final answer. Conservative: every
+// phrase requires a request verb or an explicit "tool response so I can"
+// clause, so a genuine answer that merely mentions a result ("The get_time
+// tool returned 3pm.") does not match.
+func looksLikeAwaitingToolResult(text string) bool {
+	t := strings.ToLower(strings.TrimSpace(text))
+	if t == "" {
+		return false
+	}
+	for _, p := range []string{
+		"provide the output", "provide the result", "provide the tool response",
+		"please provide", "please paste", "please run",
+		"paste the output", "paste the result", "paste the tool",
+		"the output from the tool", "tool response so i can",
+		"waiting for the tool", "awaiting the tool",
+		"i need the output", "i need the result", "i need you to",
+		"could you provide", "can you provide",
+		"could you run", "can you run",
+		"could you paste", "can you paste",
+		"share the output", "send the output",
+	} {
+		if strings.Contains(t, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// awaitingToolNudge is the corrective system message fed back when the guard
+// re-prompts a stalling model. The awaiting variant states the fact the
+// dead-end prose gets wrong — no tool has run yet, so there is no output to
+// provide, and a tool runs only via a structured tool call whose result is
+// returned automatically — and directs the model to emit one now. The
+// narration variant (awaiting == false) keeps the original intention-prose
+// nudge so TestAgentNarrationGuard's behavior is unchanged.
+func awaitingToolNudge(awaiting bool) string {
+	if awaiting {
+		return "No tool has run yet, so there is no tool output to provide. The user will not paste a tool result or run a command for you — a tool executes only when YOU emit a structured tool call, and its output is returned to you automatically as the observation. Emit a structured tool call now to actually make progress: apply_patch to edit files, run_command to run a command, git_commit/git_push to commit/push, or read_file/grep/glob/list_files/git_status to inspect the codebase. If you genuinely cannot proceed without information only the user can give, call ask_user. Do not ask the user for tool output."
+	}
+	return "You described what you would do but did not call a tool. Do not explain, describe, or narrate a plan — emit a structured tool call NOW to actually do it: apply_patch to edit files, run_command to run a command, git_commit/git_push to commit/push. If you genuinely cannot proceed without information from the user, call ask_user. Do not write another plan."
+}
+
+// synthesizeProceedCard builds a clickable "proceed" clarify card from an
+// agent turn that asked the user to hand it a tool output / run a command
+// (the prose dead-end), for the interactive fallback. It reuses the ask_user
+// clarify-card UI and answer path: the user's click becomes a new user turn
+// that re-runs the agent, nudging it back to running its tools itself. The
+// agent's prose is the card's question text; the single option is a
+// "Continue" nudge whose value is sent as the user's reply.
+func synthesizeProceedCard(text string) clarifyMeta {
+	return clarifyMeta{Questions: []clarifyQuestion{{
+		Text:    capObservation(strings.TrimSpace(text), agentObsMaxChars),
+		Type:    "single",
+		Options: []clarifyOption{{Label: "Continue", Value: "Please proceed — run the available tools yourself and use their output directly."}},
+	}}}
 }
 
 func shortQuery(q string) string {
