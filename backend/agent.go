@@ -590,32 +590,32 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 				// final answer (no first-person intention phrasing) returns as
 				// before. This runs only when prose-recovery found nothing to
 				// execute — pure intention prose with no JSON tool call.
-			// Also catch second-person "hand me the tool output / run this for
-			// me" prose (looksLikeAwaitingToolResult) — the dead-end that
-			// neither prose-recovery nor the intention-narration guard matches.
-			awaiting := looksLikeAwaitingToolResult(roundText)
-			if step == 0 && (looksLikeNarration(roundText) || awaiting) && narrationRetries < agentNarrationRetries {
-				narrationRetries++
-				if roundText != "" {
-					emitThought(roundText)
+				// Also catch second-person "hand me the tool output / run this for
+				// me" prose (looksLikeAwaitingToolResult) — the dead-end that
+				// neither prose-recovery nor the intention-narration guard matches.
+				awaiting := looksLikeAwaitingToolResult(roundText)
+				if step == 0 && (looksLikeNarration(roundText) || awaiting) && narrationRetries < agentNarrationRetries {
+					narrationRetries++
+					if roundText != "" {
+						emitThought(roundText)
+					}
+					emitClear()
+					messages = append(messages, msg, oaiMessage{Role: "system", Content: jsonString(awaitingToolNudge(awaiting))})
+					continue
 				}
-				emitClear()
-				messages = append(messages, msg, oaiMessage{Role: "system", Content: jsonString(awaitingToolNudge(awaiting))})
-				continue
-			}
-			// Interactive fallback: the model asked the user to hand it a tool
-			// output or run a command for it even after the re-prompt, or on a
-			// later step. Don't stream that dead-end prose as the answer —
-			// surface a clickable "proceed" clarify card (reusing the ask_user
-			// card UI + answer path) so the user can nudge the agent back to
-			// running its tools itself. Pure narration that exhausted the guard
-			// falls through to the normal final-answer path below, unchanged.
-			if awaiting {
-				emitClear()
-				emitQuestions(synthesizeProceedCard(roundText))
-				emitPhase("clarifying")
-				return nil
-			}
+				// Interactive fallback: the model asked the user to hand it a tool
+				// output or run a command for it even after the re-prompt, or on a
+				// later step. Don't stream that dead-end prose as the answer —
+				// surface a clickable "proceed" clarify card (reusing the ask_user
+				// card UI + answer path) so the user can nudge the agent back to
+				// running its tools itself. Pure narration that exhausted the guard
+				// falls through to the normal final-answer path below, unchanged.
+				if awaiting {
+					emitClear()
+					emitQuestions(synthesizeProceedCard(roundText))
+					emitPhase("clarifying")
+					return nil
+				}
 				// Final answer — its content was already streamed (server backend)
 				// or rendered by the browser (relay), and stays in the bubble +
 				// j.content (the answer, not thinking).
