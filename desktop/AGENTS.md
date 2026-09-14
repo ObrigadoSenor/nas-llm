@@ -11,7 +11,7 @@ For repo-wide conventions (branch model, commit style, verification loop, do-not
 - `renderer/desktop.css` (~417 lines) — self-contained dark styles for the bridge (`.ds-*` classes). No dependency on the app's CSS variables.
 - `src-tauri/src/main.rs` — entry point: binds a localhost port, resolves `www/` + `renderer/` resource paths, spawns the sidecar on the Tauri async runtime, creates the WebView window at the sidecar origin.
 - `src-tauri/src/sidecar.rs` — the axum HTTP server: serves `www/`, exposes `/__sidecar/*` control plane, reverse-proxies `/api/*` to the NAS, proxies `/__ollama/*` to local Ollama. Holds the session cookie jar.
-- `src-tauri/src/github.rs` — GitHub token storage (macOS Keychain via `keyring`), repo clone/pull/branch/exec/commit/PR operations, `/__sidecar/github/*` and `/__sidecar/repos/*` routes.
+- `src-tauri/src/github.rs` — GitHub token storage (macOS Keychain via `keyring`), repo clone/pull/branch/exec/commit/PR operations, `/__sidecar/github/*` and `/__sidecar/repos/*` routes. The `repos_exec` dispatcher runs the local file tools: `read_file`/`list_files`/`glob`/`grep`/`git_status`/`git_log`/`list_prs` (read-only), `write_file`/`edit_file`/`delete_path`/`move_path` (new, approval-gated with a unified-diff preview), `apply_patch` (normalized + a 4-rung apply ladder), `run_command` (timeout-bounded), and `git_commit`/`git_push`/`create_pr`/`merge_pr`. `resolve_new_path` resolves create-target paths that may not yet exist. A `#[cfg(test)]` module covers patch normalization, the apply ladder, `resolve_new_path` guards, and `edit_file` match counting.
 - `src-tauri/src/updater.rs` — three `#[tauri::command]`s (`app_version`, `check_for_updates`, `download_and_install_update`) wrapping `tauri-plugin-updater` so the renderer uses IPC, not plugin capabilities.
 - `src-tauri/tauri.conf.json` — no static window (`windows: []`); `frontendDist` is `../../www`; bundles `../../www/` and `../renderer/` as resources; CSP is null; updater endpoint + pubkey configured.
 - `src-tauri/capabilities/main.json` — permissions for the runtime-created `main` window. `remote.urls` allows `http://127.0.0.1:*` (the sidecar origin) so plugin commands work from the sidecar-loaded page.
@@ -50,8 +50,8 @@ GitHub/repos routes are in `github.rs:2541-2568` (merged into the same axum app 
 
 `sidecar.rs:308-332` (`index_html`) reads `www/index.html`, injects a `<link>` for `desktop.css` before `</head>` and a `<script>` for `desktop.js` before `</body>`, then serves it. The `?v=` query strings on those URLs are **hardcoded literals in Rust source**:
 
-- `desktop.css?v=19` — `sidecar.rs:317`
-- `desktop.js?v=24` — `sidecar.rs:324`
+- `desktop.css?v=20` — `sidecar.rs:317`
+- `desktop.js?v=27` — `sidecar.rs:324`
 
 (These numbers go stale on every bump; always re-read the lines before quoting them.)
 
@@ -70,7 +70,7 @@ This is a cross-language coupling with no build-time check. The `www/` side has 
 - `58-110` — **toolExec SSE shim**: wraps `window.EventSource` so every stream gets a `toolExec` listener; on receipt, POSTs the tool call to `/__sidecar/repos/exec` and the observation back to `/api/conversations/:id/tool-response`. Dedupes by `jobId:step`.
 - `112-253` — **Settings overlay**: `buildOverlay` assembles backend URL, magic-link sign-in, Ollama panel, updates section.
 - `255-339` — **In-app updater UI** (`addUpdatesSection`): `tauriInvoke` for version/check/install; listens to `update://progress` events.
-- `341-410` — **Tool execution** (`runToolExec`): approval-gated write tools; `AUTO_APPROVE_TOOLS` set at `:363`; posts observations to the backend.
+- `341-410` — **Tool execution** (`runToolExec`): approval-gated write tools; `AUTO_APPROVE_TOOLS` set at `:363` covers `write_file`/`edit_file`/`move_path`/`apply_patch`/`run_command`/`git_commit`/`git_push` (NOT `delete_path`/`create_pr`/`merge_pr` — those always prompt); `COMMAND_TOOLS` at `:367` renders a Warp-style block for all of these; threads `runCommandTimeoutMs` from the toolExec payload to the sidecar; posts observations to the backend.
 - `412-553` — **Approval dialog**: FIFO queue (`pumpApprovalQueue`), reusable overlay re-wired per call, colored diff renderer (`renderDiff`).
 - `555-574` — **Tauri IPC helpers** (`tauriInvoke`, `tauriListen`): the only IPC in the app; everything else is same-origin HTTP.
 - `576-638` — **Native notifications** (job completion) + `pickFolder` (native directory picker via `plugin:dialog`).

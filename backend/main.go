@@ -66,6 +66,11 @@ type config struct {
 	// running a file tool and POSTing the observation back). Longer than a
 	// plain tool call because several of these tools also wait on approval.
 	toolExecTimeout time.Duration
+	// runCommandTimeout bounds a single run_command the agent executes via the
+	// sidecar, so a non-exiting command (dev server, watcher) can't park the
+	// relay until toolExecTimeout. Carried on each toolExec payload so the
+	// sidecar enforces the backend-authoritative value.
+	runCommandTimeout time.Duration
 }
 
 type server struct {
@@ -118,6 +123,7 @@ func main() {
 		browserRelayGrace:  envDuration("BROWSER_RELAY_GRACE", 45*time.Second),
 		agentJobTimeout:    envDuration("AGENT_JOB_TIMEOUT", 30*time.Minute),
 		toolExecTimeout:    envDuration("TOOL_EXEC_TIMEOUT", 15*time.Minute),
+		runCommandTimeout:  envDuration("RUN_COMMAND_TIMEOUT", 120*time.Second),
 	}
 	cfg.cookieSecure = strings.HasPrefix(cfg.appBaseURL, "https://")
 	cfg.allowedEmails = parseAllowed(os.Getenv("ALLOWED_EMAILS"))

@@ -647,7 +647,7 @@ func TestJob_EmitToolStartAndCommandFields(t *testing.T) {
 	defer j.unsubscribe(ch)
 
 	// emitToolExec fires toolStart first, then the relay cue.
-	j.emitToolExec(2, "run_command", `{"command":"go test ./..."}`, "owner/repo", "main", true)
+	j.emitToolExec(2, "run_command", `{"command":"go test ./..."}`, "owner/repo", "main", true, 0)
 
 	first := nextEvent(t, ch, time.Second)
 	if first.kind != "toolStart" {
@@ -702,7 +702,7 @@ func TestJob_EmitToolStartOmitsEmptyCommandFields(t *testing.T) {
 	ch, _ := j.subscribe()
 	defer j.unsubscribe(ch)
 
-	j.emitToolExec(1, "grep", `{"pattern":"foo"}`, "owner/repo", "main", true)
+	j.emitToolExec(1, "grep", `{"pattern":"foo"}`, "owner/repo", "main", true, 0)
 	ev := nextEvent(t, ch, time.Second)
 	if ev.kind != "toolStart" {
 		t.Fatalf("event kind = %q, want toolStart", ev.kind)

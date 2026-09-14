@@ -389,6 +389,7 @@ when you open the chat.
 | `BROWSER_RELAY_GRACE` | `45s` | How long a browser-bound job waits for a stream to reattach before being cancelled. |
 | `AGENT_JOB_TIMEOUT` | `30m` | Overall deadline for an agent-mode run (plain chat stays at 5m). |
 | `TOOL_EXEC_TIMEOUT` | `15m` | How long a relayed tool call may wait, including time spent awaiting your approval. |
+| `RUN_COMMAND_TIMEOUT` | `120s` | Per-`run_command` deadline; a non-exiting command is killed (exit 124) instead of parking the relay. |
 
 ## Remote Mac backend (optional, bigger models)
 

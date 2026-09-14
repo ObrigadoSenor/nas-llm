@@ -182,10 +182,16 @@ type toolExecPayload struct {
 	// missing branch exactly like an old client that never sent one.
 	Branch string `json:"branch"`
 	// AutoApprove is the conversation's effective auto-approve setting for write
-	// tools (apply_patch/run_command/git_commit/git_push). When true the renderer
-	// runs those tools without an approval dialog; create_pr always prompts
-	// regardless. Carried per-call so a reconnect-replay still has it.
+	// tools (write_file/edit_file/move_path/apply_patch/run_command/git_commit/
+	// git_push). When true the renderer runs those tools without an approval
+	// dialog; delete_path/create_pr/merge_pr always prompt regardless. Carried
+	// per-call so a reconnect-replay still has it.
 	AutoApprove bool `json:"autoApprove,omitempty"`
+	// RunCommandTimeoutMs is the backend's RUN_COMMAND_TIMEOUT in milliseconds,
+	// carried per call so the sidecar enforces the backend-authoritative value
+	// when running a run_command. 0 means "use the sidecar default (120s)". Only
+	// read by run_command's buffered + streaming executors.
+	RunCommandTimeoutMs int `json:"runCommandTimeoutMs,omitempty"`
 }
 
 // toolStartPayload is the SSE `toolStart` event body: the UI's cue that a tool
@@ -326,12 +332,14 @@ func (j *job) clearPendingModelCall() {
 // Called by the agent loop when it hits a local file tool, parallel to
 // emitModelCall for local-model inference. branch is the conversation's bound
 // branch ("" for the repo's main working tree; see toolExecPayload).
-func (j *job) emitToolExec(step int, tool, args, repo, branch string, autoApprove bool) {
+// runCommandTimeoutMs carries the backend's RUN_COMMAND_TIMEOUT so the sidecar
+// enforces it for run_command (0 = sidecar default).
+func (j *job) emitToolExec(step int, tool, args, repo, branch string, autoApprove bool, runCommandTimeoutMs int) {
 	// Open the command block the moment the tool starts — before the relay cue
 	// fires — so streamed output has a block to land in. (Read-only tools get a
 	// toolStart too; the UI only opens a block for command-shaped tools.)
 	j.emitToolStart(step, tool, args)
-	payload := toolExecPayload{ConvID: j.convID, JobID: j.id, Step: step, Tool: tool, Args: args, Repo: repo, Branch: branch, AutoApprove: autoApprove}
+	payload := toolExecPayload{ConvID: j.convID, JobID: j.id, Step: step, Tool: tool, Args: args, Repo: repo, Branch: branch, AutoApprove: autoApprove, RunCommandTimeoutMs: runCommandTimeoutMs}
 	b, _ := json.Marshal(payload)
 	j.mu.Lock()
 	j.pendingToolExecPayload = &payload
@@ -1244,12 +1252,21 @@ func (s *server) runGeneration(j *job) error {
 		var toolExecRelay func(context.Context, int, string, string) toolOutcome
 		if repoID != "" {
 			if repo, err := s.store.getRepo(j.email, repoID); err == nil && repo != nil {
-				allow = append(allow, "read_file", "list_files", "glob", "grep", "git_status", "apply_patch", "run_command", "git_commit", "git_push", "create_pr", "merge_pr")
+				allow = append(allow, "read_file", "list_files", "glob", "grep", "git_status",
+					"write_file", "edit_file", "move_path", "delete_path",
+					"apply_patch", "run_command", "git_commit", "git_push", "create_pr", "merge_pr")
 				sys = injectRepoContext(sys, repo, conv.RepoBranch)
 				// Resolve the conversation's effective auto-approve once for this run;
 				// the renderer uses it to skip the approval dialog for write tools
-				// (create_pr always prompts regardless).
+				// (delete_path/create_pr/merge_pr always prompt regardless).
 				autoApprove := s.store.convAutoApprove(j.email, j.convID)
+				// Carry the backend's RUN_COMMAND_TIMEOUT (ms) on each toolExec so the
+				// sidecar enforces it for run_command; 0 lets the sidecar use its
+				// own default when the backend didn't configure one.
+				runCmdTimeoutMs := 0
+				if s.cfg.runCommandTimeout > 0 {
+					runCmdTimeoutMs = int(s.cfg.runCommandTimeout / time.Millisecond)
+				}
 				toolExecRelay = func(ctx context.Context, step int, tool, args string) toolOutcome {
 					respCh := make(chan toolExecResponse, 1)
 					j.mu.Lock()
@@ -1262,7 +1279,7 @@ func (s *server) runGeneration(j *job) error {
 						}
 						j.mu.Unlock()
 					}()
-					j.emitToolExec(step, tool, args, repo.FullName, conv.RepoBranch, autoApprove)
+					j.emitToolExec(step, tool, args, repo.FullName, conv.RepoBranch, autoApprove, runCmdTimeoutMs)
 					// apply_patch/run_command/git_* block on a user approval dialog, which
 					// can take far longer than a plain tool call — give it its own budget
 					// (TOOL_EXEC_TIMEOUT) rather than the whole-job timeout.

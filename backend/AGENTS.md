@@ -5,7 +5,7 @@
 ## File responsibility map
 
 - `main.go` — entry point; `config` struct (`:13-69`), `server` struct (`:71-89`), env helpers (`:170-221`), `main()` wiring (`:95-168`), `routes()` (`:234-281`), `requireAuth` middleware (`:283-293`)
-- `agent.go` (~1500 lines) — ReAct agent loop (`runAgentLoop:493`), tool registry (`toolRegistry:163`), file/git/search/memory tool schemas, narration guards, prose tool-call recovery (`extractProseToolCall:752`), context compaction (`maybeCompact:1449`), safe arithmetic evaluator (`evalExpr:1040`), `fetch_page` tool, agent config resolution (`agentConfig:99`)
+- `agent.go` (~1500 lines) — ReAct agent loop (`runAgentLoop:493`), tool registry (`toolRegistry:163`), file/git/search/memory tool schemas (incl. `write_file`/`edit_file`/`delete_path`/`move_path`), narration guards, prose tool-call recovery (`extractProseToolCall:752`), context compaction (`maybeCompact:1449`), safe arithmetic evaluator (`evalExpr:1040`), `fetch_page` tool, agent config resolution (`agentConfig:99`)
 - `jobs.go` (~1400 lines) — `job` struct (`:60`), `jobManager` worker pool (`:822`), `eventHub` per-user SSE multiplexer (`:736`), `runGeneration` dispatch (`:1088`), `runStreamPass` (`:1298`), `streamFromOllama` (`:1314`), SSE emit/broadcast, grace-period cancel for browser-bound jobs
 - `models.go` (~1300 lines) — Ollama native API types, `curatedCatalog` (`:528`), `pullManager`/`pullJob` (`:331`), KV-cache estimation (`estimateKV:664`), fit verdicts (`verdictFor:671`), `runBenchmark` (`:1075`), `supportsTools` capability check (`:1273`), model management handlers
 - `handlers.go` (~1100 lines) — auth/conversation/folder/generation/SSE/agent-config/repo handlers, `handleChat` proxy (`:358`), `handleGenerate` (`:431`), `handleEvents` per-conversation SSE (`:551`), `handleUserEvents` per-user SSE (`:795`), browser relay endpoints, `buildProxy` (`:335`)
@@ -68,12 +68,14 @@
 - `DB_PATH` — defaults to `/data/nas-llm.db` (container path, `main.go:102`).
 - `OLLAMA_MAC_URL` — empty by default; setting it enables the optional Mac backend.
 - `OLLAMA_CONTEXT_LENGTH` — mirrors the Ollama container's context length for KV-cache RAM estimation.
+- `MAX_AGENT_STEPS` — per-run tool-calling round budget (default 6; a small model that loops is forced to a final answer).
+- `RUN_COMMAND_TIMEOUT` — per-`run_command` deadline (default 120s), carried on each `toolExec` payload so the sidecar kills a non-exiting command (exit 124) instead of parking the relay until `TOOL_EXEC_TIMEOUT`.
 
 ## Key architecture pointers
 
 - **Job manager / background generation:** `jobs.go` — `handleGenerate` enqueues a `job`; `maxConcurrentJobs` workers drain the queue. `runGeneration` (`jobs.go:1088`) picks the backend (`browserRelay` for local models, `directOllama` for server models) and branches into agent/clarify/search/plain paths.
 - **SSE event hub:** `eventHub` (`jobs.go:736`) — per-user multiplexed stream backing `GET /api/events`. Jobs publish modelCall/toolExec/phase/done/error events so backgrounded chats keep working. Per-conversation tails (`handleEvents`, `handlers.go:551`) are the other long-lived SSE connection.
-- **Browser relay:** `relay.go` — local-model jobs emit `modelCall` SSE events; the browser dials its own Ollama (localhost:11434) and POSTs results to `/api/conversations/{id}/model-response`. File tools (`apply_patch`, `run_command`, git tools) relay through `toolExec` events → `/tool-response`.
+- **Browser relay:** `relay.go` — local-model jobs emit `modelCall` SSE events; the browser dials its own Ollama (localhost:11434) and POSTs results to `/api/conversations/{id}/model-response`. File tools (`write_file`/`edit_file`/`delete_path`/`move_path`, `apply_patch`, `run_command`, git tools) relay through `toolExec` events → `/tool-response`. `run_command` is bounded by `RUN_COMMAND_TIMEOUT` (carried on the payload); the sidecar's `apply_patch` normalizes the diff and tries a 4-rung apply ladder before failing.
 - **Multi-host Ollama routing:** `hosts.go` / `registry.go` — `hostRegistry` probes each backend's `/api/tags` every 30s and resolves model→host (`onlineHostForModel`). NAS is always-on default; Mac is optional (enabled by `OLLAMA_MAC_URL`). Server-side inference is serialized per host via `hostSem` (matching `OLLAMA_NUM_PARALLEL=1`).
 
 ## Tests
@@ -86,3 +88,4 @@ Run from `backend/`: `go test ./...`
 - `clarify_test.go` — prose-question detector, plain-chat ask_user offer for tool-capable models, non-tool skip
 - `registry_test.go` — model ref parsing, manifest size computation, preflight fit verdicts, 404 sentinel mapping
 - `library_test.go` — ollama.com/search HTML parser, empty/non-matching HTML fallback
+- `agent_tools_test.go` — wiring of the local file/git tools (write_file/edit_file/delete_path/move_path/merge_pr) across `defaultAgentTools`, `toolRegistry`, and `availableTools` (guards against a silent allowlist regression)

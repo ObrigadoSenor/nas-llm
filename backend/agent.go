@@ -103,6 +103,7 @@ func defaultAgentTools() []string {
 	return []string{
 		"web_search", "ask_user", "get_time", "calculator",
 		"read_file", "list_files", "glob", "grep", "git_status",
+		"write_file", "edit_file", "move_path", "delete_path",
 		"apply_patch", "run_command", "git_commit", "git_push", "create_pr", "merge_pr",
 	}
 }
@@ -305,6 +306,10 @@ func (s *server) toolRegistry(email string) map[string]agentTool {
 		"glob":        globTool(),
 		"grep":        grepTool(),
 		"git_status":  gitStatusTool(),
+		"write_file":  writeFileTool(),
+		"edit_file":   editFileTool(),
+		"delete_path": deletePathTool(),
+		"move_path":   movePathTool(),
 		"apply_patch": applyPatchTool(),
 		"run_command": runCommandTool(),
 		"git_commit":  gitCommitTool(),
@@ -371,10 +376,56 @@ func gitStatusTool() oaiTool {
 func applyPatchTool() oaiTool {
 	return oaiTool{Type: "function", Function: oaiToolFunction{
 		Name:        "apply_patch",
-		Description: "Apply a unified diff to the repository to make file edits. Each change must be a valid unified diff (git diff format) with --- and +++ headers and @@ hunks. Call this tool to actually apply edits — do not write the diff as prose.",
+		Description: "Apply a unified diff to edit files. Prefer write_file to create/overwrite a single file and edit_file for a targeted string replacement — they are more reliable on small models than a hand-written diff. Use apply_patch only for genuine multi-hunk edits across one or more files. The diff must be a valid unified diff (git diff format) with --- and +++ headers and @@ hunks. Call the tool to actually apply edits — do not write the diff as prose.",
 		Parameters: map[string]any{"type": "object", "properties": map[string]any{
 			"patch": map[string]any{"type": "string", "description": "The unified diff to apply, e.g. --- a/file.go\n+++ b/file.go\n@@ -1,3 +1,4 @@\n line1\n+new line\n line3"},
 		}, "required": []string{"patch"}},
+	}}
+}
+
+func writeFileTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "write_file",
+		Description: "Create a file (creating parent directories as needed) or overwrite it with the given content. Use this for new files or when you want to replace a file's entire contents. The observation reports created-vs-overwritten plus byte and line counts.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"path":    map[string]any{"type": "string", "description": "Repository-relative path to the file, e.g. src/main.go"},
+			"content": map[string]any{"type": "string", "description": "The full file contents to write."},
+		}, "required": []string{"path", "content"}},
+	}}
+}
+
+func editFileTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "edit_file",
+		Description: "Replace an exact string in a file with a new string. This is the reliable way to make a targeted edit — prefer it over apply_patch for single-file changes. If old_string is missing or matches more than once (without replace_all), the file is left unchanged and the observation tells you how many times it matched and asks for more surrounding context. Include enough unique context around the change so the match is unambiguous.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"path":        map[string]any{"type": "string", "description": "Repository-relative path to the file to edit."},
+			"old_string":  map[string]any{"type": "string", "description": "The exact text to find in the file. Include enough surrounding context so it matches exactly once."},
+			"new_string":  map[string]any{"type": "string", "description": "The text to replace old_string with."},
+			"replace_all": map[string]any{"type": "boolean", "description": "If true, replace every occurrence of old_string. Default false (requires a unique match)."},
+		}, "required": []string{"path", "old_string", "new_string"}},
+	}}
+}
+
+func deletePathTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "delete_path",
+		Description: "Delete a file or directory. Refuses the repository root and anything under .git/. A directory requires recursive=true. Always prompts for approval, even when auto-approve is on.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"path":      map[string]any{"type": "string", "description": "Repository-relative path to delete."},
+			"recursive": map[string]any{"type": "boolean", "description": "Required to delete a directory. Default false."},
+		}, "required": []string{"path"}},
+	}}
+}
+
+func movePathTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "move_path",
+		Description: "Rename or move a file or directory, creating the destination's parent directories as needed. Refuses to overwrite an existing destination.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"from": map[string]any{"type": "string", "description": "Repository-relative path to the file/dir to move."},
+			"to":   map[string]any{"type": "string", "description": "Repository-relative destination path."},
+		}, "required": []string{"from", "to"}},
 	}}
 }
 
@@ -1105,6 +1156,10 @@ func availableTools(fetchPage bool) []toolMeta {
 		toolMeta{Name: "glob", Label: "Glob", Description: "Find files by name pattern (desktop only)."},
 		toolMeta{Name: "grep", Label: "Grep", Description: "Search file contents in the repository (desktop only)."},
 		toolMeta{Name: "git_status", Label: "Git status", Description: "Show the working tree status (desktop only)."},
+		toolMeta{Name: "write_file", Label: "Write file", Description: "Create or overwrite a file (desktop only)."},
+		toolMeta{Name: "edit_file", Label: "Edit file", Description: "Exact string replacement in a file (desktop only)."},
+		toolMeta{Name: "move_path", Label: "Move/rename", Description: "Rename or move a file/directory (desktop only)."},
+		toolMeta{Name: "delete_path", Label: "Delete path", Description: "Delete a file/directory; always prompts (desktop only)."},
 		toolMeta{Name: "apply_patch", Label: "Apply patch", Description: "Apply a unified diff to edit files (desktop only)."},
 		toolMeta{Name: "run_command", Label: "Run command", Description: "Run a shell command in the repo (desktop only)."},
 		toolMeta{Name: "git_commit", Label: "Git commit", Description: "Stage and commit changes on the current branch (desktop only)."},

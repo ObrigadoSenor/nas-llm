@@ -348,21 +348,23 @@ async function titleForConv(convId) {
   return (conv && conv.title) || "";
 }
 
-// Run one file-tool call via the sidecar. Write tools (apply_patch, run_command)
-// require per-invocation approval: the sidecar returns {needs_approval:true} with
-// a preview; we show an approval dialog and only re-POST with approved:true once
-// the user clicks Approve. On Reject, we post a rejection as the observation so
-// the agent loop can adjust. Read tools run immediately.
+// Run one file-tool call via the sidecar. Write tools (apply_patch, run_command,
+// write_file, edit_file, move_path) require per-invocation approval: the sidecar
+// returns {needs_approval:true} with a preview; we show an approval dialog and
+// only re-POST with approved:true once the user clicks Approve. On Reject, we
+// post a rejection as the observation so the agent loop can adjust. Read tools
+// run immediately.
 // d.branch (from the toolExec payload, sourced from conversations.repo_branch)
 // is passed straight through to the sidecar so the tool runs in THIS chat's
 // worktree, not whichever tree happens to be checked out — dropping it would
 // silently send a background chat's edits into the wrong tree.
 // Write tools that auto-approve covers run immediately (no dialog) when the
-// backend says auto-approve is on for this chat. create_pr is never in this set —
-// opening a PR is external/irreversible, so it always prompts regardless.
-const AUTO_APPROVE_TOOLS = new Set(["apply_patch", "run_command", "git_commit", "git_push"]);
+// backend says auto-approve is on for this chat. delete_path, create_pr, and
+// merge_pr are never in this set — they are destructive/external/irreversible,
+// so they always prompt regardless of the auto-approve setting.
+const AUTO_APPROVE_TOOLS = new Set(["apply_patch", "run_command", "git_commit", "git_push", "write_file", "edit_file", "move_path"]);
 // Command-shaped tools render a Warp-style block; run_command additionally streams.
-const COMMAND_TOOLS = new Set(["run_command", "apply_patch", "git_commit", "git_push", "create_pr"]);
+const COMMAND_TOOLS = new Set(["run_command", "apply_patch", "git_commit", "git_push", "create_pr", "merge_pr", "write_file", "edit_file", "move_path", "delete_path"]);
 // Keep last ~64KB of streamed command output for the observation / block body.
 const STREAM_OUTPUT_CAP = 65536;
 function capStreamOutput(s){ s = String(s||""); return s.length > STREAM_OUTPUT_CAP ? s.slice(-STREAM_OUTPUT_CAP) : s; }
@@ -382,6 +384,9 @@ async function runToolExec(convId, d) {
   const key = d.jobId + ":" + (d.step ?? 0);
   const execBody = { repo: d.repo, tool: d.tool, args: d.args || "" };
   if (d.branch) execBody.branch = d.branch;
+  // run_command timeout (ms), carried from the backend's RUN_COMMAND_TIMEOUT on
+  // the toolExec payload so the sidecar enforces the backend-authoritative value.
+  if (d.runCommandTimeoutMs) execBody.run_command_timeout_ms = d.runCommandTimeoutMs;
   if (autoApproved) execBody.approved = true;
 
   let execRes;
@@ -523,12 +528,14 @@ function renderApprovalDialog(kind, preview, ctx, done) {
 }
 
 // renderApprovalContent fills the scrollable container with either a
-// line-by-line colored diff (for apply_patch) or a raw <pre> (for run_command
-// and anything that isn't a unified diff). The diff parser splits on newlines,
+// line-by-line colored diff (for apply_patch and the create/edit/move file tools,
+// whose sidecar previews are unified diffs) or a raw <pre> (for run_command and
+// anything that isn't a unified diff). The diff parser splits on newlines,
 // classifies each line, and builds a DOM fragment with red/green gutters.
+const DIFF_PREVIEW_TOOLS = new Set(["apply_patch", "write_file", "edit_file", "move_path"]);
 function renderApprovalContent(container, kind, preview) {
   container.innerHTML = "";
-  if (kind === "apply_patch" && preview.includes("@@")) {
+  if (DIFF_PREVIEW_TOOLS.has(kind) && preview.includes("@@")) {
     container.appendChild(renderDiff(preview));
     return;
   }

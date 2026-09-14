@@ -41,13 +41,13 @@ vet: ## Run go vet
 test: ## Run the Go test suite
 	cd $(BACKEND) && go test ./...
 
-check-desktop: ## Type-check the Tauri sidecar (Rust)
+check-desktop: ## Type-check + test the Tauri sidecar (Rust)
 	@command -v cargo >/dev/null 2>&1 || { \
 		echo "cargo not found — install Rust via https://rustup.rs"; \
 		echo "(see desktop/README.md); skipping the desktop check"; \
 		exit 1; \
 	}
-	cd $(TAURI) && cargo check
+	cd $(TAURI) && cargo check && cargo test
 
 run-backend: ## Run the backend locally on :8081 against a local Ollama
 	cd $(BACKEND) && \
