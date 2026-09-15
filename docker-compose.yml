@@ -95,6 +95,16 @@ services:
       # prompt-injection surface. See .env.example for the full rationale.
       MAX_AGENT_STEPS: ${MAX_AGENT_STEPS:-24}
       FETCH_PAGE_ENABLED: "${FETCH_PAGE_ENABLED:-false}"
+      # Agent harness sampling params (agent/search/clarify rounds only; plain
+      # chat stays on Ollama Modelfile defaults). See .env.example.
+      AGENT_TEMPERATURE: "${AGENT_TEMPERATURE:-0.4}"
+      AGENT_TOP_P: "${AGENT_TOP_P:-0.9}"
+      AGENT_SEED: ${AGENT_SEED:-0}
+      # Context-window assumption for local (browser-relay) compaction.
+      AGENT_RELAY_CONTEXT_LENGTH: ${AGENT_RELAY_CONTEXT_LENGTH:-4096}
+      # Opt-in agent per-round prompt capture (diagnostic; off by default).
+      AGENT_DEBUG_CAPTURE: "${AGENT_DEBUG_CAPTURE:-false}"
+      AGENT_DEBUG_CAPTURE_DIR: ${AGENT_DEBUG_CAPTURE_DIR:-/data/agent-debug}
       # Concurrent chats + human-in-the-loop timeouts (Go duration syntax).
       MAX_CONCURRENT_JOBS: ${MAX_CONCURRENT_JOBS:-4}
       BROWSER_RELAY_GRACE: ${BROWSER_RELAY_GRACE:-45s}

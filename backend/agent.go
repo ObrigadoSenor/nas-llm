@@ -7,8 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -348,7 +351,7 @@ func listFilesTool() oaiTool {
 func treeTool() oaiTool {
 	return oaiTool{Type: "function", Function: oaiToolFunction{
 		Name:        "tree",
-		Description: "List the repository's folder structure recursively (a depth-limited tree). Use this to see the project layout at a glance instead of calling list_files on each directory. Returns repo-relative paths; directories are suffixed with /. Gitignored entries are marked (ignored) so you learn they exist without seeing their contents.",
+		Description: "List the repository's folder structure recursively (depth-limited). Returns repo-relative paths; directories end with /. Gitignored entries are marked (ignored). Use this to see the project layout at a glance.",
 		Parameters: map[string]any{"type": "object", "properties": map[string]any{
 			"path":  map[string]any{"type": "string", "description": "Repository-relative directory to start from (empty or \".\" for the root)."},
 			"depth": map[string]any{"type": "integer", "description": "Maximum recursion depth (default 3, clamped to 1..6)."},
@@ -388,7 +391,7 @@ func gitStatusTool() oaiTool {
 func applyPatchTool() oaiTool {
 	return oaiTool{Type: "function", Function: oaiToolFunction{
 		Name:        "apply_patch",
-		Description: "Apply a unified diff to edit files. Prefer write_file to create/overwrite a single file and edit_file for a targeted string replacement — they are more reliable on small models than a hand-written diff. Use apply_patch only for genuine multi-hunk edits across one or more files. The diff must be a valid unified diff (git diff format) with --- and +++ headers and @@ hunks. Call the tool to actually apply edits — do not write the diff as prose.",
+		Description: "Apply a unified diff to edit files. Prefer write_file/edit_file for single-file changes; use apply_patch only for genuine multi-hunk or multi-file edits. The diff must be valid unified diff (git diff format) with --- / +++ headers and @@ hunks.",
 		Parameters: map[string]any{"type": "object", "properties": map[string]any{
 			"patch": map[string]any{"type": "string", "description": "The unified diff to apply, e.g. --- a/file.go\n+++ b/file.go\n@@ -1,3 +1,4 @@\n line1\n+new line\n line3"},
 		}, "required": []string{"patch"}},
@@ -398,7 +401,7 @@ func applyPatchTool() oaiTool {
 func writeFileTool() oaiTool {
 	return oaiTool{Type: "function", Function: oaiToolFunction{
 		Name:        "write_file",
-		Description: "Create a file (creating parent directories as needed) or overwrite it with the given content. Use this for new files or when you want to replace a file's entire contents. The observation reports created-vs-overwritten plus byte and line counts.",
+		Description: "Create a file (creating parent directories as needed) or overwrite it with the given content. Use for new files or full replacement.",
 		Parameters: map[string]any{"type": "object", "properties": map[string]any{
 			"path":    map[string]any{"type": "string", "description": "Repository-relative path to the file, e.g. src/main.go"},
 			"content": map[string]any{"type": "string", "description": "The full file contents to write."},
@@ -409,7 +412,7 @@ func writeFileTool() oaiTool {
 func editFileTool() oaiTool {
 	return oaiTool{Type: "function", Function: oaiToolFunction{
 		Name:        "edit_file",
-		Description: "Replace an exact string in a file with a new string. This is the reliable way to make a targeted edit — prefer it over apply_patch for single-file changes. If old_string is missing or matches more than once (without replace_all), the file is left unchanged and the observation tells you how many times it matched and asks for more surrounding context. Include enough unique context around the change so the match is unambiguous.",
+		Description: "Replace an exact string in a file. Prefer this over apply_patch for single-file changes. Include enough unique context around old_string so it matches exactly once (or set replace_all).",
 		Parameters: map[string]any{"type": "object", "properties": map[string]any{
 			"path":        map[string]any{"type": "string", "description": "Repository-relative path to the file to edit."},
 			"old_string":  map[string]any{"type": "string", "description": "The exact text to find in the file. Include enough surrounding context so it matches exactly once."},
@@ -589,7 +592,7 @@ func injectRepoContext(sys string, r *Repo, convBranch string) string {
 	} else {
 		b.WriteString("This checkout shares the repo's main working tree. ")
 	}
-	b.WriteString("A gitignored file (such as .env) is a secret you must NEVER read, print, or paste into an answer: read_file refuses ignored paths, grep skips them, and the discovery tools (tree, list_files, glob) mark them (ignored) so you learn they exist without seeing their contents. Make ALL the changes needed with apply_patch first, then commit ONCE with git_commit when the work is complete — do NOT commit after each individual edit. Do not push with git_push and do not open a pull request with create_pr unless the user explicitly asks you to. Do not write diffs or commands as prose — call the tool so the change is actually applied. Keep answers grounded in what you read — do not guess at file contents.\n\n")
+	b.WriteString("A gitignored file (such as .env) is a secret you must NEVER read, print, or paste into an answer: read_file refuses ignored paths, grep skips them, and the discovery tools (tree, list_files, glob) mark them (ignored) so you learn they exist without seeing their contents. Make single-file edits with edit_file (exact string replacement) or write_file (create/overwrite); both are reliable on every model. Reserve apply_patch (a unified diff) for genuine multi-file or multi-hunk edits, and if a diff fails to apply, do not re-emit it; switch to edit_file or write_file. Then commit ONCE with git_commit when the work is complete — do NOT commit after each individual edit. Do not push with git_push and do not open a pull request with create_pr unless the user explicitly asks you to. Do not write diffs or commands as prose — call the tool so the change is actually applied. Keep answers grounded in what you read — do not guess at file contents.\n\n")
 	b.WriteString(sys)
 	return b.String()
 }
@@ -616,10 +619,13 @@ func agentSystemNudge() string {
 		"Reserve ask_user for the user's own intent, preferences, or requirements that are genuinely " +
 		"ambiguous and that you cannot discover from the codebase or conversation; if the request is " +
 		"clear enough to act, act. If the task requires editing files or running commands, your FIRST response MUST be a " +
-		"structured tool call (apply_patch / run_command), not an explanation of what you plan to do — never say \"I will\" " +
+		"structured tool call (read_file / edit_file / write_file / run_command), not an explanation of what you plan to do — never say \"I will\" " +
 		"or \"Let me\" without immediately emitting the tool call. After the work is done, synthesize a clear final " +
 		"answer for the user. Do not repeat the same tool call with the same arguments. If a tool returns an error, read " +
-		"it and adjust — do not retry blindly. Keep answers concise."
+		"it and adjust — do not retry blindly. Keep answers concise.\n\n" +
+		"Example loop: to add a comment to main.go, first call read_file to see its contents, then " +
+		"call edit_file with the exact old_string and new_string, then answer concisely. Each step is " +
+		"a structured tool call — never describe the edit in prose."
 }
 
 // toolCallDiscipline is the anti-narration guardrail appended to every
@@ -700,6 +706,14 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 	seen := map[string]int{}
 	narrationRetries := 0
 	budgetWarned := false
+	// Chronic format-mismatch tracking: if the model never emits a structured
+	// tool_call across the whole run (every round lands in prose-recovery or the
+	// narration guard), emit a one-time trace hint so an invisible chat-template
+	// break or a mislabeled tool-capable model surfaces as an actionable signal
+	// instead of silently recovering forever.
+	proseRecoveries := 0
+	narrationHits := 0
+	structuredToolCalls := 0
 	// step is a manual counter (not the for-loop counter) so a narration
 	// re-prompt round — which re-runs the model without making progress — does
 	// not consume a step of the budget. It increments only at the end of a real
@@ -707,6 +721,21 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 	// skips the increment. resumeStep is 0 for a fresh run, or the checkpoint's
 	// step index for a resumed run so it continues on the remaining budget.
 	step := resumeStep
+	// emitFormatHint surfaces a chronic format mismatch at the end of a run: if
+	// the model never emitted a structured tool_call (every round landed in
+	// prose-recovery or the narration guard), emit a one-time trace step so an
+	// invisible chat-template break or a mislabeled tool-capable model becomes an
+	// actionable signal instead of silently recovering forever.
+	emitFormatHint := func() {
+		if structuredToolCalls == 0 && (proseRecoveries > 0 || narrationHits > 0) {
+			emitTool(agentStep{Step: step + 1, Tool: "(format)", Preview: "This model never emitted a structured tool call — its chat template may be broken or it may be mislabeled as tool-capable. Consider a different model or disable Agent mode.", IsError: true})
+		}
+	}
+	// runID groups one agent run's captured rounds (opt-in debug capture);
+	// round is a monotonic per-Call index so narration re-prompt rounds (which
+	// reuse the same step number) still get unique capture filenames.
+	runID := newJobID()[:8]
+	round := 0
 	for step < s.cfg.maxAgentSteps {
 		// Pause check between steps: if the user paused the run, stop before
 		// driving another inference round. The transcript and step index ride
@@ -730,18 +759,29 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 			messages = append(messages, oaiMessage{Role: "system", Content: jsonString(fmt.Sprintf("Budget notice: %d tool-call step(s) remain before the run is forced to a final answer. Finish any outstanding edits now, then synthesize your final answer for the user.", s.cfg.maxAgentSteps-step))})
 		}
 		// Bound the running transcript before each model call so a long multi-step
-		// run can't overflow the context window (Tier 3 compaction). Only a
-		// server-side backend's context window is bounded by the server's config;
-		// a browser-relay (local-model) backend runs on the visitor's Ollama with
-		// its own context window, so compaction is skipped for it (and doing the
-		// summary over the relay would stream an internal summary into the bubble).
-		if d, ok := mb.(*directOllama); ok {
-			messages = s.maybeCompact(roundCtx, d.chatURL, model, messages)
+		// run can't overflow the context window (Tier 3 compaction). A server-side
+		// backend compacts against cfg.contextLength (mirrors the NAS
+		// OLLAMA_CONTEXT_LENGTH) and summarizes the dropped head via a non-streaming
+		// model call. A browser-relay (local-model) backend runs on the visitor's
+		// Ollama, whose context the backend can't introspect — it compacts against
+		// the conservative cfg.agentRelayContextLength (default 4096, the small-model
+		// default) using truncation only (no summary, which would stream an internal
+		// summary into the bubble and cost an extra round on the visitor's Ollama).
+		switch mbT := mb.(type) {
+		case *directOllama:
+			messages = s.maybeCompact(roundCtx, mbT.chatURL, model, messages, s.cfg.contextLength, true)
+		case *browserRelay:
+			messages = s.maybeCompact(roundCtx, "", model, messages, s.cfg.agentRelayContextLength, false)
 		}
 		// One inference round. For a server backend, content streams live to the
 		// answer bubble as it arrives; for a browser relay, the browser streams it
 		// directly from localhost (the backend does not re-emit chunks). The
 		// returned content drives thinking-round handling below.
+		round++
+		if s.cfg.agentDebugCapture {
+			backend, sampling := agentBackendInfo(mb)
+			s.captureAgentRound(runID, backend, model, step, round, messages, tools, sampling)
+		}
 		msg, usage, err := mb.Call(roundCtx, model, messages, tools)
 		if err != nil {
 			roundCancel()
@@ -760,6 +800,9 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 			addUsage(usage.PromptTokens, usage.CompletionTokens)
 		}
 		roundText := contentText(msg.Content)
+		if len(msg.ToolCalls) > 0 {
+			structuredToolCalls++
+		}
 		if len(msg.ToolCalls) == 0 {
 			// Prose tool-call recovery: a small model that reports a tools
 			// capability but can't emit structured tool_calls deltas often
@@ -774,6 +817,7 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 			// thinking. If no parseable call is found, fall through to the
 			// narration guard / final-answer path.
 			if tc, ok := extractProseToolCall(roundText, added); ok {
+				proseRecoveries++
 				msg.ToolCalls = []oaiToolCall{tc}
 				// Strip the recovered JSON tool-call blob (and any fenced code-block
 				// wrapper around it) from the thinking text so the raw
@@ -804,6 +848,7 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 				awaiting := looksLikeAwaitingToolResult(roundText)
 				if step == 0 && (looksLikeNarration(roundText) || awaiting) && narrationRetries < agentNarrationRetries {
 					narrationRetries++
+					narrationHits++
 					if roundText != "" {
 						emitThought(roundText)
 					}
@@ -844,6 +889,7 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 				if roundText == "" {
 					emit("(no response)")
 				}
+				emitFormatHint()
 				roundCancel()
 				return nil
 			}
@@ -942,6 +988,7 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 	// Surface a trace step so the truncation is visible in the UI instead of a
 	// silent "agent stopped calling tools and answered".
 	emitTool(agentStep{Step: step + 1, Tool: "(budget)", Preview: fmt.Sprintf("step budget exhausted — forcing a final answer (%d steps).", s.cfg.maxAgentSteps)})
+	emitFormatHint()
 	emitPhase("answering")
 	_, _, err := mb.Call(ctx, model, messages, nil)
 	return err
@@ -1739,14 +1786,81 @@ func (s *server) summarizeTurns(ctx context.Context, target, model string, msgs 
 	return summary, nil
 }
 
-// maybeCompact bounds req.Messages within the context window. It first truncates
-// old tool-result observations (cheap, always safe). If still over the threshold
-// it summarizes the oldest text turns into one system message via a non-streaming
-// model call, keeping the system + summary + a recent tail (with all tool-call /
-// result pairs intact) verbatim. Summarization failure is non-fatal: it falls
-// back to the truncated list and lets Ollama handle any overflow.
-func (s *server) maybeCompact(ctx context.Context, target, model string, msgs []oaiMessage) []oaiMessage {
-	limit := s.cfg.contextLength
+// --- Tier 3: opt-in per-round debug capture (the "practical test") -----------
+
+// agentDebugRound is one captured agent inference round, written to disk when
+// AGENT_DEBUG_CAPTURE is on so a failing iteration's exact payload can be
+// replayed standalone (scripts/replay-agent-round.go) to separate harness bugs
+// (fails only in-loop) from model-capability limits (fails one-shot too).
+//
+// SECURITY: the message list can contain user-pasted secrets. Capture is off by
+// default; only enable it while debugging, point AGENT_DEBUG_CAPTURE_DIR at an
+// access-restricted location, and clear it when done.
+type agentDebugRound struct {
+	RunID       string       `json:"runId"`
+	Step        int          `json:"step"`  // the loop's step counter (UI-correlated)
+	Round       int          `json:"round"` // monotonic per-Call index (unique within the run)
+	Backend     string       `json:"backend"`
+	Model       string       `json:"model"`
+	Messages    []oaiMessage `json:"messages"`
+	Tools       []oaiTool    `json:"tools,omitempty"`
+	Temperature *float64     `json:"temperature,omitempty"`
+	TopP        *float64     `json:"top_p,omitempty"`
+	Seed        *int64       `json:"seed,omitempty"`
+}
+
+// captureAgentRound writes one inference round's exact payload to the debug
+// capture dir as indented JSON. No-op unless cfg.agentDebugCapture is on. A
+// log line names the file and the replay command so the operator can find and
+// re-run a failing iteration without digging.
+func (s *server) captureAgentRound(runID, backend, model string, step, round int, messages []oaiMessage, tools []oaiTool, sampling *agentSampling) {
+	if !s.cfg.agentDebugCapture {
+		return
+	}
+	dir := s.cfg.agentDebugCaptureDir
+	if dir == "" {
+		dir = "./agent-debug"
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		log.Printf("agent-debug capture: mkdir %s: %v", dir, err)
+		return
+	}
+	rec := agentDebugRound{RunID: runID, Step: step, Round: round, Backend: backend, Model: model, Messages: messages, Tools: tools}
+	if sampling != nil {
+		t, p := sampling.temperature, sampling.topP
+		rec.Temperature = &t
+		rec.TopP = &p
+		if sampling.seed != 0 {
+			sd := sampling.seed
+			rec.Seed = &sd
+		}
+	}
+	b, _ := json.MarshalIndent(rec, "", "  ")
+	name := fmt.Sprintf("agent-round-%s-r%d.json", runID, round)
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		log.Printf("agent-debug capture: write %s: %v", path, err)
+		return
+	}
+	log.Printf("agent-debug capture: wrote %s (backend=%s model=%s step=%d msgs=%d tools=%d) — replay: go run scripts/replay-agent-round.go %s <ollama-url>", path, backend, model, step, len(messages), len(tools), path)
+}
+
+// maybeCompact bounds the running transcript within the context window. It first
+// truncates old tool-result observations (cheap, always safe). If still over the
+// threshold it drops the oldest turns up to a safe cut (never severing a
+// tool-call/result pair), keeping the system prompt + a verbatim tail.
+//
+// For a server backend (summarize=true, target set) the dropped head is compressed
+// into one summary system message via a non-streaming model call; summarization
+// failure is non-fatal (falls back to the truncated list). For a browser-relay
+// backend (summarize=false) the head is dropped with a short marker instead — a
+// summary would need an extra inference round on the visitor's Ollama and stream
+// into the answer bubble — and a final pass caps every remaining tool result so a
+// single big recent observation can't blow the small local window.
+//
+// limit is the assumed context window (cfg.contextLength for server models,
+// cfg.agentRelayContextLength for local models, which the backend can't introspect).
+func (s *server) maybeCompact(ctx context.Context, target, model string, msgs []oaiMessage, limit int, summarize bool) []oaiMessage {
 	if limit <= 0 {
 		limit = 8192
 	}
@@ -1771,14 +1885,25 @@ func (s *server) maybeCompact(ctx context.Context, target, model string, msgs []
 	if cut <= 1 {
 		return msgs
 	}
-	head := msgs[1:cut]
-	summary, err := s.summarizeTurns(ctx, target, model, head)
-	if err != nil || strings.TrimSpace(summary) == "" {
-		return msgs // summarization failed — run as-is
+	if summarize {
+		head := msgs[1:cut]
+		summary, err := s.summarizeTurns(ctx, target, model, head)
+		if err != nil || strings.TrimSpace(summary) == "" {
+			return msgs // summarization failed — run as-is
+		}
+		out := make([]oaiMessage, 0, len(msgs)-cut+3)
+		out = append(out, msgs[0]) // original system prompt
+		out = append(out, oaiMessage{Role: "system", Content: jsonString("Earlier in this task (summary of older turns): " + summary)})
+		out = append(out, msgs[cut:]...)
+		return out
 	}
-	out := make([]oaiMessage, 0, len(msgs)-cut+3)
+	// Truncation-only (browser relay): drop the head with a marker, then cap every
+	// remaining tool result so a big recent observation can't alone overflow the
+	// small local window. No extra inference.
+	out := make([]oaiMessage, 0, len(msgs)-cut+2)
 	out = append(out, msgs[0]) // original system prompt
-	out = append(out, oaiMessage{Role: "system", Content: jsonString("Earlier in this task (summary of older turns): " + summary)})
+	out = append(out, oaiMessage{Role: "system", Content: jsonString("Earlier turns were dropped to fit the context window; the recent activity follows.")})
 	out = append(out, msgs[cut:]...)
+	out = truncateOldToolResults(out, 1)
 	return out
 }

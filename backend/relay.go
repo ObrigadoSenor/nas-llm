@@ -19,6 +19,19 @@ import (
 // backend, the browser streams the model output into the answer bubble directly
 // from localhost and Call returns the assembled text WITHOUT re-emitting chunk
 // events — the backend must not double-stream local-model content.
+// agentSampling carries the sampling parameters applied to every inference
+// round of an agent/search/clarify run. It is nil for plain-chat turns (which
+// stay on Ollama's Modelfile defaults). Sent as top-level OpenAI fields
+// (temperature/top_p/seed) on /v1/chat/completions — the only reliable way to
+// control temperature on Ollama's OpenAI shim, which otherwise ignores the
+// Modelfile's PARAMETER temperature (ollama/ollama#17744). seed == 0 means
+// unset (no seed sent).
+type agentSampling struct {
+	temperature float64
+	topP        float64
+	seed        int64
+}
+
 type modelBackend interface {
 	Call(ctx context.Context, model string, messages []oaiMessage, tools []oaiTool) (oaiMessage, agentUsage, error)
 }
@@ -28,8 +41,9 @@ type modelBackend interface {
 // they arrive. Tool-call deltas are accumulated into the returned assistant
 // message for the next round. This is unchanged behavior for NAS/Mac models.
 type directOllama struct {
-	chatURL string
-	emit    func(string) // live content deltas → job broadcast (j.emitChunk)
+	chatURL  string
+	emit     func(string)   // live content deltas → job broadcast (j.emitChunk)
+	sampling *agentSampling // nil for plain chat → Ollama Modelfile defaults
 }
 
 func (d *directOllama) Call(ctx context.Context, model string, messages []oaiMessage, tools []oaiTool) (oaiMessage, agentUsage, error) {
@@ -39,7 +53,31 @@ func (d *directOllama) Call(ctx context.Context, model string, messages []oaiMes
 		Tools:         tools,
 		StreamOptions: map[string]any{"include_usage": true},
 	}
+	if d.sampling != nil {
+		t := d.sampling.temperature
+		p := d.sampling.topP
+		req.Temperature = &t
+		req.TopP = &p
+		if d.sampling.seed != 0 {
+			s := d.sampling.seed
+			req.Seed = &s
+		}
+	}
 	return streamOllamaChatWithTools(ctx, d.chatURL, &req, d.emit)
+}
+
+// agentBackendInfo returns the backend kind ("server"/"relay") and the
+// per-run sampling config for a modelBackend, used by the opt-in debug
+// capture so a replayed round carries the same sampling that was actually
+// applied. Returns "unknown", nil for any other backend (e.g. a test fake).
+func agentBackendInfo(mb modelBackend) (string, *agentSampling) {
+	switch v := mb.(type) {
+	case *directOllama:
+		return "server", v.sampling
+	case *browserRelay:
+		return "relay", v.j.sampling
+	}
+	return "unknown", nil
 }
 
 // browserRelay is the local-model backend. The NAS backend cannot dial the

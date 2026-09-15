@@ -1163,6 +1163,13 @@ async function postModelResponse(convId, jobId, content, toolCalls, error){
 async function relayLocalModelCall(convId, call, renderer, bubble, signal){
   const body={ model:call.model, messages:call.messages, stream:true };
   if(call.tools && call.tools.length) body.tools=call.tools;
+  // Sampling params (agent/search/clarify rounds only): the backend forwards
+  // temperature/top_p/seed on the modelCall payload. Omit for plain chat
+  // (null) so the local Ollama uses its Modelfile defaults. temperature 0 is
+  // a valid (greedy) value, so check against null, not falsiness.
+  if(call.temperature != null) body.temperature=call.temperature;
+  if(call.top_p != null) body.top_p=call.top_p;
+  if(call.seed != null) body.seed=call.seed;
   const reportErr=(msg)=>{ if(bubble) bubbleError(bubble, msg); else showToast(msg, "err"); };
   let resp;
   // text/plain (not application/json) to keep this a CORS "simple request" with
