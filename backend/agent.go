@@ -30,7 +30,7 @@ import (
 // the current date injected so the model doesn't hallucinate "today".
 
 const (
-	agentObsMaxChars      = 4000 // cap a tool observation fed back to the model
+	agentObsMaxChars      = 4000 // Cap the size of the tool observation fed back to the model
 	agentOutputMaxChars   = 4096 // cap a command's display-only output stored on the step (reload parity)
 	agentDupLimit         = 3    // same tool+args this many times -> nudge to answer
 	agentNarrationRetries = 1    // re-prompt a narrating model this many times before accepting prose
@@ -242,6 +242,7 @@ func (s *server) toolRegistry(email string) map[string]agentTool {
 				}
 				return toolOutcome{observation: fmt.Sprintf("%s = %s", strings.TrimSpace(p.Expression), formatNum(v)), preview: "= " + formatNum(v)}
 			},
+     // agentObsMaxChars caps the size of the tool observation fed back to the model
 		},
 		"memory_read": {
 			schema: memoryReadTool(),
