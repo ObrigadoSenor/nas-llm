@@ -301,6 +301,7 @@ func (s *server) toolRegistry(email string) map[string]agentTool {
 	for name, schema := range map[string]oaiTool{
 		"read_file":   readFileTool(),
 		"list_files":  listFilesTool(),
+		"tree":        treeTool(),
 		"glob":        globTool(),
 		"grep":        grepTool(),
 		"git_status":  gitStatusTool(),
@@ -340,6 +341,17 @@ func listFilesTool() oaiTool {
 		Description: "List files and subdirectories in a repository directory. Use this to explore the project structure.",
 		Parameters: map[string]any{"type": "object", "properties": map[string]any{
 			"path": map[string]any{"type": "string", "description": "Repository-relative directory path (empty or \".\" for the root)"},
+		}},
+	}}
+}
+
+func treeTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "tree",
+		Description: "List the repository's folder structure recursively (a depth-limited tree). Use this to see the project layout at a glance instead of calling list_files on each directory. Returns repo-relative paths; directories are suffixed with /. Gitignored entries are marked (ignored) so you learn they exist without seeing their contents.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"path":  map[string]any{"type": "string", "description": "Repository-relative directory to start from (empty or \".\" for the root)."},
+			"depth": map[string]any{"type": "integer", "description": "Maximum recursion depth (default 3, clamped to 1..6)."},
 		}},
 	}}
 }
@@ -506,7 +518,7 @@ func listPrsTool() oaiTool {
 // then write tools, then git workflow tools.
 func localRepoTools() []string {
 	return []string{
-		"read_file", "list_files", "glob", "grep", "git_status", "git_log", "list_prs",
+		"read_file", "list_files", "tree", "glob", "grep", "git_status", "git_log", "list_prs",
 		"write_file", "edit_file", "move_path", "delete_path", "apply_patch", "run_command",
 		"git_commit", "git_push", "create_pr", "merge_pr",
 	}
@@ -518,6 +530,7 @@ func localToolMetas() []toolMeta {
 	return []toolMeta{
 		{Name: "read_file", Label: "Read file", Description: "Read a file in the repository (desktop only)."},
 		{Name: "list_files", Label: "List files", Description: "List a directory in the repository (desktop only)."},
+		{Name: "tree", Label: "Tree", Description: "Recursive folder structure (desktop only)."},
 		{Name: "glob", Label: "Glob", Description: "Find files by name pattern (desktop only)."},
 		{Name: "grep", Label: "Grep", Description: "Search file contents in the repository (desktop only)."},
 		{Name: "git_status", Label: "Git status", Description: "Show the working tree status (desktop only)."},
@@ -543,10 +556,16 @@ func localToolMetas() []toolMeta {
 // (conversations.repo_branch); when set it wins over r.Branch, which is only
 // the shared working tree's branch and can be plain wrong for a chat pinned to
 // its own branch (e.g. via a worktree) — telling the model the wrong branch
-// would make its "what am I working on" narration false.
+// would make its "what am I working on" narration false. A set convBranch also
+// means the run executes in an isolated per-branch worktree, so the block tells
+// the model gitignored files (.env, node_modules, build caches) are absent by
+// design there and that .env is a secret it must never read or print — the
+// primary remedy for the "agent can't find .env" confusion, since .env is
+// gitignored and therefore not materialized in a fresh worktree.
 func injectRepoContext(sys string, r *Repo, convBranch string) string {
 	branch := r.Branch
-	if strings.TrimSpace(convBranch) != "" {
+	inWorktree := strings.TrimSpace(convBranch) != ""
+	if inWorktree {
 		branch = convBranch
 	}
 	var b strings.Builder
@@ -558,13 +577,19 @@ func injectRepoContext(sys string, r *Repo, convBranch string) string {
 		b.WriteString(", HEAD: ")
 		b.WriteString(r.Head[:min(12, len(r.Head))])
 	}
-	b.WriteString("). Top-level files/dirs: ")
+	b.WriteString("). Your working directory is the repository root and all paths are repository-relative. Top-level files/dirs: ")
 	if len(r.Tree) > 0 {
 		b.WriteString(strings.Join(r.Tree, ", "))
 	} else {
 		b.WriteString("(empty)")
 	}
-	b.WriteString(". Use the read_file, list_files, glob, grep, and git_status tools to explore the codebase and discover what you need yourself — do NOT ask the user about the codebase (which files, where something is, how it works); look it up. Make ALL the changes needed with apply_patch first, then commit ONCE with git_commit when the work is complete — do NOT commit after each individual edit. Do not push with git_push and do not open a pull request with create_pr unless the user explicitly asks you to. Paths are repository-relative. Do not write diffs or commands as prose — call the tool so the change is actually applied. Keep answers grounded in what you read — do not guess at file contents.\n\n")
+	b.WriteString(". Use the tree, list_files, glob, grep, read_file, and git_status tools to explore the codebase and discover what you need yourself — do NOT ask the user about the codebase (which files, where something is, how it works); look it up. ")
+	if inWorktree {
+		b.WriteString("You are in an isolated per-branch git worktree for branch " + branch + ", which contains only git-tracked files: gitignored files such as .env, node_modules, and build caches are absent by design — do not try to create or copy in .env. ")
+	} else {
+		b.WriteString("This checkout shares the repo's main working tree. ")
+	}
+	b.WriteString("A gitignored file (such as .env) is a secret you must NEVER read, print, or paste into an answer: read_file refuses ignored paths, grep skips them, and the discovery tools (tree, list_files, glob) mark them (ignored) so you learn they exist without seeing their contents. Make ALL the changes needed with apply_patch first, then commit ONCE with git_commit when the work is complete — do NOT commit after each individual edit. Do not push with git_push and do not open a pull request with create_pr unless the user explicitly asks you to. Do not write diffs or commands as prose — call the tool so the change is actually applied. Keep answers grounded in what you read — do not guess at file contents.\n\n")
 	b.WriteString(sys)
 	return b.String()
 }
@@ -586,7 +611,7 @@ func agentSystemNudge() string {
 		"You have tools to help with tasks. Use a tool only when it is genuinely needed to make " +
 		"progress; otherwise answer directly. When the user asks you to change code or run something, " +
 		"do it directly with the tools — do not just describe or quote the changes. Discover codebase " +
-		"facts yourself with grep, glob, read_file, list_files, and git_status — never ask the user " +
+		"facts yourself with tree, list_files, glob, grep, read_file, and git_status — never ask the user " +
 		"about the codebase (which files to touch, where something lives, how it works); look it up. " +
 		"Reserve ask_user for the user's own intent, preferences, or requirements that are genuinely " +
 		"ambiguous and that you cannot discover from the codebase or conversation; if the request is " +
