@@ -2383,10 +2383,10 @@ function buildReposOverlay() {
     const r = await sid("github/connect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token }) });
     connectBtn.disabled = false;
     const d = (r && r.data) || {};
-    if (d.ok) { tokInput.value = ""; refreshGithub(); }
+    if (d.ok) { tokInput.value = ""; refreshGithub(); refreshGithubDot(); }
     else ghStatus.textContent = "Failed: " + (d.error || r.status);
   };
-  discBtn.onclick = async () => { await sid("github/disconnect", { method: "POST" }); refreshGithub(); };
+  discBtn.onclick = async () => { await sid("github/disconnect", { method: "POST" }); refreshGithub(); refreshGithubDot(); };
 }
 
 // openWorkingChanges shows a panel with the current `git diff` across all
@@ -3093,18 +3093,18 @@ function wireAgentMergeToggle(overlay) {
 }
 
 function makeReposBtn() {
-  const btn = el("button", "ds-repos-btn");
-  btn.title = "GitHub (connect account, browse & clone repos)"; btn.setAttribute("aria-label", "GitHub");
-  btn.textContent = "GitHub";
+  const btn = el("button", "ds-head-btn ds-repos-btn");
+  btn.title = "GitHub — connect account, browse & clone repos"; btn.setAttribute("aria-label", "GitHub");
+  btn.innerHTML = dsIcon("github") + '<span class="ds-dot off"></span>';
   btn.onclick = (e) => { e.stopPropagation(); openRepos(); };
   return btn;
 }
 
 // makeMyWorkBtn is the header button that opens the cross-workspace dashboard.
 function makeMyWorkBtn() {
-  const btn = el("button", "ds-repos-btn");
+  const btn = el("button", "ds-head-btn ds-mywork-btn");
   btn.title = "My Work — sessions, changes, and PRs across all workspaces"; btn.setAttribute("aria-label", "My Work");
-  btn.textContent = "My Work";
+  btn.innerHTML = dsIcon("mywork") + '<span class="ds-badge zero"></span>';
   btn.onclick = (e) => { e.stopPropagation(); openMyWork(); };
   return btn;
 }
@@ -3210,6 +3210,59 @@ async function maybeShowRepoWizard() {
   showRepoWizard();
 }
 
+// --- Header icon set + state badges ----------------------------------------
+// The bridge doesn't import the shared www/lib.js icon set, so the header
+// buttons carry their own inline SVGs. My Work shows an attention badge (active
+// sessions + open PRs across workspaces); GitHub shows a connected-state dot.
+const DS_ICONS = {
+  mywork: '<svg class="ds-ic" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6h11"/><path d="M9 12h11"/><path d="M9 18h11"/><path d="m3 6 1.5 1.5L7 5"/><path d="m3 12 1.5 1.5L7 11"/><path d="m3 18 1.5 1.5L7 17"/></svg>',
+  github:  '<svg class="ds-ic" width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2C6.48 2 2 6.58 2 12.26c0 4.5 2.87 8.32 6.84 9.67.5.1.68-.22.68-.48 0-.24-.01-.88-.01-1.73-2.78.62-3.37-1.37-3.37-1.37-.45-1.18-1.11-1.5-1.11-1.5-.91-.64.07-.62.07-.62 1 .07 1.53 1.06 1.53 1.06.89 1.56 2.34 1.11 2.91.85.09-.66.35-1.11.63-1.37-2.22-.26-4.55-1.14-4.55-5.07 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.71 0 0 .84-.28 2.75 1.05A9.4 9.4 0 0 1 12 6.84c.85 0 1.71.12 2.51.34 1.91-1.33 2.75-1.05 2.75-1.05.55 1.41.2 2.45.1 2.71.64.72 1.03 1.63 1.03 2.75 0 3.94-2.34 4.81-4.57 5.06.36.32.68.94.68 1.9 0 1.37-.01 2.48-.01 2.82 0 .27.18.59.69.48A10.02 10.02 0 0 0 22 12.26C22 6.58 17.52 2 12 2Z"/></svg>',
+};
+function dsIcon(name){ return DS_ICONS[name] || ''; }
+
+// refreshMyWorkBadge counts active sessions + open PRs across workspaces and
+// updates the My Work icon's attention badge. Best-effort: failures leave the
+// last badge. Capped at the first 8 repos so a large fleet doesn't fan out into
+// a request storm on every poll.
+async function refreshMyWorkBadge(){
+  const btn = document.querySelector(".ds-mywork-btn"); if(!btn) return;
+  let count = 0;
+  try{
+    const jr = await fetch("/api/jobs/active");
+    if(jr.ok){ const m = await jr.json().catch(()=>({})); count += Object.keys(m||{}).length; }
+  }catch{}
+  try{
+    const rr = await fetch("/api/repos");
+    if(rr.ok){
+      const repos = await rr.json().catch(()=>[]);
+      const prsP = (Array.isArray(repos)?repos:[]).slice(0,8).map(async rp=>{
+        const fullName = rp.fullName || rp.name || ""; if(!fullName) return 0;
+        try{ const p = await sid("repos/prs?name="+encodeURIComponent(fullName));
+             if(p && p.ok && p.data && Array.isArray(p.data.prs)) return p.data.prs.length; }catch{}
+        return 0;
+      });
+      const counts = await Promise.all(prsP);
+      count += counts.reduce((a,b)=>a+b,0);
+    }
+  }catch{}
+  const badge = btn.querySelector(".ds-badge");
+  if(!badge) return;
+  if(count>0){ badge.textContent = count>99?"99+":String(count); badge.classList.remove("zero"); }
+  else { badge.classList.add("zero"); badge.textContent=""; }
+}
+
+// refreshGithubDot toggles the GitHub icon's connected dot from /github/status.
+// Lightweight (one fetch) so it can poll alongside the My Work badge.
+async function refreshGithubDot(){
+  const btn = document.querySelector(".ds-repos-btn"); if(!btn) return;
+  let connected=false, login="";
+  try{ const r = await sid("github/status"); const d=(r&&r.data)||{}; connected=!!d.connected; login=d.login||""; }catch{}
+  const dot = btn.querySelector(".ds-dot");
+  if(dot) dot.classList.toggle("off", !connected);
+  btn.title = connected ? ("GitHub — connected as "+login) : "GitHub — connect account, browse & clone repos";
+  btn.setAttribute("aria-label", connected ? ("GitHub — "+login) : "GitHub");
+}
+
 function makeGear() {
   const btn = el("button", "ds-gear");
   btn.title = "Desktop settings"; btn.setAttribute("aria-label", "Desktop settings");
@@ -3226,15 +3279,19 @@ function addSettingsButton() {
   const app = $("app");
   const appVisible = !!app && !app.classList.contains("hidden");
   const header = document.querySelector("#app header");
-  // Gear (settings)
-  const headerGear = header ? header.querySelector(".ds-gear") : null;
-  if (appVisible && header && !headerGear) {
-    const gear = makeGear();
-    const sel = header.querySelector(".model-select");
-    if (sel) header.insertBefore(gear, sel); else header.appendChild(gear);
-  } else if (!appVisible && headerGear) {
-    headerGear.remove();
+  // One right-aligned actions cluster in the header: [My Work] [GitHub] [⚙].
+  // Built once and reused across syncAuthedUI runs; the header's .gap flex-pushes
+  // it to the right. (The model selector used to be the insertion anchor here but
+  // has moved into the composer config row — see www/index.html.)
+  let cluster = header ? header.querySelector(".ds-head-actions") : null;
+  if (appVisible && header && !cluster) {
+    cluster = el("div", "ds-head-actions");
+    header.appendChild(cluster);
   }
+  // Gear (settings): header when authed, fixed when on the login view.
+  const headerGear = header ? header.querySelector(".ds-gear") : null;
+  if (appVisible && cluster && !headerGear) cluster.appendChild(makeGear());
+  else if (!appVisible && headerGear) headerGear.remove();
   let fixed = document.querySelector("body > .ds-gear-fixed");
   if (!appVisible && !fixed) {
     fixed = makeGear();
@@ -3243,25 +3300,21 @@ function addSettingsButton() {
   } else if (appVisible && fixed) {
     fixed.remove();
   }
-  // Repos + My Work buttons (header only — require auth + backend)
-  const headerRepos = header ? header.querySelector(".ds-repos-btn") : null;
+  // My Work + GitHub: header only (require auth + backend).
   const headerMyWork = header ? header.querySelector(".ds-mywork-btn") : null;
-  if (appVisible && header && !headerRepos) {
-    const reposBtn = makeReposBtn();
-    const sel = header.querySelector(".model-select");
-    if (sel) header.insertBefore(reposBtn, sel); else header.appendChild(reposBtn);
-  } else if (!appVisible && headerRepos) {
-    headerRepos.remove();
-  }
-  if (appVisible && header && !headerMyWork) {
-    const myWorkBtn = makeMyWorkBtn();
-    myWorkBtn.classList.add("ds-mywork-btn");
-    const sel = header.querySelector(".model-select");
-    // Place My Work before the GitHub button so it reads [My Work] [GitHub] [⚙].
-    const reposBtn = header.querySelector(".ds-repos-btn");
-    if (reposBtn) header.insertBefore(myWorkBtn, reposBtn); else if (sel) header.insertBefore(myWorkBtn, sel); else header.appendChild(myWorkBtn);
-  } else if (!appVisible && headerMyWork) {
-    headerMyWork.remove();
+  const headerRepos = header ? header.querySelector(".ds-repos-btn") : null;
+  if (appVisible && cluster && !headerMyWork) cluster.appendChild(makeMyWorkBtn());
+  else if (!appVisible && headerMyWork) headerMyWork.remove();
+  if (appVisible && cluster && !headerRepos) cluster.appendChild(makeReposBtn());
+  else if (!appVisible && headerRepos) headerRepos.remove();
+  // Enforce visual order: My Work, GitHub, Gear (appendChild moves existing nodes).
+  if (cluster) {
+    const my = cluster.querySelector(".ds-mywork-btn");
+    const gh = cluster.querySelector(".ds-repos-btn");
+    const gear = cluster.querySelector(".ds-gear");
+    if (my) cluster.appendChild(my);
+    if (gh) cluster.appendChild(gh);
+    if (gear) cluster.appendChild(gear);
   }
 }
 
@@ -3318,9 +3371,10 @@ async function bootDesktop() {
   buildReposOverlay();
   fillOverlay();
   loadAgentGlobalAutoApprove();
-  // syncAuthedUI places the gear/GitHub buttons and — once #app is actually
-  // visible (authed) — builds the sidebar Repos section, populates it, and
-  // (only the first time, with zero repos connected) shows the connect wizard.
+  // syncAuthedUI places the header actions cluster (My Work / GitHub / gear)
+  // and — once #app is actually visible (authed) — builds the sidebar Repos
+  // section, populates it, and (only the first time, with zero repos
+  // connected) shows the connect wizard. Also seeds the header state badges.
   const syncAuthedUI = () => {
     addSettingsButton();
     const app = $("app");
@@ -3330,6 +3384,8 @@ async function bootDesktop() {
       refreshLocal();
       maybeShowRepoWizard();
       syncBranchRail();
+      refreshMyWorkBadge();
+      refreshGithubDot();
     } else {
       hideBranchRail();
     }
@@ -3341,6 +3397,11 @@ async function bootDesktop() {
   // boot script runs, so #app may still be hidden the first time above.
   const app = $("app");
   if (app) new MutationObserver(syncAuthedUI).observe(app, { attributes: true, attributeFilter: ["class"] });
+  // Keep the header state badges (active sessions + open PRs, GitHub connection
+  // dot) fresh while authed. Best-effort; skipped on the login view.
+  setInterval(() => {
+    if ($("app") && !$("app").classList.contains("hidden")) { refreshMyWorkBadge(); refreshGithubDot(); }
+  }, 20000);
   // Branch rail: re-derive the active repo-bound chat when the sidebar
   // re-renders (app.js marks the active conv row) or when desktop.js navigates
   // to a chat via the nasllm:openConv event.

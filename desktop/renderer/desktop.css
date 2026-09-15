@@ -8,7 +8,6 @@
   color: #c7ccd4;
   border-radius: 6px;
   width: 30px; height: 30px;
-  margin-right: 8px;
   font-size: 15px;
   line-height: 1;
   cursor: pointer;
@@ -102,6 +101,33 @@
   cursor: pointer;
 }
 .ds-repos-btn:hover { background: #1b1f27; }
+
+/* --- Header actions cluster (My Work / GitHub / gear) ---
+   Compact icon buttons replace the old verbose text labels. My Work carries an
+   attention badge (active sessions + open PRs); GitHub carries a connected dot. */
+.ds-head-actions { display: flex; align-items: center; gap: 4px; }
+.ds-head-btn {
+  background: transparent; border: none; color: #c7ccd4;
+  border-radius: 6px; width: 30px; height: 30px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer; position: relative;
+}
+.ds-head-btn:hover { background: #1b1f27; color: #e6e6e6; }
+.ds-head-btn .ds-ic { display: inline-flex; }
+.ds-head-btn .ds-badge {
+  position: absolute; top: -3px; right: -3px;
+  min-width: 16px; height: 16px; padding: 0 4px;
+  border-radius: 99px; background: #3b2a1a; color: #e8a060;
+  font-size: 10px; font-weight: 600; line-height: 16px; text-align: center;
+  border: 1.5px solid #15171c;
+}
+.ds-head-btn .ds-badge.zero { display: none; }
+.ds-head-btn .ds-dot {
+  position: absolute; bottom: 3px; right: 3px;
+  width: 7px; height: 7px; border-radius: 50%;
+  background: #60c890; border: 1.5px solid #15171c;
+}
+.ds-head-btn .ds-dot.off { background: #3a4150; }
 
 /* Wider card for the repos list. */
 .ds-card-wide { width: 660px; }

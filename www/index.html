@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="dark">
 <title>nas-llm</title>
 <link rel="stylesheet" href="vendor/highlight-github-dark.min.css">
-<link rel="stylesheet" href="styles.css?v=49">
+<link rel="stylesheet" href="styles.css?v=50">
 <script defer src="vendor/highlight.min.js"></script>
 </head>
 <body>
@@ -44,12 +44,16 @@
       <h1 id="chatTitle">nas-llm</h1>
       <span id="chatMeta"></span>
       <div class="gap"></div>
-      <div class="model-select">
-        <button id="modelBtn" class="model-btn" type="button" aria-haspopup="dialog" aria-expanded="false" title="Model"></button>
-      </div>
     </header>
     <div id="chat"></div>
     <div class="composer">
+      <div class="composer-cfg">
+        <div class="seg mode-seg" id="modeSeg" role="tablist" aria-label="Chat mode"></div>
+        <div class="gap"></div>
+        <div class="model-select">
+          <button id="modelBtn" class="model-btn" type="button" aria-haspopup="dialog" aria-expanded="false" title="Model"></button>
+        </div>
+      </div>
       <div id="pills" class="pills hidden"></div>
       <div id="imgPills" class="img-pills hidden"></div>
       <div class="input-wrap">
@@ -110,6 +114,6 @@
   </div>
 </div>
 
-<script type="module" src="app.js?v=54"></script>
+<script type="module" src="app.js?v=55"></script>
 </body>
 </html>
