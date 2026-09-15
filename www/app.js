@@ -179,7 +179,12 @@ function enforceToolGating(){
 
 function renderPills(){
   pills.innerHTML="";
-  activeExtras.forEach(id=>{
+  // Mode extras (web/clarify/agent) are shown in the segmented mode selector
+  // above the input, not as removable pills — skip them here so the two don't
+  // duplicate the same state. Future non-mode extras would still render as pills.
+  const MODE_IDS=["web","clarify","agent"];
+  const visible=[...activeExtras].filter(id=>!MODE_IDS.includes(id));
+  visible.forEach(id=>{
     const def=EXTRA_DEFS.find(d=>d.id===id); if(!def) return;
     const pill=document.createElement("span"); pill.className="pill";
     pill.innerHTML=icon(def.icon,13)+'<span>'+escapeHtml(def.label)+'</span>';
@@ -188,7 +193,7 @@ function renderPills(){
     x.addEventListener("click",e=>{ e.stopPropagation(); activeExtras.delete(id); saveExtras(); renderExtras(); });
     pill.appendChild(x); pills.appendChild(pill);
   });
-  pills.classList.toggle("hidden", activeExtras.size===0);
+  pills.classList.toggle("hidden", visible.length===0);
 }
 function renderPlusPopup(){
   plusPopup.innerHTML="";
@@ -212,7 +217,86 @@ function renderPlusPopup(){
   cfg.addEventListener("click",e=>{ e.stopPropagation(); setPlusPopup(false); openAgentPanel(); });
   plusPopup.appendChild(sep); plusPopup.appendChild(cfg);
 }
-function renderExtras(){ renderPills(); renderPlusPopup(); }
+function renderExtras(){ renderPills(); renderPlusPopup(); renderModeSeg(); }
+
+// --- Mode selector (segmented control above the input) ---------------------
+// A persistent, visible replacement for the mode toggles that used to live only
+// in the + popup. Ask = no extra; Web/Clarify/Agent = the mutually-exclusive
+// tool extras; Plan = the conversation's planMode field (agent loop researches
+// and plans, then waits for approval). Drives the same primitives as the +
+// menu / slash commands (activeExtras + a planMode PATCH), so there is one
+// source of truth for mode state. Gated by tool support like renderPlusPopup.
+const MODE_DEFS=[
+  { id:"ask", label:"Ask", needsTools:false },
+  { id:"web", label:"Web", needsTools:true },
+  { id:"clarify", label:"Clarify", needsTools:true },
+  { id:"agent", label:"Agent", needsTools:true },
+  { id:"plan", label:"Plan", needsTools:true },
+];
+function activeModeId(){
+  const c = activeId ? conversations.find(x=>x.id===activeId) : null;
+  if(c && c.planMode) return "plan";
+  if(activeExtras.has("web")) return "web";
+  if(activeExtras.has("clarify")) return "clarify";
+  if(activeExtras.has("agent")) return "agent";
+  return "ask";
+}
+function renderModeSeg(){
+  const seg=$("modeSeg"); if(!seg) return;
+  const toolsOk=modelSupportsTools(selectedModel); // null=unknown, true, false
+  const active=activeModeId();
+  seg.replaceChildren();
+  for(const def of MODE_DEFS){
+    const blocked=!!def.needsTools && toolsOk!==true;
+    const b=document.createElement("button");
+    b.type="button";
+    b.className="mode-seg-btn"+(def.id===active?" active":"")+(blocked?" disabled":"");
+    b.textContent=def.label;
+    b.setAttribute("role","tab");
+    b.setAttribute("aria-selected", String(def.id===active));
+    if(blocked){
+      b.disabled=true;
+      b.title = toolsOk===false
+        ? (selectedModel+" has no tool support — use a tool-capable model for "+def.label+".")
+        : (selectedModel+" — checking tool support…");
+    } else {
+      b.title=def.label+" mode";
+    }
+    b.addEventListener("click",e=>{ e.stopPropagation(); if(blocked) return; selectMode(def.id); });
+    seg.appendChild(b);
+  }
+}
+async function selectMode(id){
+  if(id===activeModeId()) return;
+  const def=MODE_DEFS.find(d=>d.id===id);
+  if(def && def.needsTools && modelSupportsTools(selectedModel)!==true){
+    slashNote(selectedModel+" has no tool support — use a tool-capable model for "+def.label+".");
+    return;
+  }
+  // Reset mode extras, then set the chosen one (Plan runs inside the agent loop).
+  activeExtras.delete("web"); activeExtras.delete("clarify"); activeExtras.delete("agent");
+  if(id==="web") activeExtras.add("web");
+  else if(id==="clarify") activeExtras.add("clarify");
+  else if(id==="agent") activeExtras.add("agent");
+  else if(id=="plan" && !activeExtras.has("agent")) activeExtras.add("agent");
+  saveExtras(); renderExtras();
+  // Plan is a conversation field, not an extra — PATCH it for the active chat.
+  if(activeId){
+    const planMode=(id==="plan");
+    try{
+      await fetchRetry("/api/conversations/"+encodeURIComponent(activeId),{
+        method:"PATCH", headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({planMode, planApproved:false})
+      },{label:"Set plan mode"});
+      const c=conversations.find(x=>x.id===activeId);
+      if(c){ c.planMode=planMode; c.planApproved=false; }
+    }catch(e){ /* best-effort */ }
+  }
+  renderModeSeg();
+  if(id==="ask") slashNote("Ask mode");
+  else if(id==="plan") slashNote("Plan mode on — the agent will research and plan, then wait for your approval.");
+  else slashNote(def.label+" on");
+}
 function setPlusPopup(open){ plusPopup.classList.toggle("hidden", !open); plusBtn.classList.toggle("on", open); plusBtn.setAttribute("aria-expanded", String(open)); }
 plusBtn.addEventListener("click", e=>{ e.stopPropagation(); setPlusPopup(plusPopup.classList.contains("hidden")); });
 document.addEventListener("click", e=>{ if(plusPopup.classList.contains("hidden")) return; if(!plusPopup.contains(e.target) && !plusBtn.contains(e.target)) setPlusPopup(false); });
@@ -1682,6 +1766,7 @@ function rerenderChat(){
   });
 }
 function updateHeader(){
+  renderModeSeg();
   if(!activeId){ chatTitle.textContent="New chat"; chatMeta.textContent=""; return; }
   const c=conversations.find(x=>x.id===activeId);
   if(!c){ chatTitle.textContent="Chat"; chatMeta.textContent=""; return; }
