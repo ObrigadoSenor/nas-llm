@@ -11,7 +11,7 @@ For repo-wide conventions (branch model, commit style, verification loop, do-not
 - `renderer/desktop.css` (~417 lines) — self-contained dark styles for the bridge (`.ds-*` classes). No dependency on the app's CSS variables.
 - `src-tauri/src/main.rs` — entry point: binds a localhost port, resolves `www/` + `renderer/` resource paths, spawns the sidecar on the Tauri async runtime, creates the WebView window at the sidecar origin.
 - `src-tauri/src/sidecar.rs` — the axum HTTP server: serves `www/`, exposes `/__sidecar/*` control plane, reverse-proxies `/api/*` to the NAS, proxies `/__ollama/*` to local Ollama. Holds the session cookie jar.
-- `src-tauri/src/github.rs` — GitHub token storage (macOS Keychain via `keyring`), repo clone/pull/branch/exec/commit/PR operations, `/__sidecar/github/*` and `/__sidecar/repos/*` routes. The `repos_exec` dispatcher runs the local file tools: `read_file`/`list_files`/`glob`/`grep`/`git_status`/`git_log`/`list_prs` (read-only), `write_file`/`edit_file`/`delete_path`/`move_path` (new, approval-gated with a unified-diff preview), `apply_patch` (normalized + a 4-rung apply ladder), `run_command` (timeout-bounded), and `git_commit`/`git_push`/`create_pr`/`merge_pr`. `resolve_new_path` resolves create-target paths that may not yet exist. A `#[cfg(test)]` module covers patch normalization, the apply ladder, `resolve_new_path` guards, and `edit_file` match counting.
+- `src-tauri/src/github.rs` — GitHub token storage (macOS Keychain via `keyring`), repo clone/pull/branch/exec/commit/PR operations, `/__sidecar/github/*` and `/__sidecar/repos/*` routes. The `repos_exec` dispatcher runs the local file tools: `read_file`/`list_files`/`glob`/`grep`/`git_status`/`git_log`/`list_prs` (read-only), `write_file`/`edit_file`/`delete_path`/`move_path` (new, approval-gated with a unified-diff preview), `apply_patch` (normalized + a 4-rung apply ladder), `run_command` (timeout-bounded), and `git_commit`/`git_push`/`create_pr`/`merge_pr`. For a non-git workspace (`useGit=false`), the git tools are short-circuited with a clear observation and the git-only routes return `{ok:false,error:"workspace is not git-enabled"}`. `create-workspace`/`init-git` register/promote workspaces (name + optional `git init`). `resolve_new_path` resolves create-target paths that may not yet exist. A `#[cfg(test)]` module covers patch normalization, the apply ladder, `resolve_new_path` guards, `edit_file` match counting, `is_safe_workspace_name`, and the non-git git-route gating.
 - `src-tauri/src/updater.rs` — three `#[tauri::command]`s (`app_version`, `check_for_updates`, `download_and_install_update`) wrapping `tauri-plugin-updater` so the renderer uses IPC, not plugin capabilities.
 - `src-tauri/tauri.conf.json` — no static window (`windows: []`); `frontendDist` is `../../www`; bundles `../../www/` and `../renderer/` as resources; CSP is null; updater endpoint + pubkey configured.
 - `src-tauri/capabilities/main.json` — permissions for the runtime-created `main` window. `remote.urls` allows `http://127.0.0.1:*` (the sidecar origin) so plugin commands work from the sidecar-loaded page.
@@ -44,14 +44,16 @@ The cookie jar is persisted to `<app-data>/nas-llm-desktop/session.json`; the ba
 - `GET/POST /__sidecar/ollama/{status,start,stop}` — local Ollama lifecycle.
 - `ANY /__ollama/*path` — `proxy_ollama` (`:835`): same-origin proxy to `localhost:11434`, strips browser `Origin`/`Referer` (Ollama 403s them).
 
-GitHub/repos routes are in `github.rs:2541-2568` (merged into the same axum app at `main.rs:148`): `/__sidecar/github/{status,connect,disconnect,repos}` and `/__sidecar/repos/{local,add-local,scan-local,clone,refresh,open,exec,diff,revert,changelog,ship,set-folder,branch,create-branch,state,branches,checkout,commit,create-pr,worktree}`.
+GitHub/repos routes are in `github.rs:2541-2568` (merged into the same axum app at `main.rs:148`): `/__sidecar/github/{status,connect,disconnect,repos}` and `/__sidecar/repos/{local,add-local,create-workspace,init-git,scan-local,clone,refresh,open,exec,diff,revert,changelog,ship,set-folder,branch,create-branch,state,branches,checkout,commit,create-pr,worktree}`.
+
+A connected codebase is a "workspace": either a git repo (`useGit=true`, the default and the only case before this feature) or a plain folder (`useGit=false`). The sidecar registry (`repos.json`) records `use_git` + `name` per record; git-only routes (`state`/`branches`/`checkout`/`branch`/`create-branch`/`commit`/`create-pr`/`prs`/`merge-pr`/`worktree`/`ship`/`changelog`/`refresh`/`diff`/`revert`) gate on `use_git` and return `{ok:false,error:"workspace is not git-enabled"}` for a non-git workspace. `repos_exec` short-circuits the git tools (`git_status`/`git_log`/`list_prs`/`git_commit`/`git_push`/`create_pr`/`merge_pr`) for a non-git workspace with a clear observation; file tools run unchanged. `repos_state` returns `useGit:false` + zeros for branch/dirty/ahead/behind for a non-git workspace. `create-workspace` registers a folder with a name + optional `git init`; `init-git` promotes a non-git workspace to git-enabled in place.
 
 ## HTML injection + cache-bust — READ THIS BEFORE EDITING THE RENDERER
 
 `sidecar.rs:308-332` (`index_html`) reads `www/index.html`, injects a `<link>` for `desktop.css` before `</head>` and a `<script>` for `desktop.js` before `</body>`, then serves it. The `?v=` query strings on those URLs are **hardcoded literals in Rust source**:
 
-- `desktop.css?v=20` — `sidecar.rs:317`
-- `desktop.js?v=27` — `sidecar.rs:324`
+- `desktop.css?v=21` — `sidecar.rs:317`
+- `desktop.js?v=29` — `sidecar.rs:324`
 
 (These numbers go stale on every bump; always re-read the lines before quoting them.)
 
@@ -74,17 +76,17 @@ This is a cross-language coupling with no build-time check. The `www/` side has 
 - `412-553` — **Approval dialog**: FIFO queue (`pumpApprovalQueue`), reusable overlay re-wired per call, colored diff renderer (`renderDiff`).
 - `555-574` — **Tauri IPC helpers** (`tauriInvoke`, `tauriListen`): the only IPC in the app; everything else is same-origin HTTP.
 - `576-638` — **Native notifications** (job completion) + `pickFolder` (native directory picker via `plugin:dialog`).
-- `640-736` — **Connect folder flow**: native pick → `/__sidecar/repos/scan-local` → single add or checklist picker.
+- `640-736` — **Connect folder flow**: native pick → `/__sidecar/repos/scan-local` → single add or checklist picker. `scan-local` returns a `git` flag per candidate; a non-git candidate routes to the named-workspace flow (`createWorkspaceForPath`) instead of `add-local`.
 - `738-776` — `dsConfirm` (replaces native `confirm()`).
 - `778-829` — Workspace data helpers (`loadWorkspaceData`, `ensureWorkspaceFolder`).
 - `831-1036` — **Branch rail + composer status line**: binds to the active repo-bound chat, polls `/__sidecar/repos/state` every 5s, renders `repo · ⎇ branch · ●N dirty · ↑a ↓b`, auto-approve toggle chip.
-- `1038-1178` — `createRepoChat`: registers repo with backend, creates conversation, cuts an `agent/<slug>-<id>` branch, enables file+git agent tools, navigates without reload.
+- `1038-1178` — `createWorkspaceChat` (was `createRepoChat`): registers workspace with backend, creates conversation, cuts an `agent/<slug>-<id>` branch (git workspaces only — skipped for `useGit=false`), enables file+git agent tools (file-only for non-git), navigates without reload.
 - `1180-1733` — **Repos overlay + local repo sidebar**: GitHub connect/browse/clone, local repo dropdown rows, `openBranchPicker` (repo folder switch), `openChatBranchPicker`/`switchChatBranch` (per-chat branch), `repoMenu` (⋯ actions), `refreshLocal`/`refreshGithub`, toasts.
 - `1735-1800` — **Working changes panel**: cross-repo `git diff` + revert.
 - `1802-1904` — **Ship wizard**: version + changelog + commit/push.
 - `1906-2077` — **Session panel**: diff review, commit & push, open PR, revert, ship.
-- `2078-2119` — Sidebar "Repos" section injection into `#sidebar`.
-- `2121-2168` — First-load connect wizard (shown once when zero repos).
+- `2078-2119` — Sidebar "Repos" section injection into `#sidebar`; the "+" opens `openConnectMenu` (Connect git repo / New workspace…).
+- `2121-2168` — First-load connect wizard (shown once when zero workspaces); offers both git and non-git.
 - `2170-2212` — Gear button placement (header when authed, fixed when on login view).
 - `2214-2254` — `hookLogin`: paste-link box on the login card.
 - `2256-2325` — `bootDesktop`: orchestrates all of the above on load; MutationObservers on `#app`/`#convList`; auto-starts Ollama.

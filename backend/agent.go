@@ -592,13 +592,33 @@ func sshGrepTool(hosts []string) oaiTool {
 // allow append in jobs.go so the three lists cannot drift. git_log and list_prs
 // are included here — they already had sidecar executors but were missing from
 // every backend list, so the model could never call them. Read-only tools first,
-// then write tools, then git workflow tools.
+// then write tools, then git workflow tools. The literal order is preserved
+// exactly (agent_tools_test.go and the UI menu depend on it); the file/git
+// subsets below are sliced out of this same set so a non-git workspace gets the
+// file tools only without reordering the git-repo case.
 func localRepoTools() []string {
 	return []string{
 		"read_file", "list_files", "tree", "glob", "grep", "git_status", "git_log", "list_prs",
 		"write_file", "edit_file", "move_path", "delete_path", "apply_patch", "run_command",
 		"git_commit", "git_push", "create_pr", "merge_pr",
 	}
+}
+
+// localFileTools is the read + write subset of localRepoTools: the tools that
+// work against a plain workspace folder with no git. Appended to a non-git
+// workspace's agent allowlist (useGit=false). Order is stable and independent
+// of localRepoTools' interleaving so the git-repo menu never shifts.
+func localFileTools() []string {
+	return []string{
+		"read_file", "list_files", "tree", "glob", "grep",
+		"write_file", "edit_file", "move_path", "delete_path", "apply_patch", "run_command",
+	}
+}
+
+// localGitTools is the git-workflow subset of localRepoTools: status/log/PRs
+// plus commit/push/PR/merge. Only appended when the workspace is git-enabled.
+func localGitTools() []string {
+	return []string{"git_status", "git_log", "list_prs", "git_commit", "git_push", "create_pr", "merge_pr"}
 }
 
 // localToolMetas is the UI-facing metadata for localRepoTools, in the same
@@ -777,6 +797,27 @@ func injectRepoContext(sys string, r *Repo, convBranch string) string {
 		b.WriteString("This checkout shares the repo's main working tree. ")
 	}
 	b.WriteString("A gitignored file (such as .env) is a secret you must NEVER read, print, or paste into an answer: read_file refuses ignored paths, grep skips them, and the discovery tools (tree, list_files, glob) mark them (ignored) so you learn they exist without seeing their contents. Make single-file edits with edit_file (exact string replacement) or write_file (create/overwrite); both are reliable on every model. Reserve apply_patch (a unified diff) for genuine multi-file or multi-hunk edits, and if a diff fails to apply, do not re-emit it; switch to edit_file or write_file. Then commit ONCE with git_commit when the work is complete — do NOT commit after each individual edit. Do not push with git_push and do not open a pull request with create_pr unless the user explicitly asks you to. Do not write diffs or commands as prose — call the tool so the change is actually applied. Keep answers grounded in what you read — do not guess at file contents.\n\n")
+	b.WriteString(sys)
+	return b.String()
+}
+
+// injectWorkspaceContext prepends a workspace context block to the agent system
+// prompt for a non-git workspace (useGit=false): the workspace name and the
+// top-level file tree, with no branch/HEAD/worktree/gitignore text (there is no
+// git). File tools still run via the sidecar relay; the .env-secret rule
+// carries over so the agent never reads or prints secrets.
+func injectWorkspaceContext(sys string, r *Repo) string {
+	var b strings.Builder
+	b.WriteString("You are working in a local workspace folder named ")
+	b.WriteString(r.FullName)
+	b.WriteString(" (no git). Your working directory is the workspace root and all paths are workspace-relative. Top-level files/dirs: ")
+	if len(r.Tree) > 0 {
+		b.WriteString(strings.Join(r.Tree, ", "))
+	} else {
+		b.WriteString("(empty)")
+	}
+	b.WriteString(". Use the tree, list_files, glob, grep, and read_file tools to explore the workspace and discover what you need yourself — do NOT ask the user about the workspace (which files, where something is, how it works); look it up. ")
+	b.WriteString("This workspace is not under git version control: do not call git_status, git_log, git_commit, git_push, create_pr, list_prs, or merge_pr — they are not available and will error. Make single-file edits with edit_file (exact string replacement) or write_file (create/overwrite); both are reliable on every model. Reserve apply_patch (a unified diff) for genuine multi-file or multi-hunk edits, and if a diff fails to apply, do not re-emit it; switch to edit_file or write_file. A secret file (such as .env) must NEVER be read, printed, or pasted into an answer: read_file refuses ignored paths, grep skips them, and the discovery tools (tree, list_files, glob) mark them (ignored) so you learn they exist without seeing their contents. Do not write diffs or commands as prose — call the tool so the change is actually applied. Keep answers grounded in what you read — do not guess at file contents.\n\n")
 	b.WriteString(sys)
 	return b.String()
 }

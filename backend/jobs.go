@@ -1451,8 +1451,14 @@ func (s *server) runGeneration(j *job) error {
 		if repoID != "" {
 			if r, err := s.store.getRepo(j.email, repoID); err == nil && r != nil {
 				repo = r
-				allow = append(allow, localRepoTools()...)
-				sys = injectRepoContext(sys, repo, conv.RepoBranch)
+				if r.UseGit {
+					allow = append(allow, localRepoTools()...)
+					sys = injectRepoContext(sys, repo, conv.RepoBranch)
+				} else {
+					// Non-git workspace: file tools only (no git tools/routes/controls).
+					allow = append(allow, localFileTools()...)
+					sys = injectWorkspaceContext(sys, repo)
+				}
 			}
 		}
 
