@@ -62,6 +62,51 @@ npm run desktop    # = tauri dev
 (`http://127.0.0.1:17543` by default). The first build downloads many crates
 and links (~25s after the crate cache is warm; several minutes cold).
 
+### Local code-signing (dev)
+
+`tauri dev` runs the raw debug binary, which macOS ad-hoc-signs fresh on every
+rebuild. The GitHub token lives in the Keychain, whose access ACL keys off the
+app's code signature — so each rebuild looks like a stranger and macOS prompts
+for your keychain password on every launch. To stop that, sign the debug binary
+with a stable self-signed identity (local dev only; this does not affect
+bundle/CI signing):
+
+1. **One-time** — create the identity in your login keychain:
+
+   ```sh
+   bash desktop/scripts/setup-codesign.sh
+   ```
+
+   macOS may prompt once to let `codesign` use the new key — click **Always
+   Allow**.
+
+2. **Persist the identity name** in your shell rc (`~/.zshrc`):
+
+   ```sh
+   export NASLLM_CODESIGN_ID=nas-llm-dev
+   ```
+
+3. **Launch dev with signing** instead of plain `npm run desktop`:
+
+   ```sh
+   cd desktop
+   npm run desktop:signed
+   ```
+
+   `desktop:signed` (`scripts/dev.sh`) wires `scripts/codesign-linker.sh` in as
+   the cargo linker for the build, which re-signs the
+   `target/debug/nas-llm-desktop` executable after every link. `tauri dev`'s
+   auto-rebuild and devtools are unchanged.
+
+The first launch still prompts once for the GitHub-token keychain item — click
+**Always Allow**. Subsequent rebuilds and relaunches no longer prompt. Plain
+`npm run desktop` and `make check-desktop` are untouched (the wrapper is a
+no-op passthrough when `NASLLM_CODESIGN_ID` is unset).
+
+If `setup-codesign.sh` fails on your machine, create the certificate by hand:
+**Keychain Access → Certificate Assistant → Create a Certificate…**, name it
+`nas-llm-dev`, identity type *Self-Signed Root*, certificate type *Code Signing*.
+
 ### Configuration
 
 - **Backend URL:** ⚙ Desktop settings → NAS backend URL (default

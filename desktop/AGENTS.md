@@ -6,7 +6,7 @@ For repo-wide conventions (branch model, commit style, verification loop, do-not
 
 ## Layout
 
-- `package.json` — npm scripts only: `npm run desktop` = `tauri dev`, `npm run desktop:build` = `tauri build`. Deps: `@tauri-apps/cli` + `@tauri-apps/api`.
+- `package.json` — npm scripts only: `npm run desktop` = `tauri dev`, `npm run desktop:build` = `tauri build`, `npm run desktop:signed` = `tauri dev` with the codesign linker wrapper (see `scripts/`). Deps: `@tauri-apps/cli` + `@tauri-apps/api`.
 - `renderer/desktop.js` (~2325 lines) — the entire desktop bridge: settings overlay, paste-link sign-in, Ollama panel, GitHub/repos UI, approval dialogs, branch rail, in-app updater UI. Served at `/__sidecar/desktop.js`.
 - `renderer/desktop.css` (~417 lines) — self-contained dark styles for the bridge (`.ds-*` classes). No dependency on the app's CSS variables.
 - `src-tauri/src/main.rs` — entry point: binds a localhost port, resolves `www/` + `renderer/` resource paths, spawns the sidecar on the Tauri async runtime, creates the WebView window at the sidecar origin.
@@ -15,6 +15,7 @@ For repo-wide conventions (branch model, commit style, verification loop, do-not
 - `src-tauri/src/updater.rs` — three `#[tauri::command]`s (`app_version`, `check_for_updates`, `download_and_install_update`) wrapping `tauri-plugin-updater` so the renderer uses IPC, not plugin capabilities.
 - `src-tauri/tauri.conf.json` — no static window (`windows: []`); `frontendDist` is `../../www`; bundles `../../www/` and `../renderer/` as resources; CSP is null; updater endpoint + pubkey configured.
 - `src-tauri/capabilities/main.json` — permissions for the runtime-created `main` window. `remote.urls` allows `http://127.0.0.1:*` (the sidecar origin) so plugin commands work from the sidecar-loaded page.
+- `scripts/` — opt-in, macOS-only local code-signing for dev: `setup-codesign.sh` (one-time self-signed cert import), `dev.sh` (`npm run desktop:signed`; exports `CARGO_TARGET_*_LINKER` + `NASLLM_CODESIGN_ID`), `codesign-linker.sh` (env-gated linker wrapper that re-signs the debug binary after every link). The wrapper is a no-op passthrough when `NASLLM_CODESIGN_ID` is unset, so `make check-desktop`/CI are unaffected. See README "Local code-signing (dev)".
 
 ## Sidecar architecture
 
