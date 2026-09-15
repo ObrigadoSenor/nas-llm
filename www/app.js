@@ -344,6 +344,22 @@ function renderSend(){
     pauseBtn.classList.add("hidden");
   }
 }
+// stopActive aborts the active job: for a local-model job it aborts the
+// in-flight localhost inference immediately (so Stop is responsive, not gated
+// on the SSE round-trip), then POSTs /cancel so the backend finalizes the
+// connection-bound job. The per-conversation "done" event carries no payload,
+// so tailJob can't otherwise distinguish a clean finish from a user stop —
+// stoppedByUser is stashed here so the done handler reports "cancelled".
+async function stopActive(){
+  if(activeJobConvId !== activeId) return;
+  const id=activeId;
+  send.disabled=true;
+  const ctrl=localAborts.get(id);
+  if(ctrl){ ctrl.abort(); localAborts.delete(id); }
+  stoppedByUser.add(id);
+  try{ await fetch("/api/conversations/"+encodeURIComponent(id)+"/cancel",{method:"POST"}); }catch{}
+  setTimeout(()=>{ if(activeJobConvId === activeId){ activeJobConvId=null; renderSend(); } }, 4000);
+}
 // pauseActive asks the backend to pause the active agent run between steps.
 // The worker checkpoints the transcript and finalizes the job "paused"; the
 // SSE "done" event then drives the paused banner + Resume affordance.
@@ -1755,6 +1771,9 @@ async function stream(){
 
   // Tail the job. Generation keeps running on the NAS even if the user switches
   // chats; "done" reloads this conversation from the server (source of truth).
+  // An agent run shows Pause; mirror resumeIfGenerating so the button appears
+  // on the fresh send, not only after a chat-switch reattach.
+  activeJobAgent=!!job.agent;
   tailJob(activeId, job.id, bubble, job.content||"", searchWrap, srcLinks, null, stepsWrap, null, thoughtsWrap, thoughtsDet, null);
   renderSend();
 }
