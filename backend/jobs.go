@@ -1606,7 +1606,7 @@ func (s *server) runGeneration(j *job) error {
 	// (no tool-schema overhead on the slow vision path; non-tool models can't
 	// emit tool_calls). Gated by ASK_USER_IN_PLAIN_CHAT / CLARIFY_PROSE_DETECT.
 	if s.cfg.askUserInPlainChat && !hasImages && s.supportsTools(j.model, j.local, j.supportsTools) {
-		asked, err := s.runAskUserPass(ctx, mb, j.model, msgs, j.emitChunk, j.emitPhase, j.emitQuestions, phaseForImages(hasImages), askUserLightNudgeText())
+		asked, err := s.runAskUserPass(ctx, mb, j.model, msgs, j.emitChunk, j.emitPhase, j.emitQuestions, phaseForImages(hasImages), askUserLightNudgeText()+"\n\n"+plainChatNudge())
 		if err != nil {
 			return err
 		}
@@ -1628,7 +1628,8 @@ func (s *server) runGeneration(j *job) error {
 	// stale "queued" label (set at enqueue) would mislead the user into thinking
 	// another reply is blocking. A text turn reports "answering".
 	j.emitPhase(phaseForImages(hasImages))
-	return s.runStreamPass(ctx, mb, j.model, msgs, j.emitChunk)
+	plainMsgs := append([]oaiMessage{{Role: "system", Content: jsonString(plainChatNudge())}}, msgs...)
+	return s.runStreamPass(ctx, mb, j.model, plainMsgs, j.emitChunk)
 }
 
 // phaseForImages returns the generation phase hint for a non-search turn:

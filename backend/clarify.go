@@ -116,6 +116,21 @@ func askUserLightNudgeText() string {
 		"\n\n" + toolCallDiscipline()
 }
 
+// plainChatNudge is the system prompt prepended to every plain (non-agent,
+// non-search, non-clarify) chat turn. It is intentionally short — plain chat
+// stays close to the model's native behavior, unlike agent mode's heavier
+// harness prompt — and carries only the follow-up-question style nudge. It does
+// NOT pull in the configurable agent_system setting (an agent-harness concern;
+// see TestAgentSystemPromptInjection_OnlyAppliesToAgentMode), and it is NOT
+// applied to the degraded no-tool fallbacks inside the agent/search/clarify
+// paths, which stream an honest "I can't do X" message that should not end
+// with a proactive next-step offer.
+func plainChatNudge() string {
+	return "After completing your answer, end with a brief follow-up question that suggests a logical next step and asks whether " +
+		"the user would like you to take it (for example, \"Shall I run the tests now?\" or \"Want me to update the docs to match?\"). " +
+		"This is ordinary prose in your answer — not a tool call."
+}
+
 // runAskUserPass runs one tool-calling pass with the ask_user tool. If the
 // model calls ask_user with a parseable question, it stashes the structured
 // card on the job (emitQuestions) so the worker persists a clarifying turn and
