@@ -399,3 +399,90 @@ func TestPrToolsWiring(t *testing.T) {
 		}
 	}
 }
+
+// TestRepoLifecycleToolsWiring guards the backend registration of the two
+// repository-lifecycle agent tools: create_repo (create a new GitHub repo) and
+// link_remote (add a GitHub origin remote to the local workspace). Both are
+// approval-gated and external/mutating, so they must be in planWriteTools and
+// must NOT be in localFileTools (a non-git workspace doesn't get them). It
+// checks the surfaces that must agree for the tools to be offered to a
+// repo-bound agent run: defaultAgentTools, toolRegistry (schema + local-relay
+// flag + required args), availableTools, and the localGitTools partition. It
+// does NOT exercise the sidecar executors or the GitHub API — those run in the
+// desktop app with a real token.
+func TestRepoLifecycleToolsWiring(t *testing.T) {
+	want := []struct {
+		name    string
+		require []string
+	}{
+		{"create_repo", []string{"name"}},
+		{"link_remote", []string{"url"}},
+	}
+	defaults := defaultAgentTools()
+	menuByName := map[string]bool{}
+	for _, tm := range availableTools(false, nil) {
+		menuByName[tm.Name] = true
+	}
+	st, err := newStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	defer st.close()
+	srv := &server{cfg: config{contextLength: 8192}, store: st}
+	reg := srv.toolRegistry("")
+
+	// Both are git-workflow tools: in localGitTools + localRepoTools, and
+	// absent from localFileTools (a non-git workspace must not get them).
+	for _, w := range want {
+		if !slicesContains(localGitTools(), w.name) {
+			t.Errorf("localGitTools() does not include %s", w.name)
+		}
+		if !slicesContains(localRepoTools(), w.name) {
+			t.Errorf("localRepoTools() does not include %s", w.name)
+		}
+		if slicesContains(localFileTools(), w.name) {
+			t.Errorf("localFileTools() must not include git-only tool %s", w.name)
+		}
+		if !slicesContains(defaults, w.name) {
+			t.Errorf("defaultAgentTools() does not include %s", w.name)
+		}
+		if !menuByName[w.name] {
+			t.Errorf("availableTools(false, nil) does not include %s", w.name)
+		}
+		tool, ok := reg[w.name]
+		if !ok {
+			t.Errorf("toolRegistry does not register %s", w.name)
+			continue
+		}
+		if tool.schema.Function.Name != w.name {
+			t.Errorf("%s schema name = %q, want %s", w.name, tool.schema.Function.Name, w.name)
+		}
+		if !tool.local {
+			t.Errorf("%s must be a local (sidecar-relayed) tool, got local=false", w.name)
+		}
+		req, _ := tool.schema.Function.Parameters["required"].([]string)
+		for _, r := range w.require {
+			found := false
+			for _, got := range req {
+				if got == r {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("%s schema missing required %q arg: %v", w.name, r, req)
+			}
+		}
+	}
+
+	// Both are write tools for Plan-mode gating (gated out pre-approval).
+	planWrite := map[string]bool{}
+	for _, w := range planWriteTools() {
+		planWrite[w] = true
+	}
+	for _, w := range want {
+		if !planWrite[w.name] {
+			t.Errorf("planWriteTools() does not include %s", w.name)
+		}
+	}
+}

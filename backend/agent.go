@@ -334,6 +334,8 @@ func (s *server) toolRegistry(email string) map[string]agentTool {
 		"pr_close":    prCloseTool(),
 		"pr_ready":    prReadyTool(),
 		"pr_edit":     prEditTool(),
+		"create_repo": createRepoTool(),
+		"link_remote": linkRemoteTool(),
 		"todo_write":  todoWriteTool(),
 		"todo_read":   todoReadTool(),
 	} {
@@ -631,6 +633,38 @@ func prEditTool() oaiTool {
 	}}
 }
 
+// createRepoTool creates a new GitHub repository under the user's account (or
+// an organization). Approval-gated and external — only used when the user
+// explicitly asks. Does not touch the local workspace; follow with link_remote
+// (and git_push) to publish a local project to the new repo. GitHub.com only.
+func createRepoTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "create_repo",
+		Description: "Create a new GitHub repository under your account (or an organization, if org is set). Approval-gated — only use it when the user explicitly asks. Returns the new repo's URL and clone URL. Does not modify the local workspace; follow with link_remote and git_push to publish a local project to it. GitHub.com only.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"name":        map[string]any{"type": "string", "description": "The repository name."},
+			"org":         map[string]any{"type": "string", "description": "Optional organization to create the repo under. Omit to create it under your own account."},
+			"description": map[string]any{"type": "string", "description": "Optional short description of the repository."},
+			"private":     map[string]any{"type": "boolean", "description": "Whether the repo is private. Defaults to true."},
+			"auto_init":   map[string]any{"type": "boolean", "description": "Whether to initialize the repo with an empty README. Defaults to false."},
+		}, "required": []string{"name"}},
+	}}
+}
+
+// linkRemoteTool links the current local git workspace to a GitHub repository
+// by adding it as the origin remote. Approval-gated. Does not push — call
+// git_push afterwards to publish. Requires a git-enabled workspace. GitHub.com only.
+func linkRemoteTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "link_remote",
+		Description: "Link the current local git workspace to a GitHub repository by adding it as the origin remote (git remote add). Approval-gated. Refuses to overwrite an existing origin that points to a different URL. Does not push — call git_push afterwards to publish the branch. Requires a git-enabled workspace. GitHub.com only.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"url":    map[string]any{"type": "string", "description": "The GitHub repository URL to link as origin, e.g. https://github.com/owner/repo.git"},
+			"remote": map[string]any{"type": "string", "description": "Remote name to add. Defaults to \"origin\"."},
+		}, "required": []string{"url"}},
+	}}
+}
+
 // --- Tasks Pill (in-session todo list) ---
 
 // todoWriteTool lets the agent update the session's task checklist. The todos
@@ -741,6 +775,7 @@ func localRepoTools() []string {
 		"write_file", "edit_file", "move_path", "delete_path", "apply_patch", "run_command",
 		"git_commit", "git_push", "create_pr", "merge_pr",
 		"pr_comment", "pr_close", "pr_ready", "pr_edit",
+		"create_repo", "link_remote",
 		"todo_write", "todo_read",
 	}
 }
@@ -760,14 +795,14 @@ func localFileTools() []string {
 // localGitTools is the git-workflow subset of localRepoTools: status/log/PRs
 // plus commit/push/PR/merge. Only appended when the workspace is git-enabled.
 func localGitTools() []string {
-	return []string{"git_status", "git_log", "list_prs", "pr_view", "pr_diff", "pr_checks", "git_commit", "git_push", "create_pr", "merge_pr", "pr_comment", "pr_close", "pr_ready", "pr_edit"}
+	return []string{"git_status", "git_log", "list_prs", "pr_view", "pr_diff", "pr_checks", "git_commit", "git_push", "create_pr", "merge_pr", "pr_comment", "pr_close", "pr_ready", "pr_edit", "create_repo", "link_remote"}
 }
 
 // planWriteTools lists the write tools gated out during Plan mode (before the
 // plan is approved). Used by jobs.go to filter the allowlist for a plan-mode run
 // that hasn't been approved yet. Mirrors is_write_tool but lives backend-side.
 func planWriteTools() []string {
-	return []string{"write_file", "edit_file", "delete_path", "move_path", "apply_patch", "run_command", "git_commit", "git_push", "create_pr", "merge_pr", "pr_comment", "pr_close", "pr_ready", "pr_edit"}
+	return []string{"write_file", "edit_file", "delete_path", "move_path", "apply_patch", "run_command", "git_commit", "git_push", "create_pr", "merge_pr", "pr_comment", "pr_close", "pr_ready", "pr_edit", "create_repo", "link_remote"}
 }
 
 // localToolMetas is the UI-facing metadata for localRepoTools, in the same
@@ -799,6 +834,8 @@ func localToolMetas() []toolMeta {
 		{Name: "pr_close", Label: "Close PR", Description: "Close a pull request without merging (desktop only). Approval-gated."},
 		{Name: "pr_ready", Label: "Mark PR ready", Description: "Mark a draft pull request ready for review (desktop only). Approval-gated."},
 		{Name: "pr_edit", Label: "Edit PR", Description: "Edit a pull request's title/body (desktop only). Approval-gated."},
+		{Name: "create_repo", Label: "Create repo", Description: "Create a new GitHub repository under your account or an org (desktop only). Approval-gated."},
+		{Name: "link_remote", Label: "Link remote", Description: "Link the workspace to a GitHub remote as origin (desktop only). Approval-gated."},
 		{Name: "todo_write", Label: "Update tasks", Description: "Update this session's task checklist (desktop only)."},
 		{Name: "todo_read", Label: "Read tasks", Description: "Read this session's task checklist (desktop only)."},
 	}
@@ -1000,7 +1037,7 @@ func injectRepoContext(sys string, r *Repo, convBranch string) string {
 	} else {
 		b.WriteString("This checkout shares the repo's main working tree. ")
 	}
-	b.WriteString("A gitignored file (such as .env) is a secret you must NEVER read, print, or paste into an answer: read_file refuses ignored paths, grep skips them, and the discovery tools (tree, list_files, glob) mark them (ignored) so you learn they exist without seeing their contents. Make single-file edits with edit_file (exact string replacement) or write_file (create/overwrite); both are reliable on every model. Reserve apply_patch (a unified diff) for genuine multi-file or multi-hunk edits, and if a diff fails to apply, do not re-emit it; switch to edit_file or write_file. Then commit ONCE with git_commit when the work is complete — do NOT commit after each individual edit. Do not push with git_push, open a pull request with create_pr, or comment on / close / edit / mark ready a PR (pr_comment, pr_close, pr_edit, pr_ready) unless the user explicitly asks you to; the read-only list_prs, pr_view, pr_diff, and pr_checks tools are fine for inspecting PRs. Do not write diffs or commands as prose — call the tool so the change is actually applied. Keep answers grounded in what you read — do not guess at file contents.\n\n")
+	b.WriteString("A gitignored file (such as .env) is a secret you must NEVER read, print, or paste into an answer: read_file refuses ignored paths, grep skips them, and the discovery tools (tree, list_files, glob) mark them (ignored) so you learn they exist without seeing their contents. Make single-file edits with edit_file (exact string replacement) or write_file (create/overwrite); both are reliable on every model. Reserve apply_patch (a unified diff) for genuine multi-file or multi-hunk edits, and if a diff fails to apply, do not re-emit it; switch to edit_file or write_file. Then commit ONCE with git_commit when the work is complete — do NOT commit after each individual edit. Do not push with git_push, open a pull request with create_pr, create a new repository with create_repo, link a remote with link_remote, or comment on / close / edit / mark ready a PR (pr_comment, pr_close, pr_edit, pr_ready) unless the user explicitly asks you to; the read-only list_prs, pr_view, pr_diff, and pr_checks tools are fine for inspecting PRs. Do not write diffs or commands as prose — call the tool so the change is actually applied. Keep answers grounded in what you read — do not guess at file contents.\n\n")
 	b.WriteString(sys)
 	return b.String()
 }
@@ -1021,7 +1058,7 @@ func injectWorkspaceContext(sys string, r *Repo) string {
 		b.WriteString("(empty)")
 	}
 	b.WriteString(". Use the tree, list_files, glob, grep, and read_file tools to explore the workspace and discover what you need yourself — do NOT ask the user about the workspace (which files, where something is, how it works); look it up. ")
-	b.WriteString("This workspace is not under git version control: do not call git_status, git_log, git_commit, git_push, create_pr, list_prs, merge_pr, pr_view, pr_diff, pr_checks, pr_comment, pr_close, pr_ready, or pr_edit — they are not available and will error. Make single-file edits with edit_file (exact string replacement) or write_file (create/overwrite); both are reliable on every model. Reserve apply_patch (a unified diff) for genuine multi-file or multi-hunk edits, and if a diff fails to apply, do not re-emit it; switch to edit_file or write_file. A secret file (such as .env) must NEVER be read, printed, or pasted into an answer: read_file refuses ignored paths, grep skips them, and the discovery tools (tree, list_files, glob) mark them (ignored) so you learn they exist without seeing their contents. Do not write diffs or commands as prose — call the tool so the change is actually applied. Keep answers grounded in what you read — do not guess at file contents.\n\n")
+	b.WriteString("This workspace is not under git version control: do not call git_status, git_log, git_commit, git_push, create_pr, list_prs, merge_pr, pr_view, pr_diff, pr_checks, pr_comment, pr_close, pr_ready, pr_edit, create_repo, or link_remote — they are not available and will error. Make single-file edits with edit_file (exact string replacement) or write_file (create/overwrite); both are reliable on every model. Reserve apply_patch (a unified diff) for genuine multi-file or multi-hunk edits, and if a diff fails to apply, do not re-emit it; switch to edit_file or write_file. A secret file (such as .env) must NEVER be read, printed, or pasted into an answer: read_file refuses ignored paths, grep skips them, and the discovery tools (tree, list_files, glob) mark them (ignored) so you learn they exist without seeing their contents. Do not write diffs or commands as prose — call the tool so the change is actually applied. Keep answers grounded in what you read — do not guess at file contents.\n\n")
 	b.WriteString(sys)
 	return b.String()
 }

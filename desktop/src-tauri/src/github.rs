@@ -342,7 +342,7 @@ fn git_not_enabled() -> Response {
 fn is_git_tool(tool: &str) -> bool {
 	matches!(
 		tool,
-		"git_status" | "git_log" | "list_prs" | "git_commit" | "git_push" | "create_pr" | "merge_pr" | "pr_view" | "pr_diff" | "pr_checks" | "pr_comment" | "pr_close" | "pr_ready" | "pr_edit"
+		"git_status" | "git_log" | "list_prs" | "git_commit" | "git_push" | "create_pr" | "merge_pr" | "pr_view" | "pr_diff" | "pr_checks" | "pr_comment" | "pr_close" | "pr_ready" | "pr_edit" | "create_repo" | "link_remote"
 	)
 }
 
@@ -1663,6 +1663,8 @@ async fn repos_exec(State(st): State<AppState>, Json(body): Json<ExecBody>) -> R
         "pr_close" => exec_pr_close(&st.client, &root, &body.args, body.approved).await,
         "pr_ready" => exec_pr_ready(&st.client, &root, &body.args, body.approved).await,
         "pr_edit" => exec_pr_edit(&st.client, &root, &body.args, body.approved).await,
+        "create_repo" => exec_create_repo(&st.client, &root, &body.args, body.approved).await,
+        "link_remote" => exec_link_remote(&root, &body.args, body.approved).await,
         "apply_patch" => exec_apply_patch(&root, &body.args, body.approved).await,
         "run_command" => exec_run_command(&root, &body.args, body.approved, body.run_command_timeout_ms).await,
         "write_file" => exec_write_file(&root, &body.args, body.approved).await,
@@ -4006,6 +4008,183 @@ async fn pr_edit_for_repo(client: &reqwest::Client, root: &Path, number: u64, ti
         let body_text = resp.text().await.unwrap_or_default();
         let msg = parse_github_error(&body_text).unwrap_or_else(|| format!("github returned {}", body_text));
         Err(scrub(msg, &token))
+    }
+}
+
+// exec_create_repo creates a new GitHub repository under the user's account
+// (or an organization). Approval-gated and external — never auto-approved.
+// Does not touch the local workspace (root is unused); follow with link_remote
+// + git_push to publish a local project. github.com only.
+async fn exec_create_repo(client: &reqwest::Client, _root: &Path, args: &str, approved: bool) -> ExecResult {
+    let v = match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(v) => v,
+        Err(_) => return ExecResult { observation: "Invalid args for create_repo.".into(), preview: "bad args".into(), is_error: true, ..Default::default() },
+    };
+    let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("").trim().to_string();
+    if name.is_empty() {
+        return ExecResult { observation: "No repo name provided.".into(), preview: "no name".into(), is_error: true, ..Default::default() };
+    }
+    let org = v.get("org").and_then(|o| o.as_str()).unwrap_or("").trim().to_string();
+    let description = v.get("description").and_then(|d| d.as_str()).unwrap_or("").to_string();
+    let private = v.get("private").and_then(|p| p.as_bool()).unwrap_or(true);
+    let auto_init = v.get("auto_init").and_then(|a| a.as_bool()).unwrap_or(false);
+    if !approved {
+        let prefix = if org.is_empty() { "your account/".to_string() } else { format!("{}/", org) };
+        let vis = if private { "private" } else { "public" };
+        let preview = format!("Create repo {}{} ({})", prefix, name, vis);
+        return ExecResult {
+            observation: String::new(),
+            preview: "awaiting approval".into(),
+            is_error: false,
+            needs_approval: Some(true),
+            approval_kind: Some("create_repo".into()),
+            approval_preview: Some(preview),
+            ..Default::default()
+        };
+    }
+    match create_repo_for_repo(client, &name, &org, &description, private, auto_init).await {
+        Ok((html_url, clone_url)) => {
+            let mut s = format!("Created repository: {}", html_url);
+            if !clone_url.is_empty() {
+                s.push_str(&format!("\nClone URL: {}", clone_url));
+            }
+            s.push_str("\nNext: link the local project with link_remote (if not already linked to this URL), commit with git_commit, and push with git_push.");
+            ExecResult { observation: s, preview: "repo created".into(), is_error: false, ..Default::default() }
+        }
+        Err(e) => ExecResult { observation: format!("create_repo failed: {}", e), preview: "create failed".into(), is_error: true, ..Default::default() },
+    }
+}
+
+// exec_link_remote links the current local git workspace to a GitHub repository
+// by adding it as the origin remote (git remote add). Approval-gated. Refuses
+// to overwrite an existing remote that points to a different URL; no-ops if it
+// already points to the same URL. Does not push — the agent calls git_push
+// next. github.com only; requires a git-enabled workspace (gated by is_git_tool).
+async fn exec_link_remote(root: &Path, args: &str, approved: bool) -> ExecResult {
+    let v = match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(v) => v,
+        Err(_) => return ExecResult { observation: "Invalid args for link_remote.".into(), preview: "bad args".into(), is_error: true, ..Default::default() },
+    };
+    let url = v.get("url").and_then(|u| u.as_str()).unwrap_or("").trim().to_string();
+    if url.is_empty() {
+        return ExecResult { observation: "No repository URL provided.".into(), preview: "no url".into(), is_error: true, ..Default::default() };
+    }
+    if !is_github_https(&url) {
+        return ExecResult { observation: "link_remote only supports https github.com URLs.".into(), preview: "not github".into(), is_error: true, ..Default::default() };
+    }
+    let remote = v.get("remote").and_then(|r| r.as_str()).unwrap_or("origin").trim().to_string();
+    if remote.is_empty() {
+        return ExecResult { observation: "Remote name must not be empty.".into(), preview: "bad remote".into(), is_error: true, ..Default::default() };
+    }
+    // If the remote already exists, refuse to overwrite a different URL and
+    // no-op when it already points to the same one (compare ignoring .git).
+    if let Some(existing) = git_remote_url_named(root, &remote).await {
+        let a = existing.trim_end_matches(".git");
+        let b = url.trim_end_matches(".git");
+        if a == b {
+            return ExecResult { observation: format!("{} already points to {}.", remote, url), preview: "already linked".into(), is_error: false, ..Default::default() };
+        }
+        return ExecResult { observation: format!("{} already points to a different URL ({}). Refusing to overwrite — remove it first or pass the matching URL.", remote, existing), preview: "remote exists".into(), is_error: true, ..Default::default() };
+    }
+    let branch = git_branch(root).await;
+    if !approved {
+        let preview = format!("Link {} → {} (branch {})", remote, url, branch);
+        return ExecResult {
+            observation: String::new(),
+            preview: "awaiting approval".into(),
+            is_error: false,
+            needs_approval: Some(true),
+            approval_kind: Some("link_remote".into()),
+            approval_preview: Some(preview),
+            ..Default::default()
+        };
+    }
+    let out = tokio::process::Command::new("git")
+        .arg("-C").arg(root)
+        .arg("remote").arg("add").arg(&remote).arg(&url)
+        .output().await;
+    match out {
+        Ok(o) if o.status.success() => ExecResult {
+            observation: format!("Linked {} → {} (branch {}). Run git_push to publish the branch.", remote, url, branch),
+            preview: "linked".into(),
+            is_error: false,
+            ..Default::default()
+        },
+        Ok(o) => {
+            let msg = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            ExecResult { observation: format!("git remote add failed: {}", msg), preview: "link failed".into(), is_error: true, ..Default::default() }
+        }
+        Err(e) => ExecResult { observation: format!("could not run git: {}", e), preview: "git error".into(), is_error: true, ..Default::default() },
+    }
+}
+
+// --- Repo-lifecycle helpers (create_repo + link_remote) ---
+
+// create_repo_for_repo POSTs /user/repos (or /orgs/{org}/repos) to create a
+// new GitHub repository. Returns (html_url, clone_url). github.com only; the
+// token is scrubbed from any captured error text.
+async fn create_repo_for_repo(
+    client: &reqwest::Client,
+    name: &str,
+    org: &str,
+    description: &str,
+    private: bool,
+    auto_init: bool,
+) -> Result<(String, String), String> {
+    let token = token_get().ok_or_else(|| "no github token stored (connect github first)".to_string())?;
+    let mut body = serde_json::json!({
+        "name": name,
+        "private": private,
+        "auto_init": auto_init,
+    });
+    if !description.is_empty() {
+        body["description"] = serde_json::Value::String(description.to_string());
+    }
+    let url = if org.is_empty() {
+        format!("{GH_API}/user/repos")
+    } else {
+        format!("{GH_API}/orgs/{}/repos", org)
+    };
+    let resp = client
+        .post(&url)
+        .headers(gh_headers(&token))
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("github unreachable: {}", scrub(e.to_string(), &token)))?;
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        let v: serde_json::Value = serde_json::from_str(&body_text)
+            .map_err(|e| format!("bad github response: {}", scrub(e.to_string(), &token)))?;
+        let html_url = v.get("html_url").and_then(|u| u.as_str()).map(String::from).unwrap_or_default();
+        let clone_url = v.get("clone_url").and_then(|u| u.as_str()).map(String::from).unwrap_or_default();
+        Ok((html_url, clone_url))
+    } else {
+        let msg = parse_github_error(&body_text).unwrap_or_else(|| format!("github returned {}", status));
+        Err(scrub(msg, &token))
+    }
+}
+
+// git_remote_url_named returns the configured fetch URL for a named remote
+// (git remote get-url <remote>), or None. Mirrors git_remote_url but takes the
+// remote name so link_remote can target a non-origin remote.
+async fn git_remote_url_named(path: &Path, remote: &str) -> Option<String> {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("remote")
+        .arg("get-url")
+        .arg(remote)
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() { None } else { Some(s) }
+        }
+        _ => None,
     }
 }
 
