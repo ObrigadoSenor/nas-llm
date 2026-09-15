@@ -456,6 +456,21 @@ async function runToolExec(convId, d) {
   const autoApproved = !!(d.autoApprove && AUTO_APPROVE_TOOLS.has(d.tool));
   const key = d.jobId + ":" + (d.step ?? 0);
   const isSsh = d.tool.startsWith("ssh_");
+  // Tasks Pill tools are handled in-renderer: they update the conversation's
+  // todos directly via PATCH, not via the sidecar file-tool relay. Intercept
+  // before the SSH/repo branch and post the observation back, then refresh the
+  // pill so the new checklist shows immediately.
+  if (d.tool === "todo_write" || d.tool === "todo_read") {
+    const obs = await runTodoTool(convId, d);
+    try {
+      await fetch("/api/conversations/" + encodeURIComponent(convId) + "/tool-response", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jobId: d.jobId, observation: obs.observation || "", preview: obs.preview || "", isError: !!obs.is_error })
+      });
+    } catch {}
+    if (!convId || convId === getActiveConvId()) { refreshRailState(); renderTasksPill(); }
+    return;
+  }
 
   // Build the exec body + endpoints for the tool family. SSH tools target a
   // ~/.ssh/config alias (host) and use the sidecar's /__sidecar/ssh/exec routes;
@@ -679,6 +694,143 @@ function renderDiff(diff) {
 // command block fills live. Returns a buffered ExecResult-shaped object
 // (observation/output/exit_code/is_error) so runToolExec can post it to
 // /tool-response exactly like the buffered path.
+// runTodoTool handles the Tasks Pill tools in-renderer (no sidecar round-trip).
+// todo_write PATCHes the conversation's todos; todo_read returns the cached
+// checklist as the observation. Keeps the sidecar out of conversation state.
+async function runTodoTool(convId, d) {
+  if (d.tool === "todo_write") {
+    let todos = [];
+    try { const j = JSON.parse(d.args || "{}"); if (Array.isArray(j.todos)) todos = j.todos; } catch { return { observation: "Invalid args for todo_write.", preview: "bad args", is_error: true }; }
+    try {
+      const r = await fetch("/api/conversations/" + encodeURIComponent(convId), { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ todos }) });
+      if (!r.ok) return { observation: "Could not save the task checklist.", preview: "save failed", is_error: true };
+      const conv = railMaps.convById.get(convId);
+      if (conv) { conv.todos = todos; if (railConvId === convId) railConv = conv; }
+      renderTasksPill();
+      return { observation: "Updated the session task checklist (" + todos.length + " item" + (todos.length === 1 ? "" : "s") + ").", preview: "tasks updated" };
+    } catch (e) { return { observation: String((e && e.message) || e), preview: "save error", is_error: true }; }
+  }
+  // todo_read
+  let conv = railMaps.convById.get(convId);
+  if (!conv) { await loadWorkspaceMaps(); conv = railMaps.convById.get(convId); }
+  const todos = (conv && Array.isArray(conv.todos)) ? conv.todos : [];
+  if (!todos.length) return { observation: "No tasks in this session's checklist yet.", preview: "no tasks" };
+  const lines = todos.map((t, i) => (i + 1) + ". [" + (t.status || "pending") + "] " + (t.text || ""));
+  return { observation: "Session tasks:\n" + lines.join("\n"), preview: todos.length + " tasks" };
+}
+
+// --- Tasks Pill + Plan Pill (below/around the composer) ---
+// ensureTasksPill creates the collapsible checklist pill below the composer
+// input (desktop-only) if it isn't already present. Lives inside .composer,
+// after the composer status line.
+function ensureTasksPill() {
+  let pill = $("dsTasksPill");
+  if (pill) return;
+  const composer = document.querySelector(".composer");
+  if (!composer) return;
+  pill = el("div", "ds-tasks-pill");
+  pill.id = "dsTasksPill";
+  const head = el("div", "ds-tasks-pill-head");
+  head.appendChild(el("span", "ds-tasks-pill-chev", "▸"));
+  head.appendChild(el("span", "ds-tasks-pill-title", "Tasks"));
+  const count = el("span", "ds-note"); count.id = "dsTasksPillCount";
+  head.appendChild(count);
+  head.onclick = () => { pill.classList.toggle("expanded"); };
+  pill.appendChild(head);
+  const body = el("div", "ds-tasks-pill-body"); body.id = "dsTasksPillBody";
+  pill.appendChild(body);
+  composer.appendChild(pill);
+}
+// renderTasksPill fills the pill with the active conversation's todos (if any).
+// Hidden when there are no todos or no active chat. Collapsible.
+function renderTasksPill() {
+  const pill = $("dsTasksPill");
+  if (!pill) return;
+  const body = $("dsTasksPillBody");
+  const count = $("dsTasksPillCount");
+  const conv = railConv;
+  const todos = (conv && Array.isArray(conv.todos)) ? conv.todos : [];
+  if (!todos.length) { pill.classList.add("hidden"); if (body) body.innerHTML = ""; if (count) count.textContent = ""; return; }
+  pill.classList.remove("hidden");
+  if (count) count.textContent = " · " + todos.filter((t) => t.status === "completed").length + "/" + todos.length;
+  if (!body) return;
+  body.innerHTML = "";
+  todos.forEach((t) => {
+    const row = el("div", "ds-task-item");
+    const mark = el("span", "ds-task-mark " + (t.status === "completed" ? "done" : t.status === "in_progress" ? "active" : ""), t.status === "completed" ? "✓" : t.status === "in_progress" ? "…" : "○");
+    row.appendChild(mark);
+    row.appendChild(el("span", "ds-task-text", t.text || ""));
+    body.appendChild(row);
+  });
+}
+
+// renderPlanPill adds a Plan chip to the composer status line when the active
+// conversation is in plan mode. Before approval it shows "Plan · awaiting approval";
+// after approval it shows "Plan · approved". Clicking opens a small popover with
+// the plan text and (before approval) an Approve button that PATCHes planApproved.
+function renderPlanPill(status) {
+  if (!status) return;
+  // Remove a stale plan chip first so a non-plan chat doesn't keep it.
+  const old = status.querySelector(".ds-plan-chip");
+  const conv = railConv;
+  if (!conv || !conv.planMode) { if (old) old.remove(); return; }
+  const approved = !!conv.planApproved;
+  let chip = old;
+  if (!chip) {
+    chip = el("span", "ds-plan-chip");
+    chip.onclick = (e) => { e.stopPropagation(); openPlanPopover(); };
+    status.appendChild(chip);
+  }
+  chip.textContent = approved ? "⊞ Plan · approved" : "⊞ Plan · awaiting approval";
+  chip.title = approved ? "Plan approved. Click to view it."
+    : "Plan mode: the agent is researching and planning. Click to view the plan draft and approve it.";
+  chip.classList.toggle("approved", approved);
+}
+// openPlanPopover shows the plan text + an Approve button (before approval).
+function openPlanPopover() {
+  const conv = railConv;
+  if (!conv) return;
+  let overlay = $("dsPlanOverlay");
+  if (!overlay) {
+    overlay = el("div", "ds-overlay");
+    overlay.id = "dsPlanOverlay";
+    overlay.setAttribute("role", "dialog");
+    overlay.setAttribute("aria-modal", "true");
+    overlay.setAttribute("aria-label", "Plan");
+    const card = el("div", "ds-card ds-card-wide");
+    const head = el("div", "ds-head");
+    head.appendChild(el("h2", null, "Plan"));
+    const x = el("button", "ds-x"); x.textContent = "×"; x.title = "Close"; x.setAttribute("aria-label", "Close");
+    x.onclick = () => overlay.classList.remove("open");
+    head.appendChild(x);
+    card.appendChild(head);
+    const body = el("div", "ds-plan-body"); body.id = "dsPlanBody";
+    card.appendChild(body);
+    const row = el("div", "ds-row ds-approval-row");
+    const approveBtn = el("button", "ds-btn ds-btn-approve", "Approve plan"); approveBtn.id = "dsPlanApprove";
+    row.appendChild(approveBtn);
+    card.appendChild(row);
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.classList.remove("open"); });
+    approveBtn.onclick = async () => {
+      if (!railConvId) return;
+      approveBtn.disabled = true; approveBtn.textContent = "Approving…";
+      try {
+        const r = await fetch("/api/conversations/" + encodeURIComponent(railConvId), { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planApproved: true }) });
+        if (r.ok) { const updated = await r.json().catch(() => null); if (updated && updated.id) { railMaps.convById.set(railConvId, updated); railConv = updated; } flashDsOk("Plan approved — implementation unlocked ✓"); overlay.classList.remove("open"); renderComposerStatus(); }
+        else flashDsErr("Could not approve the plan.");
+      } catch (e) { flashDsErr(String((e && e.message) || e)); }
+      finally { approveBtn.disabled = false; approveBtn.textContent = "Approve plan"; }
+    };
+  }
+  const bodyEl = $("dsPlanBody");
+  if (bodyEl) bodyEl.textContent = (conv && conv.plan) || "(no plan yet)";
+  const approveBtn = $("dsPlanApprove");
+  if (approveBtn) approveBtn.style.display = (conv && conv.planApproved) ? "none" : "";
+  overlay.classList.add("open");
+}
+
 async function runStreamingExec(convId, d, key, execBody, streamUrl) {
   let output = "", exitCode = -1, durationMs = 0;
   try {
@@ -1216,6 +1368,21 @@ async function loadAgentGlobalAutoApprove() {
     if (r.ok) { const j = await r.json(); if (typeof j.autoApprove === "boolean") agentGlobalAutoApprove = j.autoApprove; }
   } catch {}
 }
+// Auto-sync: a global toggle (persisted in localStorage, default off) that makes
+// the rail poll fast-forward the active session's branch when origin/<branch>
+// advances (behind>0). Reuses /repos/refresh with the chat's branch so the
+// pull lands in the session's isolated worktree, not the repo's shared tree.
+let autoSync = false;
+try { autoSync = localStorage.getItem("nas-llm-auto-sync") === "1"; } catch {}
+function setAutoSync(on) {
+  autoSync = !!on;
+  try { localStorage.setItem("nas-llm-auto-sync", autoSync ? "1" : "0"); } catch {}
+  renderComposerStatus();
+}
+// autoSyncInFlight guards against overlapping pulls (the 5s poll could fire
+// while a previous pull is still running).
+let autoSyncInFlight = false;
+
 function effectiveAutoApprove(conv) {
   if (conv && typeof conv.agentAutoApprove === "boolean") return conv.agentAutoApprove;
   return agentGlobalAutoApprove;
@@ -1277,6 +1444,15 @@ function renderComposerStatus() {
     if (s.ahead) status.appendChild(document.createTextNode(" · ↑" + s.ahead));
     if (s.behind) status.appendChild(document.createTextNode(" · ↓" + s.behind));
     if (s.hasRemote === false) status.appendChild(document.createTextNode(" · no remote"));
+    // Auto-sync toggle: fast-forward the session branch when origin advances.
+    // Git workspaces only; reflects the global autoSync flag.
+    status.appendChild(document.createTextNode(" · "));
+    const asChip = el("span", "ds-aa-chip " + (autoSync ? "on" : "off"), autoSync ? "↻ auto-sync" : "○ auto-sync off");
+    asChip.title = autoSync
+      ? "Auto-sync on: the session branch is fast-forwarded when origin advances (behind ↓). Click to turn off."
+      : "Auto-sync off. Click to fast-forward the session branch when origin advances.";
+    asChip.onclick = (e) => { e.stopPropagation(); setAutoSync(!autoSync); };
+    status.appendChild(asChip);
   }
   // Auto-approve toggle: reflects this chat's effective setting (per-chat
   // override, else the global default). Click flips the per-chat override.
@@ -1301,9 +1477,11 @@ function renderComposerStatus() {
     if (s.behind) tip.push(s.behind + " commits behind origin (↓)");
     if (s.hasRemote === false) tip.push("no remote configured");
   }
+  if (!noGit) tip.push(autoSync ? "auto-sync on (auto fast-forward when behind)" : "auto-sync off (click ↻ to toggle)");
   tip.push(aaOn ? "auto-approve on (edits/commands run without asking)" : "auto-approve off (click ✓/○ to toggle for this chat)");
   tip.push("click to open the session panel (review changes, commit & push, open PR)");
   status.title = tip.join(" · ");
+  renderPlanPill(status);
   status.classList.remove("hidden");
 }
 
@@ -1313,7 +1491,26 @@ function startRailPoll() { stopRailPoll(); if (railRepo) railTimer = setInterval
 async function refreshRailState() {
   if (!railRepo) return;
   const r = await sid("repos/state?name=" + encodeURIComponent(railRepo));
-  if (r.ok && r.data) { railState = r.data; renderComposerStatus(); }
+  if (r.ok && r.data) {
+    railState = r.data;
+    renderComposerStatus();
+    // Auto-sync: when the session branch is behind origin and the toggle is on,
+    // fast-forward it in the session's own worktree. Git workspaces only, and
+    // only when we know the chat's branch (repoBranch) so the pull targets the
+    // right tree. Skip if a pull is already in flight.
+    const s = railState;
+    const chatBranch = (railConv && railConv.repoBranch) || s.branch || "";
+    if (autoSync && s.useGit !== false && s.behind > 0 && chatBranch && !autoSyncInFlight) {
+      autoSyncInFlight = true;
+      try {
+        await sid("repos/refresh", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: railRepo, branch: chatBranch }) });
+      } catch {}
+      autoSyncInFlight = false;
+      // Re-poll so the rail reflects the fast-forwarded state immediately.
+      const r2 = await sid("repos/state?name=" + encodeURIComponent(railRepo));
+      if (r2.ok && r2.data) { railState = r2.data; renderComposerStatus(); }
+    }
+  }
 }
 
 function hideBranchRail() {
@@ -1344,22 +1541,28 @@ async function actualSyncBranchRail() {
   railConvId = convId;
   railConv = conv;
   ensureComposerStatus();
+  ensureTasksPill();
   if (changed) { await refreshRailState(); startRailPoll(); }
   renderComposerStatus();
+  renderTasksPill();
 }
 
 // Create a repo-bound agent chat on its own branch cut from the repo's
-// default branch, place it in the workspace folder, enable agent mode with
-// file + git tools, and navigate to it without a full page reload. Reused by
-// "+ New chat".
+// default branch (or an optional baseBranch the user picked), place it in the
+// workspace folder, enable agent mode with file + git tools, and navigate to it
+// without a full page reload. Reused by "+ New chat" and "New chat from
+// branch…". baseBranch lets a session start from an existing branch instead of
+// the repo's default (like the Copilot app's composer branch picker); ignored
+// for non-git workspaces (they have no branches).
 //
 // Order matters: we register the repo with the backend and confirm its id
 // BEFORE creating any conversation. If registration fails we surface the real
 // error and bail without creating a chat — so a failed connect never leaves an
 // orphaned "normal" chat behind (which is what happened when the conversation
 // was created first and the repo lookup threw after it).
-async function createWorkspaceChat(r) {
+async function createWorkspaceChat(r, baseBranch) {
   const fullName = r.name;
+  const baseBr = (typeof baseBranch === "string" && baseBranch.trim()) ? baseBranch.trim() : "";
 
   // 1. Pull local repo context (path/branch/head/tree) from the sidecar so the
   //    backend registration carries real metadata. Best-effort: if the sidecar
@@ -1429,7 +1632,9 @@ async function createWorkspaceChat(r) {
     const branchName = "agent/" + slugifyTitle(shortName) + "-" + shortId;
     let branchErr = "";
     try {
-      const cr = await sid("repos/create-branch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: fullName, branch: branchName }) });
+      const branchBody = { name: fullName, branch: branchName };
+      if (baseBr) branchBody.base = baseBr;
+      const cr = await sid("repos/create-branch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(branchBody) });
       const cd = (cr && cr.data) || {};
       if (cr.ok && cd.ok && cd.branch) branch = cd.branch;
       else branchErr = cd.error || cr.status || "unknown error";
@@ -1568,6 +1773,15 @@ async function enableGit(r) {
   }
 }
 
+// openInApp opens a workspace folder in an external app (editor / Finder /
+// terminal) via /repos/open-in. Best-effort: toasts on failure (e.g. no editor
+// installed). target is "editor" | "finder" | "terminal".
+async function openInApp(r, target) {
+  const res = await sid("repos/open-in", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: r.name, target }) });
+  const d = (res && res.data) || {};
+  if (!d.ok) flashDsErr("Could not open: " + (d.error || res.status || "unknown"));
+}
+
 // repoMenu opens a small popup of per-repo actions anchored under the ⋯ button.
 // Closes on outside click, Esc, or item selection.
 function repoMenu(r, anchor) {
@@ -1580,9 +1794,14 @@ function repoMenu(r, anchor) {
     item.onclick = (e) => { e.stopPropagation(); closeRepoMenu(); fn(); };
     menu.appendChild(item);
   };
+  // Open-in actions are useful for every workspace (git or not).
+  add("Open in editor", "Open the workspace folder in your editor ($VISUAL/$EDITOR, else VS Code)", () => openInApp(r, "editor"));
+  add("Open in Finder", "Reveal the workspace folder in the file manager", () => openInApp(r, "finder"));
+  add("Open in Terminal", "Open a terminal cd'd into the workspace folder", () => openInApp(r, "terminal"));
   if (r.use_git === false) {
     add("Enable git", "git init in place and start tracking with git", () => enableGit(r));
   } else {
+    add("New chat from branch…", "Start a session cut from an existing branch instead of the default", () => openBaseBranchPicker(r));
     add("Pull", "git pull --ff-only", () => pullRepo(r));
     add("Branch…", "Switch to a different branch (local or remote)", () => openBranchPicker(r));
     add("Ship…", "Versioned release (changelog + commit/push)", () => openShipChanges(r));
@@ -1710,6 +1929,75 @@ async function openBranchPicker(r) {
         }
       };
     }
+    list.appendChild(row);
+  });
+}
+
+// openBaseBranchPicker lists a git workspace's branches and, on select, starts a
+// new agent session cut from that branch (instead of the repo's default). This
+// is the Copilot-app-style "start a session from an existing branch" affordance;
+// distinct from openBranchPicker (which switches the repo's shared checkout)
+// and openChatBranchPicker (which re-points an existing chat). Git workspaces
+// only — non-git workspaces have no branches.
+async function openBaseBranchPicker(r) {
+  const repoName = r.name;
+  let overlay = $("dsBaseBranchOverlay");
+  let list;
+  if (!overlay) {
+    overlay = el("div", "ds-overlay");
+    overlay.id = "dsBaseBranchOverlay";
+    overlay.setAttribute("role", "dialog");
+    overlay.setAttribute("aria-modal", "true");
+    overlay.setAttribute("aria-label", "New chat from branch");
+    const card = el("div", "ds-card");
+    const head = el("div", "ds-head");
+    head.appendChild(el("h2", null, "New chat from branch"));
+    const sub = el("span", "ds-note", repoName);
+    head.appendChild(sub);
+    const x = el("button", "ds-x"); x.textContent = "×"; x.title = "Close"; x.setAttribute("aria-label", "Close");
+    head.appendChild(x);
+    card.appendChild(head);
+    card.appendChild(el("div", "ds-note", "Pick a branch to base the new session on. The session gets its own agent branch cut from the one you choose."));
+    list = el("div", "ds-branch-list"); list.id = "dsBaseBranchList";
+    card.appendChild(list);
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+    const close = () => overlay.classList.remove("open");
+    x.onclick = close;
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+  } else {
+    list = $("dsBaseBranchList");
+  }
+  list.innerHTML = "";
+  list.appendChild(el("div", "ds-note", "Loading branches…"));
+  overlay.classList.add("open");
+  const res = await sid("repos/branches", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: repoName }) });
+  const d = (res && res.data) || {};
+  list.innerHTML = "";
+  if (!res.ok || !d.ok) { list.appendChild(el("div", "ds-note", "Could not load branches: " + (d.error || res.status || "unknown"))); return; }
+  const branches = d.branches || [];
+  const current = d.current || "";
+  if (!branches.length) { list.appendChild(el("div", "ds-note", "No branches found.")); return; }
+  branches.forEach((b) => {
+    const bname = typeof b === "string" ? b : (b.name || "");
+    if (!bname) return;
+    const isRemote = typeof b === "object" && !!b.remote;
+    const isCur = bname === current;
+    const row = el("div", "ds-branch-item" + (isCur ? " current" : ""));
+    row.title = isCur ? "Current branch" : (isRemote ? "Base the new session on origin/" + bname : "Base the new session on " + bname);
+    row.appendChild(el("span", "ds-branch-name", bname));
+    if (isCur) row.appendChild(el("span", "ds-branch-badge ds-branch-cur", "current"));
+    else if (isRemote) row.appendChild(el("span", "ds-branch-badge ds-branch-remote", "remote"));
+    row.onclick = async () => {
+      overlay.classList.remove("open");
+      // A remote-only base needs a tracking checkout first so the branch ref
+      // exists locally for create-branch to cut from.
+      if (isRemote) {
+        try { await sid("repos/checkout", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repo: repoName, branch: bname, remote: true }) }); } catch {}
+      }
+      try { await createWorkspaceChat(r, bname); }
+      catch (err) { flashDsErr(String((err && err.message) || err)); }
+    };
     list.appendChild(row);
   });
 }
@@ -2168,6 +2456,116 @@ async function refreshWorkingChanges() {
   }
 }
 
+// --- My Work: cross-workspace dashboard overlay ---------------------------
+// One pane showing every connected workspace's live state: sessions in progress,
+// git dirty/ahead/behind, and open PRs. Built from /api/repos + /api/conversations
+// + /repos/state + /repos/prs. Analogous to openWorkingChanges but per-workspace
+// status across all workspaces (oversight, not an editor).
+function openMyWork() {
+  let overlay = $("dsMyWorkOverlay");
+  if (!overlay) {
+    overlay = el("div", "ds-overlay");
+    overlay.id = "dsMyWorkOverlay";
+    overlay.setAttribute("role", "dialog");
+    overlay.setAttribute("aria-modal", "true");
+    overlay.setAttribute("aria-label", "My Work");
+    const card = el("div", "ds-card ds-card-wide");
+    const head = el("div", "ds-head");
+    head.appendChild(el("h2", null, "My Work"));
+    const x = el("button", "ds-x"); x.textContent = "×"; x.title = "Close"; x.setAttribute("aria-label", "Close");
+    x.onclick = () => overlay.classList.remove("open");
+    head.appendChild(x);
+    card.appendChild(head);
+    card.appendChild(el("div", "ds-note", "Every connected workspace: sessions in progress, working-tree state, and open pull requests. Click a workspace's session to open it."));
+    const body = el("div", null); body.id = "dsMyWorkBody";
+    card.appendChild(body);
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.classList.remove("open"); });
+  }
+  overlay.classList.add("open");
+  loadMyWork();
+}
+
+async function loadMyWork() {
+  const body = $("dsMyWorkBody"); if (!body) return;
+  body.innerHTML = "";
+  body.appendChild(el("div", "ds-note", "Loading…"));
+  // Workspaces (backend repos) + all conversations (to count sessions per workspace).
+  const [rr, cr] = await Promise.all([
+    fetch("/api/repos"), fetch("/api/conversations"),
+  ].map((p) => p.then((r) => r.ok ? r.json() : Promise.resolve([])).catch(() => [])));
+  const repos = Array.isArray(rr) ? rr : [];
+  const convs = Array.isArray(cr) ? cr : [];
+  body.innerHTML = "";
+  if (!repos.length) { body.appendChild(el("div", "ds-note", "No workspaces connected yet.")); return; }
+  // Index sessions (conversations with a repoId) by repo id.
+  const sessionsByRepoId = new Map();
+  for (const c of convs) {
+    if (c && c.repoId) {
+      if (!sessionsByRepoId.has(c.repoId)) sessionsByRepoId.set(c.repoId, []);
+      sessionsByRepoId.get(c.repoId).push(c);
+    }
+  }
+  for (const rp of repos) {
+    const fullName = rp.fullName || rp.name || "(unnamed)";
+    const section = el("div", "ds-changes-section");
+    const head = el("div", "ds-changes-head");
+    head.appendChild(el("div", "ds-changes-name", fullName));
+    const sessions = sessionsByRepoId.get(rp.id) || [];
+    const sessionsNote = el("span", "ds-note", sessions.length + " session" + (sessions.length === 1 ? "" : "s"));
+    head.appendChild(sessionsNote);
+    section.appendChild(head);
+    const detail = el("div", "ds-note");
+    section.appendChild(detail);
+    body.appendChild(section);
+    // Live git state + open PRs for this workspace (best-effort, parallel).
+    const stateP = sid("repos/state?name=" + encodeURIComponent(fullName)).catch(() => null);
+    const prsP = sid("repos/prs?name=" + encodeURIComponent(fullName)).catch(() => null);
+    stateP.then((sr) => {
+      const sd = (sr && sr.data) || {};
+      const segs = [];
+      if (sd.useGit === false) segs.push("no git (file tools only)");
+      else {
+        if (sd.branch) segs.push("⎇ " + sd.branch);
+        if (sd.dirty) segs.push("●" + sd.dirty + " dirty");
+        if (sd.ahead) segs.push("↑" + sd.ahead);
+        if (sd.behind) segs.push("↓" + sd.behind);
+        if (sd.hasRemote === false) segs.push("no remote");
+      }
+      detail.appendChild(document.createTextNode(segs.length ? segs.join(" · ") : "up to date"));
+    });
+    prsP.then((pr) => {
+      const pd = (pr && pr.data) || {};
+      if (pr && pr.ok && Array.isArray(pd.prs) && pd.prs.length) {
+        const prList = el("div", "ds-note");
+        prList.appendChild(document.createTextNode("Open PRs: "));
+        pd.prs.slice(0, 5).forEach((p, i) => {
+          if (i) prList.appendChild(document.createTextNode(", "));
+          const a = document.createElement("a"); a.className = "ds-pr-open"; a.href = p.html_url; a.target = "_blank"; a.rel = "noopener"; a.textContent = "#" + p.number;
+          a.title = p.title || "";
+          prList.appendChild(a);
+        });
+        if (pd.prs.length > 5) prList.appendChild(document.createTextNode(" +" + (pd.prs.length - 5) + " more"));
+        section.appendChild(prList);
+      }
+    });
+    // List this workspace's sessions (click to open).
+    if (sessions.length) {
+      const list = el("div", "ds-repo-chats");
+      sessions.slice(0, 6).forEach((c) => {
+        const cr = el("div", "ds-repo-chat");
+        cr.appendChild(el("span", "ds-repo-chat-title", c.title || "New chat"));
+        if (c.repoBranch) cr.appendChild(el("span", "ds-repo-chat-branch", "⎇ " + c.repoBranch));
+        cr.onclick = () => { try { localStorage.setItem("nas-llm-conv", c.id); } catch {} navigateToConv(c.id); overlay.classList.remove("open"); };
+        list.appendChild(cr);
+      });
+      if (sessions.length > 6) list.appendChild(el("div", "ds-note", "+" + (sessions.length - 6) + " more sessions"));
+      section.appendChild(list);
+    }
+  }
+}
+
 // --- Ship changes wizard (review diff, write changelog, commit/push) -------
 // openShipChanges builds the dialog once and reuses it; loadShipChanges fills
 // it with the repo's push state, the current diff, and a changelog pre-fill.
@@ -2296,7 +2694,7 @@ function openSessionPanel(repoName) {
     titleWrap.appendChild(sub);
     head.appendChild(titleWrap);
     const x = el("button", "ds-x"); x.textContent = "×"; x.title = "Close"; x.setAttribute("aria-label", "Close");
-    x.onclick = () => overlay.classList.remove("open");
+    x.onclick = () => { stopAgentMerge(overlay); overlay.classList.remove("open"); };
     head.appendChild(x);
     card.appendChild(head);
     const tabs = el("div", "ds-tabs");
@@ -2328,9 +2726,15 @@ function openSessionPanel(repoName) {
     pChanges.appendChild(noGitNote);
     const enableGitBtn = el("button", "ds-btn", "Enable git"); enableGitBtn.id = "dsSessionEnableGit"; enableGitBtn.style.display = "none";
     pChanges.appendChild(enableGitBtn);
+    // Undo last write: restores the newest recovery snapshot for a non-git
+    // workspace (the non-git analog of Revert). Hidden by default; shown alongside
+    // the no-git note by loadSessionPanel.
+    const undoBtn = el("button", "ds-btn ds-btn-ghost ds-session-link", "Undo last write"); undoBtn.id = "dsSessionUndoLast"; undoBtn.style.display = "none";
+    pChanges.appendChild(undoBtn);
     panels.appendChild(pChanges);
-    overlay._gitControls = { tabPR, tabMerge, commitBtn, pushBtn, revertBtn, msgInput, noGitNote, enableGitBtn };
+    overlay._gitControls = { tabPR, tabMerge, commitBtn, pushBtn, revertBtn, msgInput, noGitNote, enableGitBtn, undoBtn };
     enableGitBtn.onclick = () => { if (overlay._repo) enableGit({ name: overlay._repo, path: "" }); };
+    undoBtn.onclick = () => { if (overlay._repo) undoLastWrite(overlay._repo); };
     // — Pull request —
     const pPR = el("div", "ds-tab-panel");
     const prTitle = document.createElement("input"); prTitle.id = "dsSessionPrTitle"; prTitle.type = "text"; prTitle.placeholder = "PR title"; prTitle.className = "ds-session-input";
@@ -2356,7 +2760,19 @@ function openSessionPanel(repoName) {
     pMerge.appendChild(mergeRow);
     const mergeOut = el("div", "ds-note"); mergeOut.id = "dsSessionMergeOut";
     pMerge.appendChild(mergeOut);
+    // Agent Merge: a toggle that, when on, polls the selected PR's CI/review
+    // state and auto-merges when green + reviewers satisfied. Stops on merge,
+    // toggle-off, or panel close.
+    const amRow = el("label", "ds-ws-check-row");
+    const agentMergeCheck = document.createElement("input"); agentMergeCheck.id = "dsSessionAgentMerge"; agentMergeCheck.type = "checkbox";
+    amRow.appendChild(agentMergeCheck);
+    amRow.appendChild(el("span", "ds-ws-check-label", "Agent merge — auto-merge when CI is green"));
+    pMerge.appendChild(amRow);
+    const amOut = el("div", "ds-note"); amOut.id = "dsSessionAgentMergeOut";
+    pMerge.appendChild(amOut);
     panels.appendChild(pMerge);
+    overlay._agentMerge = { check: agentMergeCheck, out: amOut, timer: null };
+    wireAgentMergeToggle(overlay);
     card.appendChild(panels);
     const foot = el("div", "ds-session-foot");
     const shipBtn = el("button", "ds-btn-ghost ds-session-link", "Ship a release…");
@@ -2364,7 +2780,7 @@ function openSessionPanel(repoName) {
     card.appendChild(foot);
     overlay.appendChild(card);
     document.body.appendChild(overlay);
-    overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.classList.remove("open"); });
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) { stopAgentMerge(overlay); overlay.classList.remove("open"); } });
     const switchTab = (active, panel) => {
       [tabChanges, tabPR, tabMerge].forEach((t) => t.classList.remove("active"));
       [pChanges, pPR, pMerge].forEach((p) => p.classList.remove("active"));
@@ -2436,6 +2852,7 @@ async function loadSessionPanel(repoName, branch) {
       gc.msgInput.style.display = "none";
       gc.noGitNote.style.display = "";
       gc.enableGitBtn.style.display = "";
+      gc.undoBtn.style.display = "";
     }
     overlay.querySelectorAll(".ds-btn-approve").forEach((b) => { b.disabled = true; b.title = "No git."; });
     return;
@@ -2452,6 +2869,7 @@ async function loadSessionPanel(repoName, branch) {
     gc.msgInput.style.display = "";
     gc.noGitNote.style.display = "none";
     gc.enableGitBtn.style.display = "none";
+    gc.undoBtn.style.display = "none";
   }
   const diffBody = { name: repoName }; if (branch) diffBody.branch = branch;
   const dr = await sid("repos/diff", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(diffBody) });
@@ -2535,6 +2953,19 @@ async function sessionRevert(repoName, branch) {
   refreshLocal();
 }
 
+// undoLastWrite restores the newest recovery snapshot for a non-git workspace via
+// /repos/undo-last, undoing the most recent approved write tool. Non-git only
+// (git workspaces use sessionRevert). Confirms first because it overwrites the
+// workspace's working files with the pre-write snapshot.
+async function undoLastWrite(repoName) {
+  const ok = await dsConfirm("Undo the last write?", "This restores the workspace \"" + repoName + "\" to its state before the most recent approved edit, discarding that edit's changes.");
+  if (!ok) return;
+  const res = await sid("repos/undo-last", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: repoName }) });
+  const d = (res && res.data) || {};
+  if (d.ok) { flashDsOk("Undid last write ✓"); refreshLocal(); refreshRailState(); }
+  else flashDsErr("Could not undo: " + (d.error || res.status || "nothing to restore"));
+}
+
 async function loadSessionPRs(repoName, branch) {
   const sel = $("dsSessionPrSelect"); if (!sel) return;
   const mergeBtn = $("dsSessionMergeBtn");
@@ -2590,6 +3021,77 @@ async function sessionMergePR(repoName, branch) {
   }
 }
 
+// --- Agent Merge: auto-merge a PR once CI is green + reviewers satisfied ----------
+// Toggled on the session-panel Merge tab. When on, polls /repos/prs for the
+// selected PR's CI + review state; when CI is "success" and review is approved
+// (or no reviews are required), calls /repos/merge-pr. Stops itself on a
+// successful merge, a failure, or when the user toggles it off / closes the panel.
+function agentMergeTick(repoName, branch) {
+  const overlay = $("dsSessionOverlay");
+  if (!overlay) return;
+  const am = overlay._agentMerge;
+  if (!am || !am.check || !am.check.checked) { stopAgentMerge(overlay); return; }
+  const sel = $("dsSessionPrSelect");
+  const number = sel && sel.value ? parseInt(sel.value, 10) : 0;
+  const out = am.out;
+  if (!number) { if (out) out.textContent = "Select a PR to watch, then toggle Agent merge."; return; }
+  const method = ($("dsSessionMergeMethod") && $("dsSessionMergeMethod").value) || "merge";
+  const qp = "name=" + encodeURIComponent(repoName) + (branch ? "&branch=" + encodeURIComponent(branch) : "");
+  sid("repos/prs?" + qp).then((r) => {
+    const d = (r && r.data) || {};
+    if (!r.ok || !Array.isArray(d.prs)) { if (out) out.textContent = "Watching… (couldn't refresh PRs: " + (d.error || r.status) + ")"; return; }
+    const pr = d.prs.find((p) => String(p.number) === String(number));
+    if (!pr) { if (out) out.textContent = "PR #" + number + " is no longer open (merged or closed?). Stopping."; stopAgentMerge(overlay); return; }
+    const ci = pr.ci_state || "";
+    const rev = pr.review_state || "";
+    const ciOk = ci === "success";
+    // review_state is APPROVED / REVIEW_REQUESTED / COMMENTED / etc.; treat
+    // APPROVED as ready. No required reviewers (empty/COMMENTED) is also ready —
+    // the user toggled it, so they've decided.
+    const revOk = rev === "APPROVED" || !rev || rev === "COMMENTED";
+    if (ciOk && revOk) {
+      if (out) out.textContent = "CI green, reviews clear — merging PR #" + number + "…";
+      const body = { repo: repoName, number, method }; if (branch) body.branch = branch;
+      sid("repos/merge-pr", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).then((mr) => {
+        const md = (mr && mr.data) || {};
+        if (md.ok) {
+          if (out) out.textContent = "Agent-merged ✓ PR #" + number;
+          stopAgentMerge(overlay);
+          loadSessionPRs(repoName, branch);
+          refreshRailState();
+        } else {
+          if (out) out.textContent = "Agent merge failed: " + (md.error || mr.status) + " — retrying next tick.";
+        }
+      });
+    } else {
+      if (out) out.textContent = "Watching PR #" + number + " — CI=" + (ci || "none") + ", reviews=" + (rev || "none") + "…";
+    }
+  });
+}
+function startAgentMerge(overlay, repoName, branch) {
+  const am = overlay._agentMerge; if (!am) return;
+  stopAgentMerge(overlay);
+  if (am.out) am.out.textContent = "Agent merge on — watching the selected PR.";
+  am.timer = setInterval(() => agentMergeTick(repoName, branch), 10000);
+}
+function stopAgentMerge(overlay) {
+  const am = overlay && overlay._agentMerge; if (!am) return;
+  if (am.timer) { clearInterval(am.timer); am.timer = null; }
+}
+// Wire the toggle: created in openSessionPanel's Merge tab build. Called once
+// on first panel build; the checkbox state is read fresh each tick.
+function wireAgentMergeToggle(overlay) {
+  const am = overlay._agentMerge; if (!am || !am.check) return;
+  am.check.onchange = () => {
+    if (am.check.checked) {
+      startAgentMerge(overlay, overlay._repo, overlay._branch);
+    } else {
+      stopAgentMerge(overlay);
+      if (am.out) am.out.textContent = "";
+    }
+  };
+}
+
 function makeReposBtn() {
   const btn = el("button", "ds-repos-btn");
   btn.title = "GitHub (connect account, browse & clone repos)"; btn.setAttribute("aria-label", "GitHub");
@@ -2598,9 +3100,20 @@ function makeReposBtn() {
   return btn;
 }
 
-// --- Sidebar "Repos" section: local repos live in the left sidebar (not the
-// GitHub modal), with a "+" to connect a folder and a "⋯" for cross-repo
-// working changes. Injected into #sidebar, between #sideHead and #convList. ---
+// makeMyWorkBtn is the header button that opens the cross-workspace dashboard.
+function makeMyWorkBtn() {
+  const btn = el("button", "ds-repos-btn");
+  btn.title = "My Work — sessions, changes, and PRs across all workspaces"; btn.setAttribute("aria-label", "My Work");
+  btn.textContent = "My Work";
+  btn.onclick = (e) => { e.stopPropagation(); openMyWork(); };
+  return btn;
+}
+
+// --- Sidebar "Workspaces" section: workspace-bound chats ("sessions") live in
+// the left sidebar under their workspace, with a "+" to connect a folder and a
+// "⋯" for cross-workspace working changes. Injected into #sidebar, between
+// #sideHead and #convList. Non-workspace chats ("chats", lightweight — no
+// branch/worktree) stay in #convList, which gets its own "Chats" header below. ---
 function toggleSidebarRepos() {
   const wrap = $("dsSidebarRepos"); if (!wrap) return;
   const collapsed = wrap.classList.toggle("collapsed");
@@ -2619,10 +3132,10 @@ function buildSidebarRepos() {
   if (collapsed) wrap.classList.add("collapsed");
   const head = el("div", "ds-sidebar-repos-head");
   const chev = el("span", "ds-sidebar-repos-chev", "▾");
-  const title = el("div", "ds-sidebar-repos-title", "Repos");
+  const title = el("div", "ds-sidebar-repos-title", "Workspaces");
   head.appendChild(chev); head.appendChild(title);
   const changesBtn = el("button", "ds-sidebar-icon-btn", "⋯");
-  changesBtn.title = "Working changes across all repos"; changesBtn.setAttribute("aria-label", "Working changes");
+  changesBtn.title = "Working changes across all workspaces"; changesBtn.setAttribute("aria-label", "Working changes");
   changesBtn.onclick = (e) => { e.stopPropagation(); openWorkingChanges(); };
   const addBtn = el("button", "ds-sidebar-icon-btn", "+");
   addBtn.title = "Connect a workspace"; addBtn.setAttribute("aria-label", "Connect a workspace");
@@ -2633,6 +3146,21 @@ function buildSidebarRepos() {
   const body = el("div", "ds-sidebar-repos-body"); body.id = "dsLocalBody";
   wrap.appendChild(body);
   sidebar.insertBefore(wrap, sideHead.nextSibling);
+}
+
+// buildSidebarChatsHeader injects a small "Chats" label above #convList so the
+// sessions-vs-chats split is explicit: workspace-bound chats render as sessions
+// under their workspace above, non-workspace chats render as "Chats" here.
+// Idempotent and best-effort — #convList is owned by app.js, so this only adds
+// a sibling header, never touches #convList itself.
+function buildSidebarChatsHeader() {
+  if ($("dsSidebarChatsHead")) return;
+  const convList = document.querySelector("#convList");
+  if (!convList || !convList.parentElement) return;
+  const head = el("div", "ds-sidebar-chats-head");
+  head.id = "dsSidebarChatsHead";
+  head.appendChild(el("div", "ds-sidebar-chats-title", "Chats"));
+  convList.parentElement.insertBefore(head, convList);
 }
 
 // --- First-load "connect your repos" wizard --------------------------------
@@ -2715,14 +3243,25 @@ function addSettingsButton() {
   } else if (appVisible && fixed) {
     fixed.remove();
   }
-  // Repos button (header only — repos require auth + backend)
+  // Repos + My Work buttons (header only — require auth + backend)
   const headerRepos = header ? header.querySelector(".ds-repos-btn") : null;
+  const headerMyWork = header ? header.querySelector(".ds-mywork-btn") : null;
   if (appVisible && header && !headerRepos) {
     const reposBtn = makeReposBtn();
     const sel = header.querySelector(".model-select");
     if (sel) header.insertBefore(reposBtn, sel); else header.appendChild(reposBtn);
   } else if (!appVisible && headerRepos) {
     headerRepos.remove();
+  }
+  if (appVisible && header && !headerMyWork) {
+    const myWorkBtn = makeMyWorkBtn();
+    myWorkBtn.classList.add("ds-mywork-btn");
+    const sel = header.querySelector(".model-select");
+    // Place My Work before the GitHub button so it reads [My Work] [GitHub] [⚙].
+    const reposBtn = header.querySelector(".ds-repos-btn");
+    if (reposBtn) header.insertBefore(myWorkBtn, reposBtn); else if (sel) header.insertBefore(myWorkBtn, sel); else header.appendChild(myWorkBtn);
+  } else if (!appVisible && headerMyWork) {
+    headerMyWork.remove();
   }
 }
 
@@ -2787,6 +3326,7 @@ async function bootDesktop() {
     const app = $("app");
     if (app && !app.classList.contains("hidden")) {
       buildSidebarRepos();
+      buildSidebarChatsHeader();
       refreshLocal();
       maybeShowRepoWizard();
       syncBranchRail();

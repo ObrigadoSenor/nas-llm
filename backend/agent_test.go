@@ -72,7 +72,7 @@ func TestAgentSystemPromptInjection(t *testing.T) {
 			}
 			if c.convSys != "" {
 				sys := c.convSys
-				if _, err := st.patchConversation(email, convID, nil, nil, nil, &sys, nil, nil, nil, nil); err != nil {
+				if _, err := st.patchConversation(email, convID, nil, nil, nil, &sys, nil, nil, nil, nil, nil, nil, nil, nil); err != nil {
 					t.Fatalf("patchConversation: %v", err)
 				}
 			}

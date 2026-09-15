@@ -57,6 +57,30 @@ type Conversation struct {
 	// the global agent_auto_approve setting; non-nil forces on/off for this chat.
 	// create_pr always prompts regardless. Exposed so the UI can show the toggle.
 	AgentAutoApprove *bool `json:"agentAutoApprove,omitempty"`
+	// Todos is the agent-maintained task checklist for the conversation (the
+	// Tasks Pill). Each entry is {text, status} where status is pending |
+	// in_progress | completed. Rides in the messages JSON blob? No — persisted in
+	// its own column so the UI can render it without re-reading messages, and so
+	// todo_write can PATCH it without rewriting the transcript. omitempty keeps
+	// existing rows byte-identical.
+	Todos []Todo `json:"todos,omitempty"`
+	// PlanMode, when true, makes an agent run research with read-only tools and
+	// emit a plan for approval before any write tool is offered. Plan is the
+	// persisted plan text (the Plan Pill). PlanApproved flips to true on approval,
+	//	unlocking write tools for subsequent runs. All omitempty for back-compat.
+	PlanMode     bool   `json:"planMode,omitempty"`
+	Plan         string `json:"plan,omitempty"`
+	PlanApproved bool   `json:"planApproved,omitempty"`
+}
+
+// Todo is one entry in a conversation's task checklist. Status mirrors the
+// Copilot app's pending → in_progress → completed flow.
+//
+//	TODO: consider promoting to a named type earlier in this file to reuse
+//	across agent + UI code.
+type Todo struct {
+	Text   string `json:"text"`
+	Status string `json:"status"` // pending | in_progress | completed
 }
 
 type Folder struct {
@@ -139,6 +163,10 @@ CREATE TABLE IF NOT EXISTS conversations (
 	agent_system TEXT,
 	agent_tools TEXT,
 	agent_auto_approve INTEGER,
+	todos TEXT NOT NULL DEFAULT '[]',
+	plan_mode INTEGER NOT NULL DEFAULT 0,
+	plan TEXT NOT NULL DEFAULT '',
+	plan_approved INTEGER NOT NULL DEFAULT 0,
 	created_at INTEGER NOT NULL,
 	updated_at INTEGER NOT NULL,
 	messages TEXT NOT NULL
@@ -333,6 +361,28 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 	}
+	// Tasks Pill + Plan mode: todos (JSON checklist), plan_mode, plan, and
+	// plan_approved. No-op for fresh installs (the schema above includes them).
+	if !cols["todos"] {
+		if _, err := db.Exec(`ALTER TABLE conversations ADD COLUMN todos TEXT NOT NULL DEFAULT '[]'`); err != nil {
+			return err
+		}
+	}
+	if !cols["plan_mode"] {
+		if _, err := db.Exec(`ALTER TABLE conversations ADD COLUMN plan_mode INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	if !cols["plan"] {
+		if _, err := db.Exec(`ALTER TABLE conversations ADD COLUMN plan TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	if !cols["plan_approved"] {
+		if _, err := db.Exec(`ALTER TABLE conversations ADD COLUMN plan_approved INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
 	// agent_steps analytics parity for the Warp-style command block: a command's
 	// exit code, (capped) output, and the cwd/branch it ran in. No-op for fresh
 	// installs (the schema above already includes them).
@@ -456,7 +506,7 @@ func (s *store) newConversationID() string {
 }
 
 func (s *store) listConversations(email string) ([]Conversation, error) {
-	rows, err := s.db.Query(`SELECT id, title, model, folder_id, repo_id, repo_branch, title_custom, created_at, updated_at, agent_auto_approve FROM conversations WHERE email = ? ORDER BY updated_at DESC`, email)
+	rows, err := s.db.Query(`SELECT id, title, model, folder_id, repo_id, repo_branch, title_custom, created_at, updated_at, agent_auto_approve, todos, plan_mode, plan, plan_approved FROM conversations WHERE email = ? ORDER BY updated_at DESC`, email)
 	if err != nil {
 		return nil, err
 	}
@@ -467,9 +517,14 @@ func (s *store) listConversations(email string) ([]Conversation, error) {
 		var folderID, repoID, repoBranch sql.NullString
 		var titleCustom int
 		var autoApprove sql.NullInt64
-		if err := rows.Scan(&c.ID, &c.Title, &c.Model, &folderID, &repoID, &repoBranch, &titleCustom, &c.CreatedAt, &c.UpdatedAt, &autoApprove); err != nil {
+		var todosJSON string
+		var planMode, planApproved int
+		if err := rows.Scan(&c.ID, &c.Title, &c.Model, &folderID, &repoID, &repoBranch, &titleCustom, &c.CreatedAt, &c.UpdatedAt, &autoApprove, &todosJSON, &planMode, &c.Plan, &planApproved); err != nil {
 			return nil, err
 		}
+		c.PlanMode = planMode != 0
+		c.PlanApproved = planApproved != 0
+		_ = json.Unmarshal([]byte(todosJSON), &c.Todos)
 		c.FolderID = folderID.String
 		c.RepoID = repoID.String
 		c.RepoBranch = repoBranch.String
@@ -486,8 +541,10 @@ func (s *store) getConversation(email, id string) (*Conversation, error) {
 	var folderID, repoID, repoBranch sql.NullString
 	var titleCustom int
 	var autoApprove sql.NullInt64
-	err := s.db.QueryRow(`SELECT id, title, model, folder_id, repo_id, repo_branch, title_custom, created_at, updated_at, messages, agent_auto_approve FROM conversations WHERE id = ? AND email = ?`, id, email).
-		Scan(&c.ID, &c.Title, &c.Model, &folderID, &repoID, &repoBranch, &titleCustom, &c.CreatedAt, &c.UpdatedAt, &msgs, &autoApprove)
+	var todosJSON string
+	var planMode, planApproved int
+	err := s.db.QueryRow(`SELECT id, title, model, folder_id, repo_id, repo_branch, title_custom, created_at, updated_at, messages, agent_auto_approve, todos, plan_mode, plan, plan_approved FROM conversations WHERE id = ? AND email = ?`, id, email).
+		Scan(&c.ID, &c.Title, &c.Model, &folderID, &repoID, &repoBranch, &titleCustom, &c.CreatedAt, &c.UpdatedAt, &msgs, &autoApprove, &todosJSON, &planMode, &c.Plan, &planApproved)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -499,6 +556,11 @@ func (s *store) getConversation(email, id string) (*Conversation, error) {
 	c.RepoBranch = repoBranch.String
 	c.TitleCustom = titleCustom != 0
 	c.AgentAutoApprove = nullBoolFromInt(autoApprove)
+	c.PlanMode = planMode != 0
+	c.PlanApproved = planApproved != 0
+	if err := json.Unmarshal([]byte(todosJSON), &c.Todos); err != nil {
+		return nil, err
+	}
 	if err := json.Unmarshal([]byte(msgs), &c.Messages); err != nil {
 		return nil, err
 	}
@@ -635,7 +697,7 @@ func (s *store) deleteFolder(email, id string) (bool, error) {
 // An empty folderID clears the folder (sets it to NULL). A non-empty title marks
 // the conversation as having a custom title (title_custom = 1) so later saves
 // won't overwrite it with the auto-derived first-message title.
-func (s *store) patchConversation(email, id string, title, folderID, model, agentSystem, agentTools, repoID, repoBranch *string, agentAutoApprove *bool) (*Conversation, error) {
+func (s *store) patchConversation(email, id string, title, folderID, model, agentSystem, agentTools, repoID, repoBranch *string, agentAutoApprove *bool, todos *[]Todo, plan *string, planMode *bool, planApproved *bool) (*Conversation, error) {
 	now := time.Now().UnixMilli()
 	sets := []string{"updated_at = ?"}
 	args := []any{now}
@@ -683,6 +745,31 @@ func (s *store) patchConversation(email, id string, title, folderID, model, agen
 		sets = append(sets, "agent_auto_approve = ?")
 		v := 0
 		if *agentAutoApprove {
+			v = 1
+		}
+		args = append(args, v)
+	}
+	if todos != nil {
+		sets = append(sets, "todos = ?")
+		tj, _ := json.Marshal(*todos)
+		args = append(args, string(tj))
+	}
+	if plan != nil {
+		sets = append(sets, "plan = ?")
+		args = append(args, *plan)
+	}
+	if planMode != nil {
+		sets = append(sets, "plan_mode = ?")
+		v := 0
+		if *planMode {
+			v = 1
+		}
+		args = append(args, v)
+	}
+	if planApproved != nil {
+		sets = append(sets, "plan_approved = ?")
+		v := 0
+		if *planApproved {
 			v = 1
 		}
 		args = append(args, v)
