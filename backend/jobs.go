@@ -111,6 +111,14 @@ type job struct {
 	// disconnect, exactly as before; jobs that do get a grace period instead of
 	// an instant cancel — see scheduleGraceCancel.
 	needsBrowser bool
+	// sampling carries the agent/search/clarify sampling parameters for this
+	// run, set once in runGeneration before any inference round. nil for plain
+	// chat (no sampling sent → Ollama Modelfile defaults). Read by browserRelay
+	// via emitModelCall so local-model rounds get the same determinism steering
+	// as server-model rounds. Safe to read without j.mu: set before the loops
+	// run on this worker and never mutated afterward (same pattern as
+	// needsBrowser/local).
+	sampling *agentSampling
 	// hub is this job's owner's multiplexed /api/events stream. Every emit*/
 	// notify* call also publishes to it (tagged with convId+jobId) so a
 	// backgrounded chat's browser relay and the sidebar/notification UI keep
@@ -197,6 +205,14 @@ type modelCallPayload struct {
 	Model    string       `json:"model"`
 	Messages []oaiMessage `json:"messages"`
 	Tools    []oaiTool    `json:"tools,omitempty"`
+	// Sampling params for agent/search/clarify rounds (nil/omitted for plain
+	// chat, which stays on Ollama defaults). Forwarded to the browser's
+	// localhost /v1/chat/completions call so local models get the same
+	// determinism steering as server models. Pointer types so a zero value
+	// (e.g. temperature 0) is sent, while unset (nil) is omitted.
+	Temperature *float64 `json:"temperature,omitempty"`
+	TopP        *float64 `json:"top_p,omitempty"`
+	Seed        *int64   `json:"seed,omitempty"`
 }
 
 // toolExecPayload is the SSE `toolExec` event body: the browser's cue to run a
@@ -332,6 +348,16 @@ func (j *job) appendContent(text string) {
 // local-model round.
 func (j *job) emitModelCall(model string, messages []oaiMessage, tools []oaiTool) {
 	payload := modelCallPayload{ConvID: j.convID, JobID: j.id, Model: model, Messages: messages, Tools: tools}
+	if j.sampling != nil {
+		t := j.sampling.temperature
+		p := j.sampling.topP
+		payload.Temperature = &t
+		payload.TopP = &p
+		if j.sampling.seed != 0 {
+			s := j.sampling.seed
+			payload.Seed = &s
+		}
+	}
 	b, _ := json.Marshal(payload)
 	j.mu.Lock()
 	j.pendingModelCall = &payload
@@ -1339,9 +1365,19 @@ func (s *server) runGeneration(j *job) error {
 	// directly. If no online host has a server model (e.g. it lives on the Mac
 	// and the Mac is asleep/offline), fail fast with a clear message instead of
 	// dialing the NAS and getting a bare not-found.
+	//
+	// Sampling params (temperature/top_p/seed) are attached to the backend for
+	// agent/search/clarify runs only — plain chat stays on Ollama's Modelfile
+	// defaults. The server backend reads them in Call; the relay reads them off
+	// the job in emitModelCall (set below).
+	var sampling *agentSampling
+	if j.agent || j.clarify || j.webSearch {
+		sampling = &agentSampling{temperature: s.cfg.agentTemperature, topP: s.cfg.agentTopP, seed: s.cfg.agentSeed}
+	}
 	var mb modelBackend
 	if j.local {
 		mb = &browserRelay{j: j}
+		j.sampling = sampling
 	} else {
 		h := s.hosts.onlineHostForModel(j.model)
 		if h == nil {
@@ -1358,7 +1394,7 @@ func (s *server) runGeneration(j *job) error {
 			return err
 		}
 		defer release()
-		mb = &directOllama{chatURL: h.chatURL(), emit: j.emitChunk}
+		mb = &directOllama{chatURL: h.chatURL(), emit: j.emitChunk, sampling: sampling}
 	}
 
 	conv, err := s.store.getConversation(j.email, j.convID)

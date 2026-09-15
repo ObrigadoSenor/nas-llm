@@ -71,6 +71,31 @@ type config struct {
 	// relay until toolExecTimeout. Carried on each toolExec payload so the
 	// sidecar enforces the backend-authoritative value.
 	runCommandTimeout time.Duration
+	// Agent harness sampling parameters, applied to every agent/search/clarify
+	// inference round (NOT plain chat, which stays on Ollama's Modelfile
+	// defaults). Lower temperature materially improves tool-selection
+	// determinism on small models. Sent as top-level OpenAI fields on
+	// /v1/chat/completions — the only reliable way to control temperature on
+	// Ollama's OpenAI shim, which otherwise ignores PARAMETER temperature
+	// (ollama/ollama#17744). agentSeed == 0 means unset (no seed sent).
+	agentTemperature float64
+	agentTopP        float64
+	agentSeed        int64
+	// agentRelayContextLength is the context-window assumption used for the
+	// browser-relay (local-model) compaction threshold. The backend cannot
+	// introspect the visitor's Ollama, so it assumes the small default (4096
+	// for most models) unless the user raised their local OLLAMA_CONTEXT_LENGTH
+	// and bumps this to match. Server-model compaction uses contextLength
+	// (which mirrors the NAS OLLAMA_CONTEXT_LENGTH) instead.
+	agentRelayContextLength int
+	// agentDebugCapture, when on, writes each agent inference round's exact
+	// payload (model, messages, tools, sampling) to agentDebugCaptureDir as JSON
+	// so a failing iteration can be replayed standalone (scripts/replay-agent-
+	// round.go) to separate harness bugs from model-capability limits. OFF by
+	// default: the message list can contain user-pasted secrets — only enable it
+	// while debugging and keep the capture dir access-restricted.
+	agentDebugCapture    bool
+	agentDebugCaptureDir string
 }
 
 type server struct {
@@ -99,31 +124,37 @@ const ctxEmail ctxKey = 0
 
 func main() {
 	cfg := config{
-		addr:               ":" + env("BACKEND_PORT", "8081"),
-		sessionSecret:      []byte(mustEnv("SESSION_SECRET")),
-		brevoKey:           env("BREVO_API_KEY", ""),
-		appBaseURL:         env("APP_BASE_URL", "https://chat.selected.systems"),
-		mailFrom:           env("MAIL_FROM", "noreply@selected.systems"),
-		dbPath:             env("DB_PATH", "/data/nas-llm.db"),
-		ollamaURL:          env("OLLAMA_URL", "http://ollama:11434"),
-		searxngURL:         env("SEARXNG_URL", ""),
-		maxSearchRounds:    envInt("MAX_SEARCH_ROUNDS", 1),
-		maxClarifyRounds:   envInt("MAX_CLARIFY_ROUNDS", 3),
-		askUserInPlainChat: envBool("ASK_USER_IN_PLAIN_CHAT", true),
-		clarifyProseDetect: envBool("CLARIFY_PROSE_DETECT", true),
-		maxAgentSteps:      envInt("MAX_AGENT_STEPS", 24),
-		fetchPageEnabled:   envBool("FETCH_PAGE_ENABLED", false),
-		contextLength:      envInt("OLLAMA_CONTEXT_LENGTH", 16384),
-		nasRamGB:           envFloat("NAS_RAM_GB", 8),
-		nasSystemReserveGB: envFloat("NAS_SYSTEM_RESERVE_GB", 1.5),
-		macURL:             env("OLLAMA_MAC_URL", ""),
-		macRamGB:           envFloat("MAC_RAM_GB", 16),
-		macSystemReserveGB: envFloat("MAC_SYSTEM_RESERVE_GB", 2),
-		maxConcurrentJobs:  envInt("MAX_CONCURRENT_JOBS", 4),
-		browserRelayGrace:  envDuration("BROWSER_RELAY_GRACE", 45*time.Second),
-		agentJobTimeout:    envDuration("AGENT_JOB_TIMEOUT", 30*time.Minute),
-		toolExecTimeout:    envDuration("TOOL_EXEC_TIMEOUT", 15*time.Minute),
-		runCommandTimeout:  envDuration("RUN_COMMAND_TIMEOUT", 120*time.Second),
+		addr:                    ":" + env("BACKEND_PORT", "8081"),
+		sessionSecret:           []byte(mustEnv("SESSION_SECRET")),
+		brevoKey:                env("BREVO_API_KEY", ""),
+		appBaseURL:              env("APP_BASE_URL", "https://chat.selected.systems"),
+		mailFrom:                env("MAIL_FROM", "noreply@selected.systems"),
+		dbPath:                  env("DB_PATH", "/data/nas-llm.db"),
+		ollamaURL:               env("OLLAMA_URL", "http://ollama:11434"),
+		searxngURL:              env("SEARXNG_URL", ""),
+		maxSearchRounds:         envInt("MAX_SEARCH_ROUNDS", 1),
+		maxClarifyRounds:        envInt("MAX_CLARIFY_ROUNDS", 3),
+		askUserInPlainChat:      envBool("ASK_USER_IN_PLAIN_CHAT", true),
+		clarifyProseDetect:      envBool("CLARIFY_PROSE_DETECT", true),
+		maxAgentSteps:           envInt("MAX_AGENT_STEPS", 24),
+		fetchPageEnabled:        envBool("FETCH_PAGE_ENABLED", false),
+		contextLength:           envInt("OLLAMA_CONTEXT_LENGTH", 16384),
+		nasRamGB:                envFloat("NAS_RAM_GB", 8),
+		nasSystemReserveGB:      envFloat("NAS_SYSTEM_RESERVE_GB", 1.5),
+		macURL:                  env("OLLAMA_MAC_URL", ""),
+		macRamGB:                envFloat("MAC_RAM_GB", 16),
+		macSystemReserveGB:      envFloat("MAC_SYSTEM_RESERVE_GB", 2),
+		maxConcurrentJobs:       envInt("MAX_CONCURRENT_JOBS", 4),
+		browserRelayGrace:       envDuration("BROWSER_RELAY_GRACE", 45*time.Second),
+		agentJobTimeout:         envDuration("AGENT_JOB_TIMEOUT", 30*time.Minute),
+		toolExecTimeout:         envDuration("TOOL_EXEC_TIMEOUT", 15*time.Minute),
+		runCommandTimeout:       envDuration("RUN_COMMAND_TIMEOUT", 120*time.Second),
+		agentTemperature:        envFloat("AGENT_TEMPERATURE", 0.4),
+		agentTopP:               envFloat("AGENT_TOP_P", 0.9),
+		agentSeed:               int64(envInt("AGENT_SEED", 0)),
+		agentRelayContextLength: envInt("AGENT_RELAY_CONTEXT_LENGTH", 4096),
+		agentDebugCapture:       envBool("AGENT_DEBUG_CAPTURE", false),
+		agentDebugCaptureDir:    env("AGENT_DEBUG_CAPTURE_DIR", "./agent-debug"),
 	}
 	cfg.cookieSecure = strings.HasPrefix(cfg.appBaseURL, "https://")
 	cfg.allowedEmails = parseAllowed(os.Getenv("ALLOWED_EMAILS"))

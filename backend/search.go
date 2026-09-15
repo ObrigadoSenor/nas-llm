@@ -88,6 +88,14 @@ type chatRequest struct {
 	WebSearch     bool           `json:"web_search"`
 	Tools         []oaiTool      `json:"tools,omitempty"`
 	StreamOptions map[string]any `json:"stream_options,omitempty"`
+	// Sampling parameters. Pointer types so a zero value (e.g. temperature 0,
+	// greedy) is distinguishable from "unset" (nil → omitted from the JSON).
+	// Set only for agent/search/clarify rounds; nil for plain chat so Ollama
+	// uses its Modelfile defaults. Ollama's /v1/chat/completions honors these
+	// as top-level OpenAI fields (mapped to options).
+	Temperature *float64 `json:"temperature,omitempty"`
+	TopP        *float64 `json:"top_p,omitempty"`
+	Seed        *int64   `json:"seed,omitempty"`
 }
 
 // agentUsage is the token accounting for one model round (parsed from Ollama's
