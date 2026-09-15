@@ -1236,6 +1236,8 @@ func (s *server) handleRepoUpsert(w http.ResponseWriter, r *http.Request) {
 	email := emailFrom(r)
 	var body struct {
 		FullName  string   `json:"fullName"`
+		Name      string   `json:"name"`
+		UseGit    *bool    `json:"useGit"`
 		LocalPath string   `json:"localPath"`
 		Branch    string   `json:"branch"`
 		Head      string   `json:"head"`
@@ -1249,8 +1251,20 @@ func (s *server) handleRepoUpsert(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "fullName is required", http.StatusBadRequest)
 		return
 	}
+	// useGit defaults to true when absent so older sidecars (which never send it)
+	// keep registering git repos exactly as before.
+	useGit := true
+	if body.UseGit != nil {
+		useGit = *body.UseGit
+	}
+	name := strings.TrimSpace(body.Name)
+	if name == "" {
+		name = body.FullName
+	}
 	repo := &Repo{
 		FullName:  body.FullName,
+		Name:      name,
+		UseGit:    useGit,
 		LocalPath: body.LocalPath,
 		Branch:    body.Branch,
 		Head:      body.Head,

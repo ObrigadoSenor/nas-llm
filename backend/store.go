@@ -66,13 +66,20 @@ type Folder struct {
 	CreatedAt int64  `json:"createdAt"`
 }
 
-// Repo is a locally-cloned repository registered with the backend. The desktop
-// sidecar pushes this context (branch, HEAD, top-level tree) on clone/open so
-// the agent loop can inject it into the system prompt for repo-bound chats.
+// Repo is a locally-cloned repository OR a plain folder registered with the
+// backend as a "workspace". The desktop sidecar pushes this context (branch,
+// HEAD, top-level tree) on clone/open so the agent loop can inject it into the
+// system prompt for repo-bound chats. UseGit is false for a non-git workspace:
+// file tools still run, but git tools/routes/controls are hidden. Name is the
+// display name (equals FullName for git repos; the user-provided name for a
+// non-git workspace). Keyed by (email, full_name); for a non-git workspace
+// full_name is the user-provided name, unique per user.
 type Repo struct {
 	ID        string   `json:"id"`
 	Email     string   `json:"-"`
 	FullName  string   `json:"fullName"`
+	Name      string   `json:"name,omitempty"`
+	UseGit    bool     `json:"useGit"`
 	LocalPath string   `json:"localPath"`
 	Branch    string   `json:"branch"`
 	Head      string   `json:"head"`
@@ -210,6 +217,8 @@ CREATE TABLE IF NOT EXISTS repos (
 	id TEXT PRIMARY KEY,
 	email TEXT NOT NULL,
 	full_name TEXT NOT NULL,
+	name TEXT NOT NULL DEFAULT '',
+	use_git INTEGER NOT NULL DEFAULT 1,
 	local_path TEXT NOT NULL DEFAULT '',
 	branch TEXT NOT NULL DEFAULT '',
 	head TEXT NOT NULL DEFAULT '',
@@ -348,6 +357,23 @@ func migrate(db *sql.DB) error {
 	}
 	if !asCols["branch"] {
 		if _, err := db.Exec(`ALTER TABLE agent_steps ADD COLUMN branch TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	// repos: use_git (workspace flag; 1=git-enabled, 0=plain folder) + name
+	// (display name). No-op for fresh installs (the schema above already includes
+	// them). Existing rows default to use_git=1 so they stay git-enabled.
+	repoCols, err := tableColumns(db, "repos")
+	if err != nil {
+		return err
+	}
+	if !repoCols["use_git"] {
+		if _, err := db.Exec(`ALTER TABLE repos ADD COLUMN use_git INTEGER NOT NULL DEFAULT 1`); err != nil {
+			return err
+		}
+	}
+	if !repoCols["name"] {
+		if _, err := db.Exec(`ALTER TABLE repos ADD COLUMN name TEXT NOT NULL DEFAULT ''`); err != nil {
 			return err
 		}
 	}
@@ -987,12 +1013,19 @@ func (s *store) upsertRepo(email string, r *Repo) (*Repo, error) {
 	id := s.newFolderID() // reuse the random-ID helper
 	now := time.Now().UnixMilli()
 	treeJSON, _ := json.Marshal(r.Tree)
+	useGit := 1
+	if !r.UseGit {
+		useGit = 0
+	}
 	// Try insert; on conflict (email, full_name), update in place and keep the id.
-	res, err := s.db.Exec(`INSERT INTO repos(id, email, full_name, local_path, branch, head, tree, created_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(email, full_name) DO UPDATE SET local_path=excluded.local_path,
+	// use_git/name update on conflict so a workspace promoted to git via init-git
+	// (which re-pushes) flips the flag without leaving a stale row.
+	res, err := s.db.Exec(`INSERT INTO repos(id, email, full_name, name, use_git, local_path, branch, head, tree, created_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(email, full_name) DO UPDATE SET name=excluded.name,
+			use_git=excluded.use_git, local_path=excluded.local_path,
 			branch=excluded.branch, head=excluded.head, tree=excluded.tree`,
-		id, email, r.FullName, r.LocalPath, r.Branch, r.Head, string(treeJSON), now)
+		id, email, r.FullName, r.Name, useGit, r.LocalPath, r.Branch, r.Head, string(treeJSON), now)
 	if err != nil {
 		return nil, err
 	}
@@ -1012,7 +1045,7 @@ func (s *store) upsertRepo(email string, r *Repo) (*Repo, error) {
 
 // listRepos returns all repos registered by a user.
 func (s *store) listRepos(email string) ([]Repo, error) {
-	rows, err := s.db.Query(`SELECT id, full_name, local_path, branch, head, tree, created_at FROM repos WHERE email = ? ORDER BY created_at DESC`, email)
+	rows, err := s.db.Query(`SELECT id, full_name, name, use_git, local_path, branch, head, tree, created_at FROM repos WHERE email = ? ORDER BY created_at DESC`, email)
 	if err != nil {
 		return nil, err
 	}
@@ -1021,9 +1054,11 @@ func (s *store) listRepos(email string) ([]Repo, error) {
 	for rows.Next() {
 		var r Repo
 		var treeJSON string
-		if err := rows.Scan(&r.ID, &r.FullName, &r.LocalPath, &r.Branch, &r.Head, &treeJSON, &r.CreatedAt); err != nil {
+		var useGit int
+		if err := rows.Scan(&r.ID, &r.FullName, &r.Name, &useGit, &r.LocalPath, &r.Branch, &r.Head, &treeJSON, &r.CreatedAt); err != nil {
 			return nil, err
 		}
+		r.UseGit = useGit != 0
 		_ = json.Unmarshal([]byte(treeJSON), &r.Tree)
 		out = append(out, r)
 	}
@@ -1034,14 +1069,16 @@ func (s *store) listRepos(email string) ([]Repo, error) {
 func (s *store) getRepo(email, id string) (*Repo, error) {
 	var r Repo
 	var treeJSON string
-	err := s.db.QueryRow(`SELECT id, full_name, local_path, branch, head, tree, created_at FROM repos WHERE id = ? AND email = ?`, id, email).
-		Scan(&r.ID, &r.FullName, &r.LocalPath, &r.Branch, &r.Head, &treeJSON, &r.CreatedAt)
+	var useGit int
+	err := s.db.QueryRow(`SELECT id, full_name, name, use_git, local_path, branch, head, tree, created_at FROM repos WHERE id = ? AND email = ?`, id, email).
+		Scan(&r.ID, &r.FullName, &r.Name, &useGit, &r.LocalPath, &r.Branch, &r.Head, &treeJSON, &r.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
+	r.UseGit = useGit != 0
 	_ = json.Unmarshal([]byte(treeJSON), &r.Tree)
 	r.Email = email
 	return &r, nil

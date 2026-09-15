@@ -946,8 +946,96 @@ async function connectFolderFlow() {
     return false;
   }
   if (!repos.length) { flashDsErr("No git repositories found in that folder."); return false; }
+  // A single non-git candidate (the picked folder itself, when no .git was
+  // found): route to the named-workspace flow so the user can name it and choose
+  // whether to track it with git, instead of erroring on add-local.
+  if (repos.length === 1 && repos[0].git === false) {
+    return createWorkspaceForPath(repos[0].path, repos[0].name, false);
+  }
   if (repos.length === 1) return addLocalRepo(repos[0].path);
   return showConnectPicker(repos);
+}
+
+// createWorkspaceForPath opens the "new workspace" dialog for a chosen folder:
+// a Name input (required) + a "Track with git" checkbox. On submit it POSTs to
+// /repos/create-workspace. Returns true on success. `suggestName` pre-fills the
+// name (e.g. the folder basename from scan-local); `suggestGit` sets the
+// checkbox default (false for a non-git folder picked via connectFolderFlow,
+// true when the user opened "New workspace…" directly).
+function createWorkspaceForPath(path, suggestName, suggestGit) {
+  return new Promise((resolve) => {
+    let overlay = $("dsWorkspaceOverlay");
+    let nameInput, gitCheck, createBtn;
+    if (!overlay) {
+      overlay = el("div", "ds-overlay");
+      overlay.id = "dsWorkspaceOverlay";
+      overlay.setAttribute("role", "dialog");
+      overlay.setAttribute("aria-modal", "true");
+      overlay.setAttribute("aria-label", "New workspace");
+      const card = el("div", "ds-card");
+      const head = el("div", "ds-head");
+      head.appendChild(el("h2", null, "New workspace"));
+      const x = el("button", "ds-x"); x.textContent = "×"; x.title = "Cancel"; x.setAttribute("aria-label", "Cancel");
+      head.appendChild(x);
+      card.appendChild(head);
+      card.appendChild(el("div", "ds-note", "Connect this folder as a workspace. Name it, and choose whether to track it with git (commits, branches, pull requests) or keep it as a plain folder (file tools only)."));
+      card.appendChild(el("div", "ds-label", "Name"));
+      nameInput = document.createElement("input"); nameInput.id = "dsWsName"; nameInput.type = "text";
+      card.appendChild(nameInput);
+      const gitRow = el("label", "ds-ws-check-row");
+      gitCheck = document.createElement("input"); gitCheck.id = "dsWsGit"; gitCheck.type = "checkbox";
+      gitRow.appendChild(gitCheck);
+      gitRow.appendChild(el("span", "ds-ws-check-label", "Track with git"));
+      card.appendChild(gitRow);
+      const out = el("div", "ds-note"); out.id = "dsWsOut";
+      card.appendChild(out);
+      const btnRow = el("div", "ds-row ds-approval-row");
+      createBtn = el("button", "ds-btn", "Create workspace"); createBtn.id = "dsWsCreate";
+      btnRow.appendChild(createBtn);
+      card.appendChild(btnRow);
+      overlay.appendChild(card);
+      document.body.appendChild(overlay);
+      const close = (v) => { overlay.classList.remove("open"); resolve(v); };
+      x.onclick = () => close(false);
+      overlay.addEventListener("click", (e) => { if (e.target === overlay) close(false); });
+      createBtn.onclick = async () => {
+        const name = nameInput.value.trim();
+        if (!name) { out.textContent = "Enter a workspace name."; return; }
+        createBtn.disabled = true; createBtn.textContent = "Creating…";
+        const res = await sid("repos/create-workspace", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path, name, useGit: gitCheck.checked }) });
+        const d = (res && res.data) || {};
+        createBtn.disabled = false; createBtn.textContent = "Create workspace";
+        if (d.ok) { flashDsOk("Connected \"" + name + "\" ✓"); close(true); }
+        else { out.textContent = "Failed: " + (d.error || res.status || "unknown"); }
+      };
+    } else {
+      nameInput = $("dsWsName"); gitCheck = $("dsWsGit"); createBtn = $("dsWsCreate");
+    }
+    nameInput.value = suggestName || "";
+    gitCheck.checked = !!suggestGit;
+    const outEl = $("dsWsOut"); if (outEl) outEl.textContent = "";
+    overlay.classList.add("open");
+    setTimeout(() => { try { nameInput.focus(); nameInput.select(); } catch {} }, 0);
+  });
+}
+
+// createWorkspaceFlow is the entry point for "New workspace…": pick a folder,
+// then open the name + git dialog. Returns true if a workspace was connected.
+async function createWorkspaceFlow() {
+  let path;
+  try {
+    path = await pickFolder("Select a folder for the new workspace");
+  } catch (e) {
+    flashDsErr("Could not open the folder picker: " + String((e && e.message) || e));
+    return false;
+  }
+  if (!path) return false;
+  // Pre-fill the name with the folder basename; default git on (the user can
+  // turn it off to keep a plain folder, or leave it on to git-init in place).
+  const base = (path.split("/").pop() || "workspace").replace(/\.git$/, "");
+  const ok = await createWorkspaceForPath(path, base, true);
+  if (ok) refreshLocal();
+  return ok;
 }
 
 // Small confirm dialog (replaces native confirm(), which the browser can block).
@@ -1171,39 +1259,49 @@ function renderComposerStatus() {
   if (!status) return;
   if (!railRepo) { status.classList.add("hidden"); status.textContent = ""; return; }
   const s = railState || {};
-  const chatBranch = (railConv && railConv.repoBranch) || s.branch || "";
+  const noGit = s.useGit === false;
+  const chatBranch = noGit ? "" : ((railConv && railConv.repoBranch) || s.branch || "");
   status.innerHTML = "";
   status.appendChild(document.createTextNode(railRepo));
-  if (chatBranch) {
-    status.appendChild(document.createTextNode(" · "));
-    const chip = el("span", "ds-branch-chip", "⎇ " + chatBranch);
-    chip.title = "Change this chat's branch";
-    chip.onclick = (e) => { e.stopPropagation(); if (railConvId) openChatBranchPicker(railConvId, railRepo, chatBranch); };
-    status.appendChild(chip);
+  if (noGit) {
+    status.appendChild(document.createTextNode(" · no git"));
+  } else {
+    if (chatBranch) {
+      status.appendChild(document.createTextNode(" · "));
+      const chip = el("span", "ds-branch-chip", "⎇ " + chatBranch);
+      chip.title = "Change this chat's branch";
+      chip.onclick = (e) => { e.stopPropagation(); if (railConvId) openChatBranchPicker(railConvId, railRepo, chatBranch); };
+      status.appendChild(chip);
+    }
+    if (s.dirty) status.appendChild(document.createTextNode(" · ●" + s.dirty + " dirty"));
+    if (s.ahead) status.appendChild(document.createTextNode(" · ↑" + s.ahead));
+    if (s.behind) status.appendChild(document.createTextNode(" · ↓" + s.behind));
+    if (s.hasRemote === false) status.appendChild(document.createTextNode(" · no remote"));
   }
-  if (s.dirty) status.appendChild(document.createTextNode(" · ●" + s.dirty + " dirty"));
-  if (s.ahead) status.appendChild(document.createTextNode(" · ↑" + s.ahead));
-  if (s.behind) status.appendChild(document.createTextNode(" · ↓" + s.behind));
-  if (s.hasRemote === false) status.appendChild(document.createTextNode(" · no remote"));
   // Auto-approve toggle: reflects this chat's effective setting (per-chat
   // override, else the global default). Click flips the per-chat override.
+  // Applies to apply_patch/run_command (file tools) for non-git workspaces too,
+  // and to git_commit/git_push for git repos.
   const aaOn = effectiveAutoApprove(railConv);
   status.appendChild(document.createTextNode(" · "));
   const aaChip = el("span", "ds-aa-chip " + (aaOn ? "on" : "off"), aaOn ? "✓ auto-approve" : "○ auto-approve off");
   aaChip.title = aaOn
-    ? "Edits, commands, commit and push run without an approval dialog. create_pr still asks. Click to turn off for this chat."
-    : "Each edit/command/commit/push asks before running. Click to turn auto-approve on for this chat.";
+    ? "Edits and commands run without an approval dialog. Click to turn off for this chat."
+    : "Each edit/command asks before running. Click to turn auto-approve on for this chat.";
   aaChip.onclick = (e) => { e.stopPropagation(); toggleConvAutoApprove(railConvId, railConv); };
   status.appendChild(aaChip);
-  // Hover popup: explain the symbols (● = uncommitted files, ⎇ = branch, ↑/↓ =
-  // ahead/behind) and that clicking opens the review/commit session panel.
+  // Hover popup: explain the symbols and that clicking opens the session panel.
   const tip = [railRepo];
-  if (chatBranch) tip.push("branch: " + chatBranch + " (click ⎇ to change)");
-  if (s.dirty) tip.push(s.dirty + " uncommitted/modified files (●)");
-  if (s.ahead) tip.push(s.ahead + " commits ahead of origin (↑)");
-  if (s.behind) tip.push(s.behind + " commits behind origin (↓)");
-  if (s.hasRemote === false) tip.push("no remote configured");
-  tip.push(aaOn ? "auto-approve on (edits/commands/commit/push run without asking)" : "auto-approve off (click ✓/○ to toggle for this chat)");
+  if (noGit) {
+    tip.push("no git (plain folder — file tools only)");
+  } else {
+    if (chatBranch) tip.push("branch: " + chatBranch + " (click ⎇ to change)");
+    if (s.dirty) tip.push(s.dirty + " uncommitted/modified files (●)");
+    if (s.ahead) tip.push(s.ahead + " commits ahead of origin (↑)");
+    if (s.behind) tip.push(s.behind + " commits behind origin (↓)");
+    if (s.hasRemote === false) tip.push("no remote configured");
+  }
+  tip.push(aaOn ? "auto-approve on (edits/commands run without asking)" : "auto-approve off (click ✓/○ to toggle for this chat)");
   tip.push("click to open the session panel (review changes, commit & push, open PR)");
   status.title = tip.join(" · ");
   status.classList.remove("hidden");
@@ -1260,7 +1358,7 @@ async function actualSyncBranchRail() {
 // error and bail without creating a chat — so a failed connect never leaves an
 // orphaned "normal" chat behind (which is what happened when the conversation
 // was created first and the repo lookup threw after it).
-async function createRepoChat(r) {
+async function createWorkspaceChat(r) {
   const fullName = r.name;
 
   // 1. Pull local repo context (path/branch/head/tree) from the sidecar so the
@@ -1321,53 +1419,49 @@ async function createRepoChat(r) {
   const shortId = String(convId).slice(0, 7);
   const title = fullName + " (agent " + shortId + ")";
 
-  // Give this chat its own branch cut from the repo's default branch. No git
-  // worktree is provisioned upfront — a new chat is just a branch from main.
-  //
-  // The name must be unique per chat. Branch names used to come from a slug of
-  // the chat title, and since every chat on a repo shared one title, every chat
-  // shared ONE branch — "a branch per chat" was really a branch per repo. The
-  // conversation-id slice fixes that.
-  //
-  // repos/create-branch switches the repo folder onto the new branch when the
-  // folder is clean (so this chat's tools run there directly), and creates the
-  // branch ref without switching when the folder is dirty (so another chat's /
-  // the user's uncommitted edits are never carried onto the new branch). In the
-  // dirty case this chat's tool calls lazily provision an isolated worktree via
-  // repos_exec, which keeps concurrent chats on different branches isolated.
-  const shortName = (fullName.split("/").pop() || fullName);
-  const branchName = "agent/" + slugifyTitle(shortName) + "-" + shortId;
+  // Give this chat its own branch cut from the repo's default branch, unless
+  // this is a non-git workspace (useGit=false) — those have no branches, so the
+  // chat runs in the workspace folder directly with file tools only.
+  const useGit = r.use_git !== false;
   let branch = "";
-  let branchErr = "";
-  try {
-    const cr = await sid("repos/create-branch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: fullName, branch: branchName }) });
-    const cd = (cr && cr.data) || {};
-    if (cr.ok && cd.ok && cd.branch) branch = cd.branch;
-    else branchErr = cd.error || cr.status || "unknown error";
-  } catch (e) { branchErr = String((e && e.message) || e); }
-
-  if (!branch) {
-    // Branch creation failed (invalid name, a repo that moved, git refused).
-    // Surface the real git error and let the user fall back to the repo
-    // folder's current branch rather than silently landing the agent's edits
-    // somewhere they don't expect. Never force.
-    flashDsErr("Could not create this chat's branch: " + branchErr);
-    const cont = await dsConfirm(
-      "Continue on the repo's current branch instead?",
-      "The agent's edits will land in the repo folder on whatever branch it has checked out, shared with anything else using it."
-    );
-    if (!cont) return; // aborted — do not navigate
+  if (useGit) {
+    const shortName = (fullName.split("/").pop() || fullName);
+    const branchName = "agent/" + slugifyTitle(shortName) + "-" + shortId;
+    let branchErr = "";
     try {
-      const sr = await sid("repos/state?name=" + encodeURIComponent(fullName));
-      const sd = (sr && sr.data) || {};
-      if (sr.ok && sd.branch) branch = sd.branch;
-    } catch {}
+      const cr = await sid("repos/create-branch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: fullName, branch: branchName }) });
+      const cd = (cr && cr.data) || {};
+      if (cr.ok && cd.ok && cd.branch) branch = cd.branch;
+      else branchErr = cd.error || cr.status || "unknown error";
+    } catch (e) { branchErr = String((e && e.message) || e); }
+
+    if (!branch) {
+      // Branch creation failed (invalid name, a repo that moved, git refused).
+      // Surface the real git error and let the user fall back to the repo
+      // folder's current branch rather than silently landing the agent's edits
+      // somewhere they don't expect. Never force.
+      flashDsErr("Could not create this chat's branch: " + branchErr);
+      const cont = await dsConfirm(
+        "Continue on the repo's current branch instead?",
+        "The agent's edits will land in the repo folder on whatever branch it has checked out, shared with anything else using it."
+      );
+      if (!cont) return; // aborted — do not navigate
+      try {
+        const sr = await sid("repos/state?name=" + encodeURIComponent(fullName));
+        const sd = (sr && sr.data) || {};
+        if (sr.ok && sd.branch) branch = sd.branch;
+      } catch {}
+    }
   }
 
-  // PATCH title + repoId + agentTools (file + git) + folder + repoBranch in one
-  // go — no extra round trip for the rename. A title set this way is marked
-  // custom server-side, which is correct: it is deliberate, not auto-derived.
-  const agentTools = "read_file,list_files,glob,grep,git_status,apply_patch,run_command,ask_user,get_time,git_commit,git_push,create_pr";
+  // PATCH title + repoId + agentTools + folder + repoBranch in one go — no extra
+  // round trip for the rename. A title set this way is marked custom server-side,
+  // which is correct: it is deliberate, not auto-derived. A non-git workspace
+  // gets the file-only tool set (no git_status/git_commit/git_push/create_pr);
+  // a git repo gets the file + git workflow tools.
+  const agentTools = useGit
+    ? "read_file,list_files,glob,grep,git_status,apply_patch,run_command,ask_user,get_time,git_commit,git_push,create_pr"
+    : "read_file,list_files,glob,grep,apply_patch,run_command,ask_user,get_time";
   const patchBody = { title, repoId, agentTools };
   if (folderId) patchBody.folderId = folderId;
   if (branch) patchBody.repoBranch = branch;
@@ -1457,6 +1551,23 @@ async function pullRepo(r) {
   refreshLocal();
 }
 
+// enableGit promotes a non-git workspace to git-enabled in place via
+// /repos/init-git (git init + initial commit). On success, refreshes the sidebar
+// so the branch/dirty badges appear and the git session actions unlock.
+async function enableGit(r) {
+  const ok = await dsConfirm("Enable git for \"" + r.name + "\"?", "This runs `git init` and an initial commit" + (r.path ? " in " + r.path : "") + " so the workspace starts tracking changes with git (commits, branches, pull requests).");
+  if (!ok) return;
+  const res = await sid("repos/init-git", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: r.name }) });
+  const d = (res && res.data) || {};
+  if (d.ok) {
+    flashDsOk("Git enabled for \"" + r.name + "\" ✓");
+    refreshLocal();
+    refreshRailState();
+  } else {
+    flashDsErr("Could not enable git: " + (d.error || res.status || "unknown"));
+  }
+}
+
 // repoMenu opens a small popup of per-repo actions anchored under the ⋯ button.
 // Closes on outside click, Esc, or item selection.
 function repoMenu(r, anchor) {
@@ -1469,9 +1580,13 @@ function repoMenu(r, anchor) {
     item.onclick = (e) => { e.stopPropagation(); closeRepoMenu(); fn(); };
     menu.appendChild(item);
   };
-  add("Pull", "git pull --ff-only", () => pullRepo(r));
-  add("Branch…", "Switch to a different branch (local or remote)", () => openBranchPicker(r));
-  add("Ship…", "Versioned release (changelog + commit/push)", () => openShipChanges(r));
+  if (r.use_git === false) {
+    add("Enable git", "git init in place and start tracking with git", () => enableGit(r));
+  } else {
+    add("Pull", "git pull --ff-only", () => pullRepo(r));
+    add("Branch…", "Switch to a different branch (local or remote)", () => openBranchPicker(r));
+    add("Ship…", "Versioned release (changelog + commit/push)", () => openShipChanges(r));
+  }
   document.body.appendChild(menu);
   const rect = anchor.getBoundingClientRect();
   menu.style.right = (window.innerWidth - rect.right) + "px";
@@ -1491,6 +1606,39 @@ function closeRepoMenu() {
   if (menu._outside) document.removeEventListener("click", menu._outside);
   if (menu._esc) document.removeEventListener("keydown", menu._esc);
   menu.remove();
+}
+
+// openConnectMenu is the small popup behind the sidebar "+": pick between
+// connecting an existing git repo (folder picker -> scan) and creating a new
+// named workspace (folder picker -> name + git dialog). Reuses closeRepoMenu.
+function openConnectMenu(anchor) {
+  closeRepoMenu();
+  const menu = el("div", "ds-repo-menu");
+  menu.id = "dsRepoMenu";
+  const add = (label, title, fn) => {
+    const item = el("button", "ds-repo-menu-item", label);
+    if (title) item.title = title;
+    item.onclick = (e) => { e.stopPropagation(); closeRepoMenu(); fn(); };
+    menu.appendChild(item);
+  };
+  add("Connect git repo…", "Pick an existing git repository folder", async () => {
+    const ok = await connectFolderFlow();
+    if (ok) refreshLocal();
+  });
+  add("New workspace…", "Pick a folder, name it, and choose whether to use git", async () => {
+    const ok = await createWorkspaceFlow();
+    if (ok) refreshLocal();
+  });
+  document.body.appendChild(menu);
+  const rect = anchor.getBoundingClientRect();
+  menu.style.right = (window.innerWidth - rect.right) + "px";
+  menu.style.top = (rect.bottom + 4) + "px";
+  setTimeout(() => {
+    menu._outside = (e) => { if (!menu.contains(e.target)) closeRepoMenu(); };
+    menu._esc = (e) => { if (e.key === "Escape") closeRepoMenu(); };
+    document.addEventListener("click", menu._outside);
+    document.addEventListener("keydown", menu._esc);
+  }, 0);
 }
 
 // openBranchPicker shows an overlay listing the repo's local AND remote-only
@@ -1729,18 +1877,25 @@ function localRow(r, chats) {
   const chev = el("span", "ds-repo-chev", "▸");
   head.appendChild(chev);
   const nameBtn = el("button", "ds-repo-name-btn");
-  nameBtn.title = r.branch ? (r.name + " · on " + r.branch) : r.name;
-  // Name line: repo full name + (optional) dirty badge, then a branch subtitle
-  // below it so the current branch is visible at a glance in the sidebar.
+  nameBtn.title = r.use_git === false ? (r.name + " · no git") : (r.branch ? (r.name + " · on " + r.branch) : r.name);
+  // Name line: workspace display name + (for git) a dirty badge, with a branch
+  // subtitle below; for a non-git workspace a "no git" tag replaces them so the
+  // sidebar row stays informative without git-only state.
   const nameLine = el("span", "ds-repo-name-line");
   nameLine.appendChild(el("span", "ds-repo-name", r.name));
-  if (r.dirty > 0) {
-    const dirty = el("span", "ds-repo-dirty", "●" + r.dirty);
-    dirty.title = r.dirty + " uncommitted/modified files — open ⋯ → Session to review and commit";
-    nameLine.appendChild(dirty);
+  if (r.use_git === false) {
+    const nogit = el("span", "ds-repo-nogit", "no git");
+    nogit.title = "Plain folder — file tools work, but git tools (commit, branch, PR) are hidden. Use ⋯ → Enable git to start tracking with git.";
+    nameLine.appendChild(nogit);
+  } else {
+    if (r.dirty > 0) {
+      const dirty = el("span", "ds-repo-dirty", "●" + r.dirty);
+      dirty.title = r.dirty + " uncommitted/modified files — open ⋯ → Session to review and commit";
+      nameLine.appendChild(dirty);
+    }
   }
   nameBtn.appendChild(nameLine);
-  if (r.branch) nameBtn.appendChild(el("span", "ds-repo-branch", "⎇ " + r.branch));
+  if (r.use_git !== false && r.branch) nameBtn.appendChild(el("span", "ds-repo-branch", "⎇ " + r.branch));
   nameBtn.onclick = () => {
     if (expandedRepos.has(r.name)) expandedRepos.delete(r.name);
     else expandedRepos.add(r.name);
@@ -1759,7 +1914,7 @@ function localRow(r, chats) {
   addBtn.onclick = async (e) => {
     e.stopPropagation();
     addBtn.disabled = true; addBtn.textContent = "…";
-    try { await createRepoChat(r); }
+    try { await createWorkspaceChat(r); }
     catch (err) { flashDsErr(String((err && err.message) || err)); }
     finally { addBtn.disabled = false; addBtn.textContent = "+"; }
   };
@@ -2166,7 +2321,16 @@ function openSessionPanel(repoName) {
     pChanges.appendChild(commitOut);
     const revertBtn = el("button", "ds-btn ds-btn-ghost ds-session-link", "Revert all changes");
     pChanges.appendChild(revertBtn);
+    // Non-git workspace affordance: a note explaining git is off + a button to
+    // enable it in place. Hidden by default; loadSessionPanel toggles them.
+    const noGitNote = el("div", "ds-note ds-session-nogit"); noGitNote.id = "dsSessionNoGit"; noGitNote.style.display = "none";
+    noGitNote.textContent = "This workspace isn't under git, so commit, push, branches, and pull requests aren't available. Enable git to start tracking changes.";
+    pChanges.appendChild(noGitNote);
+    const enableGitBtn = el("button", "ds-btn", "Enable git"); enableGitBtn.id = "dsSessionEnableGit"; enableGitBtn.style.display = "none";
+    pChanges.appendChild(enableGitBtn);
     panels.appendChild(pChanges);
+    overlay._gitControls = { tabPR, tabMerge, commitBtn, pushBtn, revertBtn, msgInput, noGitNote, enableGitBtn };
+    enableGitBtn.onclick = () => { if (overlay._repo) enableGit({ name: overlay._repo, path: "" }); };
     // — Pull request —
     const pPR = el("div", "ds-tab-panel");
     const prTitle = document.createElement("input"); prTitle.id = "dsSessionPrTitle"; prTitle.type = "text"; prTitle.placeholder = "PR title"; prTitle.className = "ds-session-input";
@@ -2253,6 +2417,42 @@ async function loadSessionPanel(repoName, branch) {
   const qp = "name=" + encodeURIComponent(repoName) + (branch ? "&branch=" + encodeURIComponent(branch) : "");
   const sr = await sid("repos/state?" + qp);
   const sd = (sr && sr.data) || {};
+  // Non-git workspace: hide the git-only controls (commit/push/PR/merge/revert),
+  // show a "no git" note + an Enable-git button, and skip the diff/PRs loads
+  // (those routes return not-enabled for a non-git workspace).
+  if (sd.useGit === false) {
+    if (sub) sub.textContent = repoName + " · no git";
+    if (diffWrap) {
+      diffWrap.innerHTML = "";
+      diffWrap.appendChild(el("div", "ds-note", "This workspace isn't under git, so there's no diff or commit history. Enable git to start tracking changes."));
+    }
+    if (overlay._gitControls) {
+      const gc = overlay._gitControls;
+      gc.tabPR.style.display = "none";
+      gc.tabMerge.style.display = "none";
+      gc.commitBtn.style.display = "none";
+      gc.pushBtn.style.display = "none";
+      gc.revertBtn.style.display = "none";
+      gc.msgInput.style.display = "none";
+      gc.noGitNote.style.display = "";
+      gc.enableGitBtn.style.display = "";
+    }
+    overlay.querySelectorAll(".ds-btn-approve").forEach((b) => { b.disabled = true; b.title = "No git."; });
+    return;
+  }
+  // Git workspace: ensure the git-only controls are visible (in case the panel
+  // was previously opened for a non-git workspace).
+  if (overlay._gitControls) {
+    const gc = overlay._gitControls;
+    gc.tabPR.style.display = "";
+    gc.tabMerge.style.display = "";
+    gc.commitBtn.style.display = "";
+    gc.pushBtn.style.display = "";
+    gc.revertBtn.style.display = "";
+    gc.msgInput.style.display = "";
+    gc.noGitNote.style.display = "none";
+    gc.enableGitBtn.style.display = "none";
+  }
   const diffBody = { name: repoName }; if (branch) diffBody.branch = branch;
   const dr = await sid("repos/diff", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(diffBody) });
   const dd = (dr && dr.data) || {};
@@ -2425,14 +2625,8 @@ function buildSidebarRepos() {
   changesBtn.title = "Working changes across all repos"; changesBtn.setAttribute("aria-label", "Working changes");
   changesBtn.onclick = (e) => { e.stopPropagation(); openWorkingChanges(); };
   const addBtn = el("button", "ds-sidebar-icon-btn", "+");
-  addBtn.title = "Connect a folder"; addBtn.setAttribute("aria-label", "Connect a folder");
-  addBtn.onclick = async (e) => {
-    e.stopPropagation();
-    addBtn.disabled = true;
-    const ok = await connectFolderFlow();
-    addBtn.disabled = false;
-    if (ok) refreshLocal();
-  };
+  addBtn.title = "Connect a workspace"; addBtn.setAttribute("aria-label", "Connect a workspace");
+  addBtn.onclick = (e) => { e.stopPropagation(); openConnectMenu(addBtn); };
   head.appendChild(changesBtn); head.appendChild(addBtn);
   head.addEventListener("click", () => toggleSidebarRepos());
   wrap.appendChild(head);
@@ -2453,18 +2647,19 @@ function showRepoWizard() {
     overlay.id = "dsWizardOverlay";
     overlay.setAttribute("role", "dialog");
     overlay.setAttribute("aria-modal", "true");
-    overlay.setAttribute("aria-label", "Connect your repos");
+    overlay.setAttribute("aria-label", "Connect a workspace");
     const card = el("div", "ds-card");
     const head = el("div", "ds-head");
-    head.appendChild(el("h2", null, "Connect your repos"));
+    head.appendChild(el("h2", null, "Connect a workspace"));
     const x = el("button", "ds-x"); x.textContent = "×"; x.title = "Skip"; x.setAttribute("aria-label", "Skip");
     head.appendChild(x);
     card.appendChild(head);
-    card.appendChild(el("div", "ds-note", "Connect a local git repo to start chatting with your codebase — ask questions, get edits, and review diffs before they're applied."));
+    card.appendChild(el("div", "ds-note", "Connect a folder to start chatting with your codebase — ask questions, get edits, and review diffs before they're applied. Git repos get branches and pull requests; plain folders work too with file tools only."));
     const row = el("div", "ds-row ds-approval-row");
     const skipBtn = el("button", "ds-btn ds-btn-ghost", "Skip for now");
-    const connectBtn = el("button", "ds-btn", "Connect a folder");
-    row.appendChild(skipBtn); row.appendChild(connectBtn);
+    const connectBtn = el("button", "ds-btn", "Connect a git repo");
+    const newWsBtn = el("button", "ds-btn", "New workspace…");
+    row.appendChild(skipBtn); row.appendChild(connectBtn); row.appendChild(newWsBtn);
     card.appendChild(row);
     overlay.appendChild(card);
     document.body.appendChild(overlay);
@@ -2472,12 +2667,9 @@ function showRepoWizard() {
     x.onclick = dismiss;
     skipBtn.onclick = dismiss;
     overlay.addEventListener("click", (e) => { if (e.target === overlay) dismiss(); });
-    connectBtn.onclick = async () => {
-      connectBtn.disabled = true;
-      const ok = await connectFolderFlow();
-      connectBtn.disabled = false;
-      if (ok) { refreshLocal(); markRepoWizardSeen(); overlay.classList.remove("open"); }
-    };
+    const afterConnect = (ok) => { if (ok) { refreshLocal(); markRepoWizardSeen(); overlay.classList.remove("open"); } };
+    connectBtn.onclick = async () => { connectBtn.disabled = true; const ok = await connectFolderFlow(); connectBtn.disabled = false; afterConnect(ok); };
+    newWsBtn.onclick = async () => { newWsBtn.disabled = true; const ok = await createWorkspaceFlow(); newWsBtn.disabled = false; afterConnect(ok); };
   }
   overlay.classList.add("open");
 }

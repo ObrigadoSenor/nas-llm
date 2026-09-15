@@ -255,18 +255,26 @@ async fn git_dirty_count(path: &Path) -> usize {
 // agent toolExec relay (keyed by repo.FullName) and the file-tool executor
 // share one lookup path.
 
+// serde default for use_git: old repos.json entries (pre-workspace) lack the
+// field, so they deserialize to true and stay git-enabled.
+fn default_true() -> bool { true }
+
 #[derive(Serialize, Deserialize, Clone, Default)]
 struct RepoRecord {
-    full_name: String,
-    path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    remote: Option<String>,
-    #[serde(default)]
-    branch: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    folder_id: Option<String>,
-    #[serde(default)]
-    linked: bool,
+	full_name: String,
+	path: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	remote: Option<String>,
+	#[serde(default)]
+	branch: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	folder_id: Option<String>,
+	#[serde(default)]
+	linked: bool,
+	#[serde(default = "default_true")]
+	use_git: bool,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	name: Option<String>,
 }
 
 fn registry_path(data_dir: &Path) -> PathBuf {
@@ -292,19 +300,61 @@ fn save_registry(data_dir: &Path, repos: &[RepoRecord]) {
 // upsert_registry inserts or updates a record by full_name, preserving an
 // existing folder_id when the record already exists.
 fn upsert_registry(data_dir: &Path, rec: &RepoRecord) {
-    let mut repos = load_registry(data_dir);
-    if let Some(existing) = repos.iter_mut().find(|r| r.full_name == rec.full_name) {
-        existing.path = rec.path.clone();
-        existing.remote = rec.remote.clone();
-        existing.branch = rec.branch.clone();
-        existing.linked = rec.linked;
-        if rec.folder_id.is_some() {
-            existing.folder_id = rec.folder_id.clone();
-        }
-    } else {
-        repos.push(rec.clone());
-    }
-    save_registry(data_dir, &repos);
+	let mut repos = load_registry(data_dir);
+	if let Some(existing) = repos.iter_mut().find(|r| r.full_name == rec.full_name) {
+		existing.path = rec.path.clone();
+		existing.remote = rec.remote.clone();
+		existing.branch = rec.branch.clone();
+		existing.linked = rec.linked;
+		existing.use_git = rec.use_git;
+		existing.name = rec.name.clone();
+		if rec.folder_id.is_some() {
+			existing.folder_id = rec.folder_id.clone();
+		}
+	} else {
+		repos.push(rec.clone());
+	}
+	save_registry(data_dir, &repos);
+}
+
+// repo_use_git reports whether a connected workspace is git-enabled. Looks up
+// the sidecar registry record by full_name; a record not in the registry (e.g.
+// a workspace-dir-only clone discovered by repos_local, which always has .git)
+// defaults to true, preserving the old behaviour for pre-workspace clones.
+fn repo_use_git(data_dir: &Path, name: &str) -> bool {
+	load_registry(data_dir)
+		.into_iter()
+		.find(|r| r.full_name == name.trim())
+		.map(|r| r.use_git)
+		.unwrap_or(true)
+}
+
+// git_not_enabled is the standard soft response for a git route invoked against
+// a non-git workspace (useGit=false). Returns {ok:false,error} so the UI can
+// surface the reason; used by the branch/PR/commit/diff/revert/ship routes.
+fn git_not_enabled() -> Response {
+	json_ok(&serde_json::json!({ "ok": false, "error": "workspace is not git-enabled" }))
+}
+
+// is_git_tool reports whether an agent tool name requires git (status/log/PRs
+// + commit/push/PR/merge). repos_exec short-circuits these for a non-git
+// workspace so the model gets a clear observation instead of a git failure.
+fn is_git_tool(tool: &str) -> bool {
+	matches!(
+		tool,
+		"git_status" | "git_log" | "list_prs" | "git_commit" | "git_push" | "create_pr" | "merge_pr"
+	)
+}
+
+// is_safe_workspace_name validates a user-chosen workspace name: letters,
+// digits, spaces, dot, dash, underscore only — no slashes (so it can't escape
+// the workspace dir) and no shell metacharacters. Capped at 80 chars.
+fn is_safe_workspace_name(s: &str) -> bool {
+	let t = s.trim();
+	if t.is_empty() || t.len() > 80 {
+		return false;
+	}
+	t.chars().all(|c| c.is_alphanumeric() || c == ' ' || c == '.' || c == '-' || c == '_')
 }
 
 // resolve_repo finds a repo's local root by full_name: linked/registered repos
@@ -649,6 +699,65 @@ async fn git_commit_all(path: &Path, message: &str, token: &str) -> Result<(), S
     Ok(())
 }
 
+// git_init_and_initial_commit turns a plain folder into a git repo in place:
+// `git init -b main`, stage everything, and make an initial (possibly empty)
+// commit so HEAD exists and branch/head/tree can be derived. Used by
+// /repos/create-workspace (useGit=true on a non-git folder) and /repos/init-git
+// (promote a non-git workspace to git-enabled). Returns an error string on
+// failure; the caller surfaces it to the UI.
+async fn git_init_and_initial_commit(path: &Path) -> Result<(), String> {
+    let init = tokio::process::Command::new("git")
+        .arg("init")
+        .arg("-b")
+        .arg("main")
+        .arg(path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await;
+    match init {
+        Ok(o) if !o.status.success() => {
+            let msg = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            return Err(format!(
+                "git init failed: {}",
+                if msg.is_empty() { "unknown error" } else { &msg }
+            ));
+        }
+        Err(e) => return Err(format!("git init failed: {e}")),
+        _ => {}
+    }
+    // Stage everything (an empty dir stages nothing — ignore errors).
+    let _ = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("add")
+        .arg("-A")
+        .output()
+        .await;
+    let commit = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("commit")
+        .arg("-m")
+        .arg("Initial commit")
+        .arg("--allow-empty")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await;
+    match commit {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            let msg = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            Err(format!(
+                "initial commit failed: {}",
+                if msg.is_empty() { "unknown error" } else { &msg }
+            ))
+        }
+        Err(e) => Err(format!("initial commit failed: {e}")),
+    }
+}
+
 // git_push pushes HEAD to origin/<branch>. For a github.com https remote, if a
 // token is available, push to a token-injected URL so a linked repo without a
 // configured credential helper still works; otherwise push via the configured
@@ -852,16 +961,18 @@ struct RepoRow {
 
 #[derive(Serialize)]
 struct LocalRepo {
-    name: String,
-    path: String,
-    branch: String,
-    dirty: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    remote: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    full_name: Option<String>,
-    #[serde(default)]
-    linked: bool,
+	name: String,
+	path: String,
+	branch: String,
+	dirty: usize,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	remote: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	full_name: Option<String>,
+	#[serde(default)]
+	linked: bool,
+	#[serde(default = "default_true")]
+	use_git: bool,
 }
 
 #[derive(Deserialize)]
@@ -953,59 +1064,67 @@ async fn gh_repos(State(st): State<AppState>) -> Response {
 }
 
 async fn repos_local(State(st): State<AppState>) -> Response {
-    let mut out: Vec<LocalRepo> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // Linked/registered repos first (existing folders + cloned repos that have
-    // been recorded in the registry).
-    for r in load_registry(&st.data_dir) {
-        let path = PathBuf::from(&r.path);
-        if !path.is_dir() {
-            continue;
-        }
-        let branch = if r.branch.is_empty() {
-            git_branch(&path).await
-        } else {
-            r.branch.clone()
-        };
-        let dirty = git_dirty_count(&path).await;
-        seen.insert(r.full_name.clone());
-        out.push(LocalRepo {
-            name: r.full_name.clone(),
-            path: path.display().to_string(),
-            branch,
-            dirty,
-            remote: r.remote.clone(),
-            full_name: Some(r.full_name.clone()),
-            linked: r.linked,
-        });
-    }
-    // Cloned workspace repos not yet in the registry (e.g. cloned before this
-    // change). Scanning the workspace dir keeps backward compatibility.
-    let ws = workspace_dir(&st.data_dir);
-    if let Ok(entries) = std::fs::read_dir(&ws) {
-        for e in entries.flatten() {
-            let path = e.path();
-            if !path.is_dir() || !path.join(".git").exists() {
-                continue;
-            }
-            let name = e.file_name().to_string_lossy().replace("--", "/");
-            if seen.contains(&name) {
-                continue;
-            }
-            let branch = git_branch(&path).await;
-            let dirty = git_dirty_count(&path).await;
-            out.push(LocalRepo {
-                name: name.clone(),
-                path: path.display().to_string(),
-                branch,
-                dirty,
-                remote: None,
-                full_name: Some(name),
-                linked: false,
-            });
-        }
-    }
-    json_ok(&out)
+	let mut out: Vec<LocalRepo> = Vec::new();
+	let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+	// Linked/registered workspaces first (existing folders + cloned repos that
+	// have been recorded in the registry).
+	for r in load_registry(&st.data_dir) {
+		let path = PathBuf::from(&r.path);
+		if !path.is_dir() {
+			continue;
+		}
+		let (branch, dirty) = if r.use_git {
+			let br = if r.branch.is_empty() {
+				git_branch(&path).await
+			} else {
+				r.branch.clone()
+			};
+			(br, git_dirty_count(&path).await)
+		} else {
+			// Non-git workspace: no branch, nothing dirty in the git sense.
+			(String::new(), 0)
+		};
+		seen.insert(r.full_name.clone());
+		out.push(LocalRepo {
+			name: r.name.clone().unwrap_or_else(|| r.full_name.clone()),
+			path: path.display().to_string(),
+			branch,
+			dirty,
+			remote: r.remote.clone(),
+			full_name: Some(r.full_name.clone()),
+			linked: r.linked,
+			use_git: r.use_git,
+		});
+	}
+	// Cloned workspace repos not yet in the registry (e.g. cloned before this
+	// change). Scanning the workspace dir keeps backward compatibility. These are
+	// always git clones (they have .git), so use_git=true.
+	let ws = workspace_dir(&st.data_dir);
+	if let Ok(entries) = std::fs::read_dir(&ws) {
+		for e in entries.flatten() {
+			let path = e.path();
+			if !path.is_dir() || !path.join(".git").exists() {
+				continue;
+			}
+			let name = e.file_name().to_string_lossy().replace("--", "/");
+			if seen.contains(&name) {
+				continue;
+			}
+			let branch = git_branch(&path).await;
+			let dirty = git_dirty_count(&path).await;
+			out.push(LocalRepo {
+				name: name.clone(),
+				path: path.display().to_string(),
+				branch,
+				dirty,
+				remote: None,
+				full_name: Some(name),
+				linked: false,
+				use_git: true,
+			});
+		}
+	}
+	json_ok(&out)
 }
 
 async fn repos_clone(State(st): State<AppState>, Json(body): Json<CloneBody>) -> Response {
@@ -1048,6 +1167,8 @@ async fn repos_clone(State(st): State<AppState>, Json(body): Json<CloneBody>) ->
             branch: branch.clone(),
             folder_id: None,
             linked: false,
+            use_git: true,
+            name: Some(full_name.clone()),
         },
     );
     let _ = push_repo_context(&st, &full_name, &dest, &branch, &head, &tree).await;
@@ -1063,6 +1184,7 @@ async fn repos_clone(State(st): State<AppState>, Json(body): Json<CloneBody>) ->
 
 async fn repos_refresh(State(st): State<AppState>, Json(body): Json<NameBody>) -> Response {
     let name = body.name.trim().to_string();
+    if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
     let dest = match resolve_repo(&st.data_dir, &name) {
         Some(p) => p,
         None => return json_err("not found locally", StatusCode::NOT_FOUND),
@@ -1150,6 +1272,7 @@ async fn git_branches(path: &Path) -> (String, Vec<(String, bool)>) {
 // tracking checkout. Used by the UI branch picker.
 async fn repos_branches(State(st): State<AppState>, Json(body): Json<NameBody>) -> Response {
     let name = body.name.trim().to_string();
+    if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
     let dest = match resolve_repo(&st.data_dir, &name) {
         Some(p) => p,
         None => return json_err("not found locally", StatusCode::NOT_FOUND),
@@ -1178,6 +1301,7 @@ struct CheckoutBody {
 // so the agent loop sees the new branch, and updates the sidecar registry.
 async fn repos_checkout(State(st): State<AppState>, Json(body): Json<CheckoutBody>) -> Response {
     let name = body.repo.trim().to_string();
+    if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
     let branch = body.branch.trim().to_string();
     if branch.is_empty() {
         return json_err("branch is required", StatusCode::BAD_REQUEST);
@@ -1230,6 +1354,7 @@ async fn repos_checkout(State(st): State<AppState>, Json(body): Json<CheckoutBod
 // user can review agent-made edits in the Working changes panel.
 async fn repos_diff(State(st): State<AppState>, Json(body): Json<NameBody>) -> Response {
     let name = body.name.trim().to_string();
+    if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
     let dest = match resolve_repo_branch(&st.data_dir, &name, &body.branch).await {
         Ok(p) => p,
         Err((status, e)) => return json_err(&e, status),
@@ -1254,6 +1379,7 @@ async fn repos_diff(State(st): State<AppState>, Json(body): Json<NameBody>) -> R
 // patch without a terminal. Returns the git status after reverting.
 async fn repos_revert(State(st): State<AppState>, Json(body): Json<NameBody>) -> Response {
     let name = body.name.trim().to_string();
+    if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
     let dest = match resolve_repo_branch(&st.data_dir, &name, &body.branch).await {
         Ok(p) => p,
         Err((status, e)) => return json_err(&e, status),
@@ -1316,6 +1442,21 @@ struct ExecResult {
 // observation. All tools are scoped to the repo root with path-traversal guards.
 async fn repos_exec(State(st): State<AppState>, Json(body): Json<ExecBody>) -> Response {
     let repo_name = body.repo.trim().to_string();
+    // Non-git workspace: short-circuit git tools (git_status/git_log/list_prs/
+    // git_commit/git_push/create_pr/merge_pr) with a clear observation so the
+    // model learns git isn't available instead of hitting a raw git failure. File
+    // tools run unchanged below.
+    if !repo_use_git(&st.data_dir, &repo_name) && is_git_tool(&body.tool) {
+        return json_ok(&ExecResult {
+            observation: format!(
+                "Git is not enabled for workspace \"{repo_name}\". The {tool} tool is unavailable — this workspace is a plain folder with no git history. Use the file tools (read_file, list_files, grep, edit_file, write_file) instead.",
+                tool = body.tool
+            ),
+            preview: "git not enabled".into(),
+            is_error: true,
+            ..Default::default()
+        });
+    }
     let main = match resolve_repo(&st.data_dir, &repo_name) {
         Some(p) => p,
         None => return json_ok(&ExecResult {
@@ -3254,100 +3395,179 @@ fn top_level_tree(root: &Path) -> Vec<String> {
 
 // push_repo_context POSTs the repo context to the backend's /api/repos so the
 // agent loop can inject it into the system prompt. Uses the session cookie from
-// the sidecar's jar. Best-effort: failures are logged but not surfaced.
+// the sidecar's jar. Resolves the workspace's display name + use_git from the
+// sidecar registry (defaults: name=full_name, use_git=true for pre-workspace
+// clones not in the registry). Best-effort: failures are logged but not surfaced.
 async fn push_repo_context(st: &AppState, full_name: &str, dest: &Path, branch: &str, head: &str, tree: &[String]) -> Result<(), String> {
-    let backend = st.backend().await;
-    let cookie = st.cookie_value().await;
-    let url = format!("{}/api/repos", backend.trim_end_matches('/'));
-    let body = serde_json::json!({
-        "fullName": full_name,
-        "localPath": dest.display().to_string(),
-        "branch": branch,
-        "head": head,
-        "tree": tree,
-    });
-    let mut req = st.client.post(&url).json(&body).timeout(std::time::Duration::from_secs(8));
-    if let Some(cv) = cookie {
-        req = req.header(reqwest::header::COOKIE, format!("{}={}", crate::sidecar::SESSION_COOKIE, cv));
-    }
-    match req.send().await {
-        Ok(r) if r.status().is_success() => Ok(()),
-        Ok(r) => Err(format!("backend returned {}", r.status())),
-        Err(e) => Err(e.to_string()),
-    }
+	let backend = st.backend().await;
+	let cookie = st.cookie_value().await;
+	let url = format!("{}/api/repos", backend.trim_end_matches('/'));
+	let rec = load_registry(&st.data_dir)
+		.into_iter()
+		.find(|r| r.full_name == full_name.trim());
+	let name = rec
+		.as_ref()
+		.and_then(|r| r.name.clone())
+		.unwrap_or_else(|| full_name.to_string());
+	let use_git = rec.as_ref().map(|r| r.use_git).unwrap_or(true);
+	let body = serde_json::json!({
+		"fullName": full_name,
+		"name": name,
+		"useGit": use_git,
+		"localPath": dest.display().to_string(),
+		"branch": branch,
+		"head": head,
+		"tree": tree,
+	});
+	let mut req = st.client.post(&url).json(&body).timeout(std::time::Duration::from_secs(8));
+	if let Some(cv) = cookie {
+		req = req.header(reqwest::header::COOKIE, format!("{}={}", crate::sidecar::SESSION_COOKIE, cv));
+	}
+	match req.send().await {
+		Ok(r) if r.status().is_success() => Ok(()),
+		Ok(r) => Err(format!("backend returned {}", r.status())),
+		Err(e) => Err(e.to_string()),
+	}
 }
 
 // --- Connect an existing local folder (folder-picker wizard) ----------------
 
 #[derive(Deserialize)]
 struct AddLocalBody {
-    path: String,
+	path: String,
+	#[serde(default)]
+	name: Option<String>,
+	#[serde(default)]
+	use_git: Option<bool>,
 }
 
-// repos_add_local connects an existing on-disk git repo (picked via the native
-// folder dialog) as a workspace. It resolves the repo root so a sub-folder
-// selection still works, derives a full_name from the origin remote (owner/repo
-// for github.com, else the folder basename), records it in the sidecar registry,
-// and pushes repo context to the backend so agent runs can inject it.
+// repos_add_local connects an existing on-disk folder as a workspace. If the
+// folder is (or is inside) a git repo, it behaves as before: resolves the repo
+// root, derives full_name from the origin remote (owner/repo for github.com,
+// else the folder basename), and registers a git-enabled workspace. If the
+// folder is NOT a git repo, it can only be connected as a non-git workspace
+// (useGit=false) and requires a user-provided name; useGit=true on a non-git
+// folder is an error pointing at /repos/create-workspace (which can git-init in
+// place) or /repos/init-git (after connecting without git). Records it in the
+// sidecar registry and pushes context to the backend so agent runs can inject it.
 async fn repos_add_local(State(st): State<AppState>, Json(body): Json<AddLocalBody>) -> Response {
-    let raw = body.path.trim().to_string();
-    if raw.is_empty() {
-        return json_err("path is required", StatusCode::BAD_REQUEST);
-    }
-    let p = PathBuf::from(&raw);
-    if !p.is_dir() {
-        return json_err("path is not a directory", StatusCode::BAD_REQUEST);
-    }
-    let root = match git_toplevel(&p).await {
-        Some(r) => r,
-        None => {
-            return json_err(
-                "not a git repository (run `git init` first, or pick the repo root)",
-                StatusCode::BAD_REQUEST,
-            )
-        }
-    };
-    let remote = git_remote_url(&root).await;
-    let full_name = derive_full_name(remote.as_deref(), &root);
-    let branch = git_branch(&root).await;
-    let head = git_head(&root).await;
-    let tree = top_level_tree(&root);
-    upsert_registry(
-        &st.data_dir,
-        &RepoRecord {
-            full_name: full_name.clone(),
-            path: root.display().to_string(),
-            remote: remote.clone(),
-            branch: branch.clone(),
-            folder_id: None,
-            linked: true,
-        },
-    );
-    // Best-effort: a failure here (e.g. not signed in yet) doesn't fail add.
-    let _ = push_repo_context(&st, &full_name, &root, &branch, &head, &tree).await;
-    json_ok(&serde_json::json!({
-        "ok": true,
-        "name": full_name,
-        "fullName": full_name,
-        "path": root.display().to_string(),
-        "branch": branch,
-        "head": head,
-        "remote": remote,
-        "tree": tree,
-    }))
+	let raw = body.path.trim().to_string();
+	if raw.is_empty() {
+		return json_err("path is required", StatusCode::BAD_REQUEST);
+	}
+	let p = PathBuf::from(&raw);
+	if !p.is_dir() {
+		return json_err("path is not a directory", StatusCode::BAD_REQUEST);
+	}
+	// Existing git repo: derive full_name from the origin remote, git-enabled.
+	if let Some(root) = git_toplevel(&p).await {
+		let remote = git_remote_url(&root).await;
+		let full_name = derive_full_name(remote.as_deref(), &root);
+		let branch = git_branch(&root).await;
+		let head = git_head(&root).await;
+		let tree = top_level_tree(&root);
+		upsert_registry(
+			&st.data_dir,
+			&RepoRecord {
+				full_name: full_name.clone(),
+				path: root.display().to_string(),
+				remote: remote.clone(),
+				branch: branch.clone(),
+				folder_id: None,
+				linked: true,
+				use_git: true,
+				name: Some(full_name.clone()),
+			},
+		);
+		let _ = push_repo_context(&st, &full_name, &root, &branch, &head, &tree).await;
+		return json_ok(&serde_json::json!({
+			"ok": true,
+			"name": full_name,
+			"fullName": full_name,
+			"path": root.display().to_string(),
+			"branch": branch,
+			"head": head,
+			"remote": remote,
+			"tree": tree,
+			"useGit": true,
+		}));
+	}
+	// Not a git repo: only register as a non-git workspace when the user opted
+	// in (useGit=false) and provided a name. useGit=true on a non-git folder is an
+	// error — point them at create-workspace (which can git-init) or init-git.
+	let use_git = body.use_git.unwrap_or(false);
+	if use_git {
+		return json_err(
+			"not a git repository. Use /repos/create-workspace with useGit=true to git-init it in place, or connect it without git and run /repos/init-git later.",
+			StatusCode::BAD_REQUEST,
+		);
+	}
+	let name = match body.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+		Some(n) => n.to_string(),
+		None => {
+			return json_err(
+				"name is required to connect a non-git folder as a workspace",
+				StatusCode::BAD_REQUEST,
+			)
+		}
+	};
+	if !is_safe_workspace_name(&name) {
+		return json_err(
+			"name must be a simple token (letters, digits, space, dot, dash, underscore — no slashes or shell metacharacters)",
+			StatusCode::BAD_REQUEST,
+		);
+	}
+	if load_registry(&st.data_dir).iter().any(|r| r.full_name == name) {
+		return json_err(
+			"a workspace with that name is already connected",
+			StatusCode::CONFLICT,
+		);
+	}
+	let root = match p.canonicalize() {
+		Ok(r) => r,
+		Err(_) => p,
+	};
+	let tree = top_level_tree(&root);
+	upsert_registry(
+		&st.data_dir,
+		&RepoRecord {
+			full_name: name.clone(),
+			path: root.display().to_string(),
+			remote: None,
+			branch: String::new(),
+			folder_id: None,
+			linked: true,
+			use_git: false,
+			name: Some(name.clone()),
+		},
+	);
+	let _ = push_repo_context(&st, &name, &root, "", "", &tree).await;
+	json_ok(&serde_json::json!({
+		"ok": true,
+		"name": name,
+		"fullName": name,
+		"path": root.display().to_string(),
+		"branch": "",
+		"head": "",
+		"remote": null,
+		"tree": tree,
+		"useGit": false,
+	}))
 }
 
 // --- Scan a folder for one or more git repos (sidebar connect wizard) ------
 
 #[derive(Deserialize)]
 struct ScanBody {
-    path: String,
+	path: String,
 }
 
 #[derive(Serialize, Clone)]
 struct ScanCandidate {
-    name: String,
-    path: String,
+	name: String,
+	path: String,
+	#[serde(default)]
+	git: bool,
 }
 
 // repos_scan_local resolves what a picked folder should connect as: if the
@@ -3355,38 +3575,49 @@ struct ScanCandidate {
 // (preserves the original one-repo-root behavior). Otherwise its immediate
 // subdirectories are scanned (one level deep) for a `.git` entry so a parent
 // folder containing several repos (e.g. a projects directory) yields a list
-// of candidates the renderer can offer as a checklist, instead of erroring.
+// of candidates the renderer can offer as a checklist, instead of erroring. If
+// no git repo is found at all, the picked folder itself is returned as a single
+// non-git candidate (git=false) so the picker can offer "track without git".
 async fn repos_scan_local(Json(body): Json<ScanBody>) -> Response {
-    let raw = body.path.trim().to_string();
-    if raw.is_empty() {
-        return json_err("path is required", StatusCode::BAD_REQUEST);
-    }
-    let p = PathBuf::from(&raw);
-    if !p.is_dir() {
-        return json_err("path is not a directory", StatusCode::BAD_REQUEST);
-    }
-    if let Some(root) = git_toplevel(&p).await {
-        let remote = git_remote_url(&root).await;
-        let name = derive_full_name(remote.as_deref(), &root);
-        return json_ok(&serde_json::json!({
-            "ok": true,
-            "repos": [ScanCandidate { name, path: root.display().to_string() }],
-        }));
-    }
-    let mut candidates: Vec<ScanCandidate> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&p) {
-        for e in entries.flatten() {
-            let child = e.path();
-            if !child.is_dir() || !child.join(".git").exists() {
-                continue;
-            }
-            let remote = git_remote_url(&child).await;
-            let name = derive_full_name(remote.as_deref(), &child);
-            candidates.push(ScanCandidate { name, path: child.display().to_string() });
-        }
-    }
-    candidates.sort_by(|a, b| a.name.cmp(&b.name));
-    json_ok(&serde_json::json!({ "ok": true, "repos": candidates }))
+	let raw = body.path.trim().to_string();
+	if raw.is_empty() {
+		return json_err("path is required", StatusCode::BAD_REQUEST);
+	}
+	let p = PathBuf::from(&raw);
+	if !p.is_dir() {
+		return json_err("path is not a directory", StatusCode::BAD_REQUEST);
+	}
+	if let Some(root) = git_toplevel(&p).await {
+		let remote = git_remote_url(&root).await;
+		let name = derive_full_name(remote.as_deref(), &root);
+		return json_ok(&serde_json::json!({
+			"ok": true,
+			"repos": [ScanCandidate { name, path: root.display().to_string(), git: true }],
+		}));
+	}
+	let mut candidates: Vec<ScanCandidate> = Vec::new();
+	if let Ok(entries) = std::fs::read_dir(&p) {
+		for e in entries.flatten() {
+			let child = e.path();
+			if !child.is_dir() || !child.join(".git").exists() {
+				continue;
+			}
+			let remote = git_remote_url(&child).await;
+			let name = derive_full_name(remote.as_deref(), &child);
+			candidates.push(ScanCandidate { name, path: child.display().to_string(), git: true });
+		}
+	}
+	if candidates.is_empty() {
+		// No git repo here or one level down: offer the picked folder itself as a
+		// non-git workspace candidate so the picker can offer "track without git".
+		let name = p
+			.file_name()
+			.map(|n| n.to_string_lossy().to_string())
+			.unwrap_or_else(|| "workspace".to_string());
+		candidates.push(ScanCandidate { name, path: p.display().to_string(), git: false });
+	}
+	candidates.sort_by(|a, b| a.name.cmp(&b.name));
+	json_ok(&serde_json::json!({ "ok": true, "repos": candidates }))
 }
 
 // --- Ship changes: changelog preview + commit/push -------------------------
@@ -3396,6 +3627,7 @@ async fn repos_scan_local(Json(body): Json<ScanBody>) -> Response {
 // pre-fill and gate the Push button (Push only makes sense with a remote).
 async fn repos_changelog(State(st): State<AppState>, Json(body): Json<NameBody>) -> Response {
     let name = body.name.trim().to_string();
+    if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
     let dest = match resolve_repo_branch(&st.data_dir, &name, &body.branch).await {
         Ok(p) => p,
         Err((status, e)) => return json_err(&e, status),
@@ -3449,6 +3681,7 @@ struct ShipBody {
 // configured origin. The token is scrubbed from any captured output.
 async fn repos_ship(State(st): State<AppState>, Json(body): Json<ShipBody>) -> Response {
     let name = body.repo.trim().to_string();
+    if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
     let dest = match resolve_repo_branch(&st.data_dir, &name, &body.branch).await {
         Ok(p) => p,
         Err((status, e)) => return json_err(&e, status),
@@ -3906,6 +4139,7 @@ struct BranchBody {
 // context to the backend with the new branch (best-effort).
 async fn repos_branch(State(st): State<AppState>, Json(body): Json<BranchBody>) -> Response {
     let name = body.name.trim().to_string();
+    if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
     let title = body.title.trim().to_string();
     let dest = match resolve_repo(&st.data_dir, &name) {
         Some(p) => p,
@@ -3993,6 +4227,7 @@ struct CreateBranchBody {
 // otherwise.
 async fn repos_create_branch(State(st): State<AppState>, Json(body): Json<CreateBranchBody>) -> Response {
     let name = body.name.trim().to_string();
+    if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
     let branch = body.branch.trim().to_string();
     if branch.is_empty() {
         return json_ok(&serde_json::json!({ "ok": false, "branch": "", "isolated": false, "error": "branch is required" }));
@@ -4087,6 +4322,19 @@ struct StateQuery {
 // remote is configured. ahead/behind are 0/0 when the upstream ref is absent.
 async fn repos_state(State(st): State<AppState>, Query(q): Query<StateQuery>) -> Response {
     let name = q.name.trim().to_string();
+    // Non-git workspace: no branch/dirty/ahead/behind/remote. The UI hides the
+    // git controls when useGit is false.
+    if !repo_use_git(&st.data_dir, &name) {
+        return json_ok(&serde_json::json!({
+            "name": name,
+            "branch": "",
+            "dirty": 0,
+            "ahead": 0,
+            "behind": 0,
+            "hasRemote": false,
+            "useGit": false,
+        }));
+    }
     let dest = match resolve_repo_branch(&st.data_dir, &name, &q.branch).await {
         Ok(p) => p,
         Err((status, e)) => return json_err(&e, status),
@@ -4110,6 +4358,7 @@ async fn repos_state(State(st): State<AppState>, Query(q): Query<StateQuery>) ->
         "ahead": ahead,
         "behind": behind,
         "hasRemote": has_remote,
+        "useGit": true,
     }))
 }
 
@@ -4128,6 +4377,7 @@ struct CommitBody {
 // but the repo has no remote, returns {ok:false, error:"no remote configured"}.
 async fn repos_commit(State(st): State<AppState>, Json(body): Json<CommitBody>) -> Response {
     let name = body.repo.trim().to_string();
+    if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
     let dest = match resolve_repo_branch(&st.data_dir, &name, &body.branch).await {
         Ok(p) => p,
         Err((status, e)) => return json_err(&e, status),
@@ -4198,6 +4448,7 @@ struct CreatePrBody {
 // no remote, or the push/PR call fails.
 async fn repos_create_pr(State(st): State<AppState>, Json(body): Json<CreatePrBody>) -> Response {
     let name = body.repo.trim().to_string();
+    if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
     let dest = match resolve_repo_branch(&st.data_dir, &name, &body.branch).await {
         Ok(p) => p,
         Err((status, e)) => return json_err(&e, status),
@@ -4227,6 +4478,7 @@ async fn repos_create_pr(State(st): State<AppState>, Json(body): Json<CreatePrBo
 // Reuses list_prs_for_repo so it stays in sync with the agent's list_prs tool.
 async fn repos_prs(State(st): State<AppState>, Query(q): Query<StateQuery>) -> Response {
     let name = q.name.trim().to_string();
+    if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
     let dest = match resolve_repo_branch(&st.data_dir, &name, &q.branch).await {
         Ok(p) => p,
         Err((status, e)) => return json_err(&e, status),
@@ -4253,6 +4505,7 @@ struct MergePrBody {
 // {ok:false, error}. method defaults to "merge".
 async fn repos_merge_pr(State(st): State<AppState>, Json(body): Json<MergePrBody>) -> Response {
     let name = body.repo.trim().to_string();
+    if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
     let dest = match resolve_repo_branch(&st.data_dir, &name, &body.branch).await {
         Ok(p) => p,
         Err((status, e)) => return json_err(&e, status),
@@ -4281,6 +4534,7 @@ struct WorktreeBody {
 // (or reused) is already there.
 async fn repos_worktree(State(st): State<AppState>, Json(body): Json<WorktreeBody>) -> Response {
     let name = body.name.trim().to_string();
+    if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
     let branch = body.branch.trim().to_string();
     if branch.is_empty() {
         return json_ok(&serde_json::json!({
@@ -4307,6 +4561,156 @@ async fn repos_worktree(State(st): State<AppState>, Json(body): Json<WorktreeBod
     }
 }
 
+// --- Create a new workspace (named, optional git) ---------------------------
+
+#[derive(Deserialize)]
+struct CreateWorkspaceBody {
+    path: String,
+    name: String,
+    #[serde(default)]
+    use_git: Option<bool>,
+}
+
+// repos_create_workspace registers a local folder as a workspace, optionally
+// initializing git. Unlike repos_add_local (which connects an EXISTING git
+// repo), this is the "new workspace" path: the user picked a folder and chose a
+// name + whether to track it with git. When useGit=true on a non-git folder it
+// runs git init + an initial commit in place; when useGit=false it registers
+// the plain folder as-is (file tools work, git tools/routes are hidden).
+// Validates the name (safe token, unique), records it in the sidecar registry,
+// and pushes context to the backend. full_name is the user-provided name (the
+// unique key); the display name equals it.
+async fn repos_create_workspace(State(st): State<AppState>, Json(body): Json<CreateWorkspaceBody>) -> Response {
+    let raw_path = body.path.trim().to_string();
+    let name = body.name.trim().to_string();
+    if raw_path.is_empty() {
+        return json_err("path is required", StatusCode::BAD_REQUEST);
+    }
+    if name.is_empty() {
+        return json_err("name is required", StatusCode::BAD_REQUEST);
+    }
+    if !is_safe_workspace_name(&name) {
+        return json_err(
+            "name must be a simple token (letters, digits, space, dot, dash, underscore — no slashes or shell metacharacters)",
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    if load_registry(&st.data_dir).iter().any(|r| r.full_name == name) {
+        return json_err(
+            "a workspace with that name is already connected",
+            StatusCode::CONFLICT,
+        );
+    }
+    let p = PathBuf::from(&raw_path);
+    if !p.is_dir() {
+        return json_err("path is not a directory", StatusCode::BAD_REQUEST);
+    }
+    let use_git = body.use_git.unwrap_or(true);
+    let is_git_already = git_toplevel(&p).await.is_some();
+    if use_git && !is_git_already {
+        if let Err(e) = git_init_and_initial_commit(&p).await {
+            return json_err(&e, StatusCode::BAD_GATEWAY);
+        }
+    }
+    let root = if is_git_already || use_git {
+        git_toplevel(&p).await.unwrap_or_else(|| p.clone())
+    } else {
+        match p.canonicalize() {
+            Ok(r) => r,
+            Err(_) => p,
+        }
+    };
+    let (branch, head, tree) = if use_git {
+        (
+            git_branch(&root).await,
+            git_head(&root).await,
+            top_level_tree(&root),
+        )
+    } else {
+        (String::new(), String::new(), top_level_tree(&root))
+    };
+    let remote = if use_git { git_remote_url(&root).await } else { None };
+    let full_name = name.clone();
+    upsert_registry(
+        &st.data_dir,
+        &RepoRecord {
+            full_name: full_name.clone(),
+            path: root.display().to_string(),
+            remote: remote.clone(),
+            branch: branch.clone(),
+            folder_id: None,
+            linked: true,
+            use_git,
+            name: Some(name.clone()),
+        },
+    );
+    let _ = push_repo_context(&st, &full_name, &root, &branch, &head, &tree).await;
+    json_ok(&serde_json::json!({
+        "ok": true,
+        "name": full_name,
+        "fullName": full_name,
+        "path": root.display().to_string(),
+        "branch": branch,
+        "head": head,
+        "remote": remote,
+        "tree": tree,
+        "useGit": use_git,
+    }))
+}
+
+// --- Promote a non-git workspace to git-enabled ------------------------------
+
+#[derive(Deserialize)]
+struct InitGitBody {
+    name: String,
+}
+
+// repos_init_git promotes a non-git workspace to git-enabled in place: runs
+// git init + an initial commit on the workspace folder, flips the registry
+// record's use_git to true, re-derives branch/head/tree, and re-pushes context
+// to the backend. The workspace keeps its full_name (and display name). If it
+// was already git-enabled, returns ok with alreadyGit=true (no-op).
+async fn repos_init_git(State(st): State<AppState>, Json(body): Json<InitGitBody>) -> Response {
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return json_err("name is required", StatusCode::BAD_REQUEST);
+    }
+    let mut repos = load_registry(&st.data_dir);
+    let rec = match repos.iter_mut().find(|r| r.full_name == name) {
+        Some(r) => r,
+        None => return json_err("workspace not found in registry", StatusCode::NOT_FOUND),
+    };
+    if rec.use_git {
+        return json_ok(&serde_json::json!({ "ok": true, "alreadyGit": true, "error": null }));
+    }
+    let root = PathBuf::from(&rec.path);
+    if !root.is_dir() {
+        return json_err("workspace path is not a directory", StatusCode::BAD_REQUEST);
+    }
+    if let Err(e) = git_init_and_initial_commit(&root).await {
+        return json_err(&e, StatusCode::BAD_GATEWAY);
+    }
+    rec.use_git = true;
+    rec.branch = git_branch(&root).await;
+    let head = git_head(&root).await;
+    let tree = top_level_tree(&root);
+    rec.remote = git_remote_url(&root).await;
+    let branch = rec.branch.clone();
+    let remote = rec.remote.clone();
+    save_registry(&st.data_dir, &repos);
+    let _ = push_repo_context(&st, &name, &root, &branch, &head, &tree).await;
+    json_ok(&serde_json::json!({
+        "ok": true,
+        "alreadyGit": false,
+        "name": name,
+        "branch": branch,
+        "head": head,
+        "remote": remote,
+        "tree": tree,
+        "error": null,
+    }))
+}
+
 // --- router ----------------------------------------------------------------
 
 pub fn router(state: AppState) -> Router {
@@ -4317,6 +4721,8 @@ pub fn router(state: AppState) -> Router {
         .route("/__sidecar/github/repos", get(gh_repos))
         .route("/__sidecar/repos/local", get(repos_local))
         .route("/__sidecar/repos/add-local", post(repos_add_local))
+        .route("/__sidecar/repos/create-workspace", post(repos_create_workspace))
+        .route("/__sidecar/repos/init-git", post(repos_init_git))
         .route("/__sidecar/repos/scan-local", post(repos_scan_local))
         .route("/__sidecar/repos/clone", post(repos_clone))
         .route("/__sidecar/repos/refresh", post(repos_refresh))
@@ -4783,6 +5189,68 @@ mod tests {
         let capped = cap_ssh_observation(&multi);
         std::str::from_utf8(capped.as_bytes()).expect("valid utf-8");
         assert!(capped.ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn is_safe_workspace_name_accepts_plain_tokens() {
+        // letters, digits, spaces, dot, dash, underscore are fine.
+        assert!(is_safe_workspace_name("notes"));
+        assert!(is_safe_workspace_name("My Notes 2024"));
+        assert!(is_safe_workspace_name("proj.v2"));
+        assert!(is_safe_workspace_name("scratch-pad"));
+        assert!(is_safe_workspace_name("tmp_3"));
+        // reject empty, slashes (path escape), shell metacharacters, too long.
+        assert!(!is_safe_workspace_name(""));
+        assert!(!is_safe_workspace_name("   "));
+        assert!(!is_safe_workspace_name("a/b"));
+        assert!(!is_safe_workspace_name("..\\secret"));
+        assert!(!is_safe_workspace_name("a;rm -rf /"));
+        assert!(!is_safe_workspace_name("$(whoami)"));
+        assert!(!is_safe_workspace_name("a`x`"));
+        let long = "w".repeat(81);
+        assert!(!is_safe_workspace_name(&long));
+        // 80 chars is still allowed (the cap is inclusive).
+        let max = "w".repeat(80);
+        assert!(is_safe_workspace_name(&max));
+    }
+
+    #[test]
+    fn repo_use_git_defaults_true_for_unregistered() {
+        let dir = tempfile::tempdir().unwrap();
+        // A name with no registry record (e.g. a workspace-dir-only clone
+        // discovered by repos_local, which always has .git) defaults to true so
+        // pre-workspace clones keep behaving as git repos.
+        assert!(repo_use_git(dir.path(), "owner/repo"));
+    }
+
+    #[tokio::test]
+    async fn git_routes_gate_on_non_git_workspace() {
+        // Build a registry with one non-git workspace and assert the gating
+        // helpers behave: repo_use_git returns false for it, and the shared
+        // git_not_enabled response shape is the {ok:false,error} the UI expects.
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+        upsert_registry(
+            data_dir,
+            &RepoRecord {
+                full_name: "scratch".into(),
+                path: data_dir.join("scratch").display().to_string(),
+                remote: None,
+                branch: String::new(),
+                folder_id: None,
+                linked: true,
+                use_git: false,
+                name: Some("scratch".into()),
+            },
+        );
+        assert!(!repo_use_git(data_dir, "scratch"), "non-git record should gate");
+        assert!(repo_use_git(data_dir, "other"), "unregistered name defaults to git");
+        // git_not_enabled is a Response; check its JSON body has the soft shape.
+        let resp = git_not_enabled();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let s = String::from_utf8_lossy(&body);
+        assert!(s.contains("\"ok\":false"), "got: {s}");
+        assert!(s.contains("workspace is not git-enabled"), "got: {s}");
     }
 }
 
