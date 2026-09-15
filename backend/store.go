@@ -80,6 +80,19 @@ type Repo struct {
 	CreatedAt int64    `json:"createdAt"`
 }
 
+// SSHHost is an allowlisted SSH alias a user has registered so the agent can
+// target it with the ssh_* tools. Stores only the alias (resolved via the
+// desktop's ~/.ssh/config) and a human description — no credentials. Keyed by
+// (email, alias); the alias is restricted to a safe bare-token charset so it
+// can be passed to ssh as a single argv element.
+type SSHHost struct {
+	ID          string `json:"id"`
+	Email       string `json:"-"`
+	Alias       string `json:"alias"`
+	Description string `json:"description"`
+	CreatedAt   int64  `json:"createdAt"`
+}
+
 type store struct {
 	db *sql.DB
 }
@@ -205,6 +218,15 @@ CREATE TABLE IF NOT EXISTS repos (
 	UNIQUE(email, full_name)
 );
 CREATE INDEX IF NOT EXISTS idx_repos_email ON repos(email);
+CREATE TABLE IF NOT EXISTS ssh_hosts (
+	id TEXT PRIMARY KEY,
+	email TEXT NOT NULL,
+	alias TEXT NOT NULL,
+	description TEXT NOT NULL DEFAULT '',
+	created_at INTEGER NOT NULL,
+	UNIQUE(email, alias)
+);
+CREATE INDEX IF NOT EXISTS idx_ssh_hosts_email ON ssh_hosts(email);
 `
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("schema: %w", err)
@@ -1023,4 +1045,58 @@ func (s *store) getRepo(email, id string) (*Repo, error) {
 	_ = json.Unmarshal([]byte(treeJSON), &r.Tree)
 	r.Email = email
 	return &r, nil
+}
+
+// --- SSH hosts (allowlist for the agent's ssh_* tools) ---------------------
+
+// listSSHHosts returns a user's allowlisted SSH aliases (no credentials), most
+// recently added first. Used by toolRegistry to build the host enum, by
+// availableTools to gate the menu, and by runGeneration to decide whether to
+// wire the toolExec relay for ssh tools.
+func (s *store) listSSHHosts(email string) ([]SSHHost, error) {
+	rows, err := s.db.Query(`SELECT id, alias, description, created_at FROM ssh_hosts WHERE email = ? ORDER BY created_at DESC`, email)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SSHHost
+	for rows.Next() {
+		var h SSHHost
+		if err := rows.Scan(&h.ID, &h.Alias, &h.Description, &h.CreatedAt); err != nil {
+			return nil, err
+		}
+		h.Email = email
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+
+// upsertSSHHost adds or updates a user's SSH host alias. Keyed by (email,
+// alias) so re-pushing refreshes the description and keeps the id. The alias is
+// assumed already validated (isSSHAlias) by the caller.
+func (s *store) upsertSSHHost(email, alias, description string) (*SSHHost, error) {
+	id := s.newFolderID() // reuse the random-ID helper
+	now := time.Now().UnixMilli()
+	if _, err := s.db.Exec(`INSERT INTO ssh_hosts(id, email, alias, description, created_at)
+		VALUES(?, ?, ?, ?, ?)
+		ON CONFLICT(email, alias) DO UPDATE SET description=excluded.description`,
+		id, email, alias, description, now); err != nil {
+		return nil, err
+	}
+	var existingID string
+	if err := s.db.QueryRow(`SELECT id FROM ssh_hosts WHERE email = ? AND alias = ?`, email, alias).Scan(&existingID); err != nil {
+		return nil, err
+	}
+	return &SSHHost{ID: existingID, Email: email, Alias: alias, Description: description, CreatedAt: now}, nil
+}
+
+// deleteSSHHost removes a user's SSH host alias by alias. Returns true if a row
+// was deleted, false if it was not found.
+func (s *store) deleteSSHHost(email, alias string) (bool, error) {
+	res, err := s.db.Exec(`DELETE FROM ssh_hosts WHERE email = ? AND alias = ?`, email, alias)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }

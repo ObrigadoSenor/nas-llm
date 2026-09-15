@@ -206,6 +206,7 @@ function buildOverlay() {
   };
   refreshOllama();
 
+  addSSHHostsSection(card);
   addUpdatesSection(card);
 
   overlay.appendChild(card);
@@ -258,6 +259,76 @@ function fillOverlay() {
   if (u && !u.value) u.value = state.backend_url || "";
   const a = $("dsAuthOut");
   if (a) a.textContent = state.authed ? ("Signed in as " + (state.email || "?")) : "Not signed in.";
+}
+
+// --- SSH hosts section (allowlist for the agent's ssh_* tools) ---
+// The agent can target only aliases the user registers here. Each alias resolves
+// via the desktop's ~/.ssh/config — no credentials are stored in the app. Hosts
+// are persisted backend-side (per user) via the /api/* reverse proxy, so they're
+// shared across devices. Add/remove updates the agent tool menu live on reload.
+function addSSHHostsSection(card) {
+  card.appendChild(el("div", "ds-label", "SSH hosts"));
+  card.appendChild(el("div", "ds-note", "Allowlist of SSH aliases the agent may target. Each resolves via your ~/.ssh/config — no credentials are stored in the app."));
+  const list = el("div");
+  card.appendChild(list);
+  const addRow = el("div", "ds-row");
+  const aliasInput = document.createElement("input");
+  aliasInput.type = "text"; aliasInput.placeholder = "alias (e.g. nas)"; aliasInput.style.flex = "1";
+  const descInput = document.createElement("input");
+  descInput.type = "text"; descInput.placeholder = "description (optional)"; descInput.style.flex = "2";
+  const addBtn = el("button", "ds-btn", "Add");
+  addRow.appendChild(aliasInput); addRow.appendChild(descInput); addRow.appendChild(addBtn);
+  card.appendChild(addRow);
+  const out = el("div", "ds-note"); card.appendChild(out);
+
+  async function loadHosts() {
+    list.innerHTML = "";
+    out.textContent = "";
+    let hosts = [];
+    try {
+      const r = await fetch("/api/agent/ssh-hosts", { headers: { "Accept": "application/json" } });
+      if (r.ok) hosts = await r.json();
+    } catch (e) { out.textContent = "Could not load SSH hosts: " + String(e && e.message || e); return; }
+    if (!Array.isArray(hosts) || !hosts.length) {
+      list.appendChild(el("div", "ds-note", "No SSH hosts yet. Add one to enable the agent's SSH tools."));
+      return;
+    }
+    for (const h of hosts) {
+      const row = el("div", "ds-row");
+      const lbl = el("div", "ds-note"); lbl.style.flex = "1";
+      lbl.textContent = h.alias + (h.description ? " — " + h.description : "");
+      row.appendChild(lbl);
+      const del = el("button", "ds-btn ds-btn-ghost", "Remove");
+      del.onclick = async () => {
+        del.disabled = true;
+        try {
+          const r = await fetch("/api/agent/ssh-hosts/" + encodeURIComponent(h.alias), { method: "DELETE" });
+          if (r.ok) loadHosts(); else out.textContent = "Failed: " + r.status;
+        } catch (e) { out.textContent = "Failed: " + String(e && e.message || e); }
+        finally { del.disabled = false; }
+      };
+      row.appendChild(del);
+      list.appendChild(row);
+    }
+  }
+
+  addBtn.onclick = async () => {
+    const alias = aliasInput.value.trim();
+    const description = descInput.value.trim();
+    if (!alias) { out.textContent = "Enter an alias."; return; }
+    addBtn.disabled = true; out.textContent = "";
+    try {
+      const r = await fetch("/api/agent/ssh-hosts", {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ alias, description })
+      });
+      if (r.ok) { aliasInput.value = ""; descInput.value = ""; loadHosts(); }
+      else { const d = await r.json().catch(() => ({})); out.textContent = "Failed: " + ((d && d.error) || r.status); }
+    } catch (e) { out.textContent = "Failed: " + String(e && e.message || e); }
+    finally { addBtn.disabled = false; }
+  };
+
+  loadHosts();
 }
 
 // --- Updates section (in-app updater) ---
@@ -364,15 +435,17 @@ async function titleForConv(convId) {
 // so they always prompt regardless of the auto-approve setting.
 const AUTO_APPROVE_TOOLS = new Set(["apply_patch", "run_command", "git_commit", "git_push", "write_file", "edit_file", "move_path"]);
 // Command-shaped tools render a Warp-style block; run_command additionally streams.
-const COMMAND_TOOLS = new Set(["run_command", "apply_patch", "git_commit", "git_push", "create_pr", "merge_pr", "write_file", "edit_file", "move_path", "delete_path"]);
+const COMMAND_TOOLS = new Set(["run_command", "apply_patch", "git_commit", "git_push", "create_pr", "merge_pr", "write_file", "edit_file", "move_path", "delete_path", "ssh_run"]);
 // Keep last ~64KB of streamed command output for the observation / block body.
 const STREAM_OUTPUT_CAP = 65536;
 function capStreamOutput(s){ s = String(s||""); return s.length > STREAM_OUTPUT_CAP ? s.slice(-STREAM_OUTPUT_CAP) : s; }
-// sidExec is the buffered POST to /__sidecar/repos/exec (the non-streaming path,
-// used for every tool except an approved run_command).
-async function sidExec(execBody) {
+// sidExec is the buffered POST to a sidecar exec endpoint (the non-streaming
+// path, used for every tool except an approved run_command/ssh_run). The
+// endpoint is /__sidecar/repos/exec for repo file tools or /__sidecar/ssh/exec
+// for ssh_* tools.
+async function sidExec(endpoint, execBody) {
   try {
-    const r = await fetch("/__sidecar/repos/exec", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(execBody) });
+    const r = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(execBody) });
     return await r.json();
   } catch (err) {
     return { observation: String(err && err.message || err), preview: "exec error", is_error: true };
@@ -382,24 +455,39 @@ async function sidExec(execBody) {
 async function runToolExec(convId, d) {
   const autoApproved = !!(d.autoApprove && AUTO_APPROVE_TOOLS.has(d.tool));
   const key = d.jobId + ":" + (d.step ?? 0);
-  const execBody = { repo: d.repo, tool: d.tool, args: d.args || "" };
-  if (d.branch) execBody.branch = d.branch;
-  // run_command timeout (ms), carried from the backend's RUN_COMMAND_TIMEOUT on
-  // the toolExec payload so the sidecar enforces the backend-authoritative value.
-  if (d.runCommandTimeoutMs) execBody.run_command_timeout_ms = d.runCommandTimeoutMs;
+  const isSsh = d.tool.startsWith("ssh_");
+
+  // Build the exec body + endpoints for the tool family. SSH tools target a
+  // ~/.ssh/config alias (host) and use the sidecar's /__sidecar/ssh/exec routes;
+  // repo file tools target a bound repo and use /__sidecar/repos/exec. ssh_run
+  // is never auto-approved (not in AUTO_APPROVE_TOOLS) — it always prompts.
+  let execBody, bufferedUrl, streamUrl;
+  if (isSsh) {
+    execBody = { host: d.host || "", tool: d.tool, args: d.args || "" };
+    if (d.runCommandTimeoutMs) execBody.run_command_timeout_ms = d.runCommandTimeoutMs;
+    bufferedUrl = "/__sidecar/ssh/exec";
+    streamUrl = "/__sidecar/ssh/exec/stream";
+  } else {
+    execBody = { repo: d.repo, tool: d.tool, args: d.args || "" };
+    if (d.branch) execBody.branch = d.branch;
+    if (d.runCommandTimeoutMs) execBody.run_command_timeout_ms = d.runCommandTimeoutMs;
+    bufferedUrl = "/__sidecar/repos/exec";
+    streamUrl = "/__sidecar/repos/exec/stream";
+  }
   if (autoApproved) execBody.approved = true;
 
   let execRes;
   if (autoApproved && d.tool === "run_command") {
     // Auto-approved run_command: stream output straight into the block.
-    execRes = await runStreamingExec(convId, d, key, { ...execBody, approved: true });
+    execRes = await runStreamingExec(convId, d, key, { ...execBody, approved: true }, streamUrl);
   } else {
     // First (buffered) call — returns needs_approval + preview for write tools.
-    execRes = await sidExec(execBody);
+    execRes = await sidExec(bufferedUrl, execBody);
     if (execRes && execRes.needs_approval) {
-      const branch = d.branch || (await branchForRepo(d.repo));
       const title = await titleForConv(convId);
-      const ctx = { repo: d.repo, branch, title };
+      const ctx = isSsh
+        ? { host: d.host, title }
+        : { repo: d.repo, branch: d.branch || (await branchForRepo(d.repo)), title };
       const kind = execRes.approval_kind || d.tool;
       const preview = execRes.approval_preview || "";
       // Inline approval in the command block when it's on screen; fall back to
@@ -407,10 +495,10 @@ async function runToolExec(convId, d) {
       const approved = await requestApprovalInlineOrModal(key, kind, preview, ctx);
       if (!approved) {
         execRes = { observation: "The user rejected this " + d.tool + " call. Do not retry it; adjust your approach.", preview: "rejected", is_error: true };
-      } else if (d.tool === "run_command") {
-        execRes = await runStreamingExec(convId, d, key, { ...execBody, approved: true });
+      } else if (d.tool === "run_command" || d.tool === "ssh_run") {
+        execRes = await runStreamingExec(convId, d, key, { ...execBody, approved: true }, streamUrl);
       } else {
-        execRes = await sidExec({ ...execBody, approved: true });
+        execRes = await sidExec(bufferedUrl, { ...execBody, approved: true });
       }
     }
   }
@@ -521,7 +609,7 @@ function renderApprovalDialog(kind, preview, ctx, done) {
   const chatText = (ctx && ctx.title) ? ("Chat: " + ctx.title) : "";
   chatLabel.textContent = chatText;
   chatLabel.classList.toggle("hidden", !chatText);
-  const kindText = (ctx && ctx.repo) ? (kind + " → " + ctx.repo + (ctx.branch ? " @ " + ctx.branch : "")) : kind;
+  const kindText = (ctx && (ctx.repo || ctx.host)) ? (kind + " → " + (ctx.repo || ctx.host) + (ctx.branch ? " @ " + ctx.branch : "")) : kind;
   $("dsApprovalKind").textContent = kindText;
   renderApprovalContent($("dsApprovalPre"), kind, preview);
   overlay.classList.add("open");
@@ -591,10 +679,10 @@ function renderDiff(diff) {
 // command block fills live. Returns a buffered ExecResult-shaped object
 // (observation/output/exit_code/is_error) so runToolExec can post it to
 // /tool-response exactly like the buffered path.
-async function runStreamingExec(convId, d, key, execBody) {
+async function runStreamingExec(convId, d, key, execBody, streamUrl) {
   let output = "", exitCode = -1, durationMs = 0;
   try {
-    const r = await fetch("/__sidecar/repos/exec/stream", {
+    const r = await fetch(streamUrl, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(execBody),
     });
     await readSseStream(r, (event, data) => {

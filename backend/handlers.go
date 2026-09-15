@@ -503,12 +503,12 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	j.supportsTools = body.SupportsTools
 	j.hub = s.hub
 	// needsBrowser marks a job as connection-bound: local (browser-relay)
-	// inference relays through the browser by definition, and a repo-bound
-	// agent run also relays its file tools through the browser (toolExec) even
-	// when the model itself runs server-side. Both get the grace-period cancel
-	// in handleEvents/handleUserEvents instead of the "survive any disconnect"
-	// behavior a plain server-model job gets.
-	j.needsBrowser = body.Local || (body.Agent && c.RepoID != "")
+	// inference relays through the browser by definition, and a repo-bound or
+	// SSH-enabled agent run also relays its local tools through the browser
+	// (toolExec) even when the model itself runs server-side. All such jobs get
+	// the grace-period cancel in handleEvents/handleUserEvents instead of the
+	// "survive any disconnect" behavior a plain server-model job gets.
+	j.needsBrowser = body.Local || (body.Agent && s.agentRunNeedsBrowser(email, convID, c.RepoID))
 	if err := s.jobs.enqueue(j); err != nil {
 		if errors.Is(err, errJobActive) {
 			if existing := s.jobs.get(convID); existing != nil {
@@ -606,11 +606,11 @@ func (s *server) handleResume(w http.ResponseWriter, r *http.Request) {
 	j.resuming = true
 	j.resumeNote = body.Note
 	c, _ := s.store.getConversation(email, convID)
+	repoID := ""
 	if c != nil {
-		j.needsBrowser = cp.Local || c.RepoID != ""
-	} else {
-		j.needsBrowser = cp.Local
+		repoID = c.RepoID
 	}
+	j.needsBrowser = cp.Local || s.agentRunNeedsBrowser(email, convID, repoID)
 	if err := s.jobs.enqueue(j); err != nil {
 		if errors.Is(err, errJobActive) {
 			if existing := s.jobs.get(convID); existing != nil {
@@ -1029,21 +1029,25 @@ func (s *server) handleModelResponse(w http.ResponseWriter, r *http.Request) {
 // handleAgentConfigGet returns the global agent system prompt + tool allowlist
 // plus the full menu of available tools (so the UI can render checkboxes).
 func (s *server) handleAgentConfigGet(w http.ResponseWriter, r *http.Request) {
+	email := emailFrom(r)
 	tools := parseToolList(s.store.getSetting("agent_tools"))
 	if len(tools) == 0 {
 		tools = defaultAgentTools()
 	}
+	sshHosts, _ := s.store.listSSHHosts(email)
 	writeJSON(w, map[string]any{
 		"system":      s.store.getSetting("agent_system"),
 		"tools":       tools,
-		"available":   availableTools(s.cfg.fetchPageEnabled),
+		"available":   availableTools(s.cfg.fetchPageEnabled, sshHostAliases(sshHosts)),
 		"autoApprove": s.store.getSetting("agent_auto_approve") != "0", // default ON
+		"sshHosts":    sshHosts,
 	})
 }
 
 // handleAgentConfigPut sets the global agent system prompt + tool allowlist.
 // An empty tool list clears the override (falls back to built-in defaults).
 func (s *server) handleAgentConfigPut(w http.ResponseWriter, r *http.Request) {
+	email := emailFrom(r)
 	var body struct {
 		System      string   `json:"system"`
 		Tools       []string `json:"tools"`
@@ -1055,8 +1059,9 @@ func (s *server) handleAgentConfigPut(w http.ResponseWriter, r *http.Request) {
 	}
 	// Validate tool names against the menu so a stale client can't enable a
 	// removed/renamed tool.
+	sshHosts, _ := s.store.listSSHHosts(email)
 	menu := map[string]bool{}
-	for _, t := range availableTools(s.cfg.fetchPageEnabled) {
+	for _, t := range availableTools(s.cfg.fetchPageEnabled, sshHostAliases(sshHosts)) {
 		menu[t.Name] = true
 	}
 	var valid []string
@@ -1087,7 +1092,90 @@ func (s *server) handleAgentConfigPut(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	writeJSON(w, map[string]any{"system": body.System, "tools": valid, "available": availableTools(s.cfg.fetchPageEnabled), "autoApprove": s.store.getSetting("agent_auto_approve") != "0"})
+	writeJSON(w, map[string]any{"system": body.System, "tools": valid, "available": availableTools(s.cfg.fetchPageEnabled, sshHostAliases(sshHosts)), "autoApprove": s.store.getSetting("agent_auto_approve") != "0"})
+}
+
+// agentRunNeedsBrowser reports whether an agent run will relay local tools
+// through the browser and so is connection-bound: a repo-bound run (whose
+// localRepoTools are auto-appended) or a run whose effective allowlist contains
+// an ssh_* tool while the user has ≥1 configured SSH host. Used at job creation
+// (handleGenerate/handleResume) so the grace-period cancel only applies to runs
+// that actually need the browser; a server-model agent run with no local tools
+// stays detached and survives a disconnect.
+func (s *server) agentRunNeedsBrowser(email, convID, repoID string) bool {
+	if repoID != "" {
+		return true
+	}
+	hosts, _ := s.store.listSSHHosts(email)
+	return len(hosts) > 0 && containsAnySSHTool(s.agentAllowlist(email, convID))
+}
+
+// --- SSH hosts (allowlist for the agent's ssh_* tools) ---------------------
+
+// handleAgentSSHHostsList returns the caller's allowlisted SSH aliases.
+func (s *server) handleAgentSSHHostsList(w http.ResponseWriter, r *http.Request) {
+	hosts, err := s.store.listSSHHosts(emailFrom(r))
+	if err != nil {
+		log.Printf("listSSHHosts: %v", err)
+		jsonError(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	if hosts == nil {
+		hosts = []SSHHost{}
+	}
+	writeJSON(w, hosts)
+}
+
+// handleAgentSSHHostUpsert adds or updates an SSH alias in the caller's
+// allowlist. The alias must be a safe bare token (matching a ~/.ssh/config Host
+// nickname); no credentials are stored — the desktop resolves the alias via its
+// own ssh config.
+func (s *server) handleAgentSSHHostUpsert(w http.ResponseWriter, r *http.Request) {
+	email := emailFrom(r)
+	var body struct {
+		Alias       string `json:"alias"`
+		Description string `json:"description"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		jsonError(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	alias := strings.TrimSpace(body.Alias)
+	if alias == "" {
+		jsonError(w, "alias is required", http.StatusBadRequest)
+		return
+	}
+	if !isSSHAlias(alias) {
+		jsonError(w, "alias must be a simple token (letters, digits, dot, dash, underscore)", http.StatusBadRequest)
+		return
+	}
+	host, err := s.store.upsertSSHHost(email, alias, strings.TrimSpace(body.Description))
+	if err != nil {
+		log.Printf("upsertSSHHost: %v", err)
+		jsonError(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, host)
+}
+
+// handleAgentSSHHostDelete removes an SSH alias from the caller's allowlist.
+func (s *server) handleAgentSSHHostDelete(w http.ResponseWriter, r *http.Request) {
+	alias := r.PathValue("alias")
+	if alias == "" {
+		jsonError(w, "alias is required", http.StatusBadRequest)
+		return
+	}
+	deleted, err := s.store.deleteSSHHost(emailFrom(r), alias)
+	if err != nil {
+		log.Printf("deleteSSHHost: %v", err)
+		jsonError(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	if !deleted {
+		jsonError(w, "no such SSH host", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, map[string]string{"status": "deleted"})
 }
 
 // --- File-tool relay (desktop sidecar → backend) ---

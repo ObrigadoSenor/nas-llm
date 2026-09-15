@@ -106,30 +106,37 @@ func defaultAgentTools() []string {
 	)
 }
 
+// agentAllowlist resolves the effective tool allowlist for a conversation
+// (per-conversation → global setting → built-in defaults), without the repo
+// auto-append or ssh gating that runGeneration applies. Used by agentConfig and
+// at job-creation time (handleGenerate/handleResume) to decide whether an agent
+// run will relay local tools through the browser (needsBrowser).
+func (s *server) agentAllowlist(email, convID string) []string {
+	if _, ctools, err := s.store.getConvAgentConfig(email, convID); err == nil {
+		if t := parseToolList(ctools); len(t) > 0 {
+			return t
+		}
+	}
+	if gt := parseToolList(s.store.getSetting("agent_tools")); len(gt) > 0 {
+		return gt
+	}
+	return defaultAgentTools()
+}
+
 // agentConfig returns the (tool allowlist, system prompt) for an agent run.
 // Resolution order (most-specific first): per-conversation override → global
 // settings → built-in defaults. A non-empty memory store injects a short index
 // of note keys into the prompt (only when memory_read is enabled) so the agent
 // knows what it can recall without a speculative read.
 func (s *server) agentConfig(j *job) ([]string, string) {
-	allow := defaultAgentTools()
+	allow := s.agentAllowlist(j.email, j.convID)
 	sys := ""
-	convSetTools := false
-	if csys, ctools, err := s.store.getConvAgentConfig(j.email, j.convID); err == nil {
+	if csys, _, err := s.store.getConvAgentConfig(j.email, j.convID); err == nil {
 		sys = strings.TrimSpace(csys)
-		if t := parseToolList(ctools); len(t) > 0 {
-			allow = t
-			convSetTools = true
-		}
 	}
 	if sys == "" {
 		if g := strings.TrimSpace(s.store.getSetting("agent_system")); g != "" {
 			sys = g
-		}
-	}
-	if !convSetTools {
-		if gt := parseToolList(s.store.getSetting("agent_tools")); len(gt) > 0 {
-			allow = gt
 		}
 	}
 	if strings.TrimSpace(sys) == "" {
@@ -319,6 +326,21 @@ func (s *server) toolRegistry(email string) map[string]agentTool {
 		"merge_pr":    mergePrTool(),
 	} {
 		reg[name] = agentTool{schema: schema, local: true}
+	}
+	// SSH tools are local (the desktop sidecar runs them over ssh, using the
+	// user's ~/.ssh/config + keys) and opt-in: only registered when the user has
+	// ≥1 configured SSH host, with the host param as an enum of their aliases so
+	// the model can only target allowlisted hosts. No credentials are stored.
+	if hosts, err := s.store.listSSHHosts(email); err == nil && len(hosts) > 0 {
+		aliases := sshHostAliases(hosts)
+		for name, schema := range map[string]oaiTool{
+			"ssh_run":  sshRunTool(aliases),
+			"ssh_read": sshReadTool(aliases),
+			"ssh_list": sshListTool(aliases),
+			"ssh_grep": sshGrepTool(aliases),
+		} {
+			reg[name] = agentTool{schema: schema, local: true}
+		}
 	}
 	return reg
 }
@@ -510,6 +532,58 @@ func listPrsTool() oaiTool {
 	}}
 }
 
+// --- SSH tools (local: executed by the desktop sidecar over ssh, using the ---
+// user's ~/.ssh/config + keys). Opt-in: only registered when the user has ≥1
+// configured SSH host (see toolRegistry). The host param is an enum of the
+// user's aliases so the model can only target allowlisted hosts; no credentials
+// are stored. ssh_run always prompts; the read tools are approval-free.
+
+func sshRunTool(hosts []string) oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "ssh_run",
+		Description: "Run a shell command on a remote host over SSH. The host must be one of your configured SSH aliases (resolved via ~/.ssh/config on the desktop). Always approved by the user before running — the user sees the host and the exact command. Use this to inspect or act on data on another machine.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"host":    map[string]any{"type": "string", "enum": hosts, "description": "The SSH alias to target (one of your configured hosts)."},
+			"command": map[string]any{"type": "string", "description": "The shell command to run on the remote host."},
+		}, "required": []string{"host", "command"}},
+	}}
+}
+
+func sshReadTool(hosts []string) oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "ssh_read",
+		Description: "Read the contents of a remote file over SSH (cat). Read-only — no approval needed. Use this to examine a config file, log, or source file on another machine.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"host": map[string]any{"type": "string", "enum": hosts, "description": "The SSH alias to target."},
+			"path": map[string]any{"type": "string", "description": "Absolute path to the remote file to read."},
+		}, "required": []string{"host", "path"}},
+	}}
+}
+
+func sshListTool(hosts []string) oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "ssh_list",
+		Description: "List the contents of a remote directory over SSH (ls -la). Read-only — no approval needed. Use this to explore the layout of a remote filesystem.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"host": map[string]any{"type": "string", "enum": hosts, "description": "The SSH alias to target."},
+			"path": map[string]any{"type": "string", "description": "Absolute path to the remote directory to list (default the remote home directory)."},
+		}, "required": []string{"host"}},
+	}}
+}
+
+func sshGrepTool(hosts []string) oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "ssh_grep",
+		Description: "Search for a text pattern in remote files over SSH (grep -rn). Returns matching lines with file:line prefixes. Read-only — no approval needed. Use this to find where a symbol, function, or string is used on another machine.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"host":    map[string]any{"type": "string", "enum": hosts, "description": "The SSH alias to target."},
+			"pattern": map[string]any{"type": "string", "description": "The text pattern to search for."},
+			"path":    map[string]any{"type": "string", "description": "Absolute path to the remote directory to search in (default the remote home directory)."},
+			"include": map[string]any{"type": "string", "description": "Optional glob to limit searched files, e.g. *.go."},
+		}, "required": []string{"host", "pattern"}},
+	}}
+}
+
 // localRepoTools is the single ordered list of local (sidecar-relayed) agent
 // tool names, used by defaultAgentTools, availableTools, and the repo-bound
 // allow append in jobs.go so the three lists cannot drift. git_log and list_prs
@@ -547,6 +621,116 @@ func localToolMetas() []toolMeta {
 		{Name: "create_pr", Label: "Create PR", Description: "Open a pull request from the current branch (desktop only)."},
 		{Name: "merge_pr", Label: "Merge PR", Description: "Merge a GitHub pull request by number (desktop only). Approval-gated."},
 	}
+}
+
+// sshTools is the ordered list of SSH agent tool names, mirroring localRepoTools
+// for the repo file tools. SSH tools are opt-in (not in defaultAgentTools) and
+// only registered/offered when the user has ≥1 configured SSH host.
+func sshTools() []string {
+	return []string{"ssh_run", "ssh_read", "ssh_list", "ssh_grep"}
+}
+
+// sshToolMetas is the UI-facing metadata for sshTools, in the same order, so
+// availableTools stays in lockstep with the allowlist/registry.
+func sshToolMetas() []toolMeta {
+	return []toolMeta{
+		{Name: "ssh_run", Label: "SSH run", Description: "Run a shell command on a remote host over SSH. Always prompts. (Desktop only.)"},
+		{Name: "ssh_read", Label: "SSH read", Description: "Read a remote file over SSH (cat). Read-only. (Desktop only.)"},
+		{Name: "ssh_list", Label: "SSH list", Description: "List a remote directory over SSH (ls). Read-only. (Desktop only.)"},
+		{Name: "ssh_grep", Label: "SSH grep", Description: "Search remote file contents over SSH (grep). Read-only. (Desktop only.)"},
+	}
+}
+
+// isSSHTool reports whether name is one of the ssh_* tools.
+func isSSHTool(name string) bool { return strings.HasPrefix(name, "ssh_") }
+
+// containsAnySSHTool reports whether the allowlist contains any ssh_* tool.
+func containsAnySSHTool(allow []string) bool {
+	for _, t := range allow {
+		if isSSHTool(t) {
+			return true
+		}
+	}
+	return false
+}
+
+// filterSSHTools returns allow with any ssh_* tools removed. Used when a user
+// has no configured hosts so a run never offers tools whose host enum would be
+// empty (guards the deleted-all-hosts edge case — toolRegistry also won't
+// register them). Filters in place over the backing array.
+func filterSSHTools(allow []string) []string {
+	out := allow[:0]
+	for _, t := range allow {
+		if !isSSHTool(t) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// sshHostAliases extracts the alias list from a user's SSHHost records, in the
+// order listSSHHosts returns them (most-recent first). Used to build the tool
+// host enum and to gate the availableTools menu.
+func sshHostAliases(hosts []SSHHost) []string {
+	out := make([]string, 0, len(hosts))
+	for _, h := range hosts {
+		out = append(out, h.Alias)
+	}
+	return out
+}
+
+// sshHostAllowed reports whether alias is in the user's allowlist. The relay
+// validates the model-supplied host against this before emitting a cue, so a
+// hallucinated host never reaches the sidecar.
+func sshHostAllowed(hosts []SSHHost, alias string) bool {
+	for _, h := range hosts {
+		if h.Alias == alias {
+			return true
+		}
+	}
+	return false
+}
+
+// sshHostList joins a user's aliases into a comma-separated string for an error
+// observation when the model names an unknown host.
+func sshHostList(hosts []SSHHost) string {
+	out := make([]string, 0, len(hosts))
+	for _, h := range hosts {
+		out = append(out, h.Alias)
+	}
+	return strings.Join(out, ", ")
+}
+
+// parseSSHHost extracts the host alias from an ssh_* tool's args JSON. Returns
+// "" if the args don't carry a host; the relay then surfaces an error
+// observation instead of emitting a cue with no target.
+func parseSSHHost(args string) string {
+	var p struct {
+		Host string `json:"host"`
+	}
+	if json.Unmarshal([]byte(args), &p) == nil {
+		return strings.TrimSpace(p.Host)
+	}
+	return ""
+}
+
+// isSSHAlias reports whether s is a safe bare SSH alias (a ~/.ssh/config Host
+// nickname): no whitespace, no shell metacharacters, conservative charset. The
+// alias is passed to ssh as a single argv element, so this guards against a UI
+// bug (or a crafted request) injecting ssh options like "-oProxyCommand=…".
+func isSSHAlias(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '.', r == '-', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // injectRepoContext prepends a repo context block to the agent system prompt
@@ -1302,9 +1486,11 @@ type toolMeta struct {
 }
 
 // availableTools lists every tool the agent can be configured to use. fetch_page
-// is included only when the server has it enabled (FETCH_PAGE_ENABLED), so the UI
-// never offers a tool the backend would reject.
-func availableTools(fetchPage bool) []toolMeta {
+// is included only when the server has it enabled (FETCH_PAGE_ENABLED); the ssh_*
+// tools are included only when the user has ≥1 configured SSH host, so the UI
+// never offers a tool the backend would reject. sshHosts is the user's alias
+// list (empty/nil hides the ssh tools).
+func availableTools(fetchPage bool, sshHosts []string) []toolMeta {
 	out := []toolMeta{
 		{Name: "web_search", Label: "Web search", Description: "Search the web for current facts via the internal SearXNG."},
 		{Name: "ask_user", Label: "Ask user", Description: "Ask a clarifying question with clickable options."},
@@ -1317,6 +1503,9 @@ func availableTools(fetchPage bool) []toolMeta {
 		out = append(out, toolMeta{Name: "fetch_page", Label: "Fetch page", Description: "Download a web page and read its text. Off by default (injection risk)."})
 	}
 	out = append(out, localToolMetas()...)
+	if len(sshHosts) > 0 {
+		out = append(out, sshToolMetas()...)
+	}
 	return out
 }
 

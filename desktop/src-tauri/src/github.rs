@@ -1467,6 +1467,375 @@ async fn repos_exec_stream(State(st): State<AppState>, Json(body): Json<ExecBody
     Sse::new(sse_stream).into_response()
 }
 
+// --- SSH tool executor (runs ssh against a ~/.ssh/config alias) ------------
+//
+// The agent's ssh_* tools run here, on the desktop, shelling out to the system
+// ssh. The host is an allowlisted alias resolved via the user's ~/.ssh/config —
+// no credentials are stored in the app. ssh_run is approval-gated (always
+// prompts, even with auto-approve on, like delete_path/create_pr/merge_pr); the
+// three read tools run immediately. BatchMode=yes makes auth fail fast instead
+// of hanging on a password prompt, and a carried timeout + kill_on_drop bound
+// a non-exiting command (mirrors run_command's discipline).
+
+#[derive(Deserialize)]
+struct SshExecBody {
+    host: String,
+    tool: String,
+    args: String,
+    #[serde(default)]
+    approved: bool,
+    #[serde(default)]
+    run_command_timeout_ms: u64,
+}
+
+// ssh_exec is the buffered path: read tools run here, and ssh_run's first
+// (unapproved) call returns needs_approval with a host+command preview. An
+// approved ssh_run can also run here as a non-streaming fallback, but the
+// renderer normally uses /stream for the live command block.
+async fn ssh_exec(State(_): State<AppState>, Json(body): Json<SshExecBody>) -> Response {
+    let host = body.host.trim().to_string();
+    if !is_safe_ssh_alias(&host) {
+        return json_ok(&ExecResult {
+            observation: format!("Invalid SSH host alias: {host}"),
+            preview: "bad host".into(),
+            is_error: true,
+            ..Default::default()
+        });
+    }
+    // ssh_run is approval-gated: the first call returns needs_approval so the
+    // renderer can show host + command and re-POST with approved=true (or to
+    // /stream for the live block). It is never auto-approved.
+    if body.tool == "ssh_run" && !body.approved {
+        let command = ssh_run_command(&body.args);
+        let preview = if command.is_empty() {
+            "No command provided.".to_string()
+        } else {
+            format!("{host}: {command}")
+        };
+        return json_ok(&ExecResult {
+            observation: String::new(),
+            preview: preview.clone(),
+            is_error: false,
+            needs_approval: Some(true),
+            approval_kind: Some("ssh_run".into()),
+            approval_preview: Some(preview),
+            ..Default::default()
+        });
+    }
+    let remote = match body.tool.as_str() {
+        "ssh_run" => ssh_run_command(&body.args),
+        "ssh_read" => ssh_read_command(&body.args),
+        "ssh_list" => ssh_list_command(&body.args),
+        "ssh_grep" => ssh_grep_command(&body.args),
+        other => {
+            return json_ok(&ExecResult {
+                observation: format!("Unknown SSH tool: {other}"),
+                preview: "unknown tool".into(),
+                is_error: true,
+                ..Default::default()
+            })
+        }
+    };
+    if remote.is_empty() {
+        return json_ok(&ExecResult {
+            observation: "No command or path provided.".into(),
+            preview: "no command".into(),
+            is_error: true,
+            ..Default::default()
+        });
+    }
+    let timeout_ms = if body.run_command_timeout_ms == 0 {
+        120_000
+    } else {
+        body.run_command_timeout_ms
+    };
+    let out = run_ssh_buffered(&host, &remote, timeout_ms).await;
+    json_ok(&ExecResult {
+        observation: out.observation,
+        preview: out.preview,
+        is_error: out.is_error,
+        exit_code: out.exit_code,
+        ..Default::default()
+    })
+}
+
+// ssh_exec_stream is the streaming variant for an approved ssh_run: it pipes the
+// remote command's stdout+stderr to the renderer as SSE chunk events as they
+// arrive and finishes with one terminal exit event (code + duration). Mirrors
+// repos_exec_stream. The renderer calls /stream only after the user approves.
+async fn ssh_exec_stream(State(_): State<AppState>, Json(body): Json<SshExecBody>) -> Response {
+    if body.tool != "ssh_run" {
+        return sse_error("Streaming SSH exec is for ssh_run only.");
+    }
+    let host = body.host.trim().to_string();
+    if !is_safe_ssh_alias(&host) {
+        return sse_error(&format!("Invalid SSH host alias: {host}"));
+    }
+    if !body.approved {
+        return sse_error("SSH command not approved.");
+    }
+    let command = ssh_run_command(&body.args);
+    if command.is_empty() {
+        return sse_error("No command provided.");
+    }
+    let timeout_for_task = if body.run_command_timeout_ms == 0 {
+        120_000
+    } else {
+        body.run_command_timeout_ms
+    };
+    let (tx, rx) = mpsc::channel::<StreamMsg>(64);
+    let host_for_task = host;
+    let command_for_task = command;
+    tokio::spawn(async move {
+        let start = std::time::Instant::now();
+        let mut child = match tokio::process::Command::new("ssh")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg(&host_for_task)
+            .arg(&command_for_task)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx
+                    .send(StreamMsg::Chunk(format!("Could not run ssh: {e}\n")))
+                    .await;
+                let _ = tx.send(StreamMsg::Exit(-1, 0)).await;
+                return;
+            }
+        };
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let stdout_task = tokio::spawn(pipe_lines(stdout, tx.clone()));
+        let stderr_task = tokio::spawn(pipe_lines(stderr, tx.clone()));
+        let limit = std::time::Duration::from_millis(timeout_for_task);
+        let status = match tokio::time::timeout(limit, child.wait()).await {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                let _ = tx
+                    .send(StreamMsg::Chunk(format!(
+                        "\n[ssh timed out after {}s — killed]\n",
+                        timeout_for_task / 1000
+                    )))
+                    .await;
+                let _ = tx.send(StreamMsg::Exit(124, start.elapsed().as_millis() as i64)).await;
+                return;
+            }
+        };
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+        let dur = start.elapsed().as_millis() as i64;
+        let code = status.ok().and_then(|s| s.code()).unwrap_or(-1) as i64;
+        let _ = tx.send(StreamMsg::Exit(code, dur)).await;
+    });
+
+    let sse_stream = unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|msg| (msg, rx))
+    })
+    .map(|msg| -> Result<Event, Infallible> { Ok(stream_msg_to_event(msg)) });
+    Sse::new(sse_stream).into_response()
+}
+
+// SshOutput is the result of one buffered ssh run.
+struct SshOutput {
+    observation: String,
+    preview: String,
+    is_error: bool,
+    exit_code: Option<i64>,
+}
+
+// run_ssh_buffered runs `ssh <host> <remote>` with a null stdin, captures
+// stdout+stderr, and applies the per-command timeout. BatchMode=yes makes auth
+// fail fast instead of hanging on a password prompt; kill_on_drop ensures the
+// child is killed if the timeout future is dropped mid-wait.
+async fn run_ssh_buffered(host: &str, remote: &str, timeout_ms: u64) -> SshOutput {
+    let mut cmd = tokio::process::Command::new("ssh");
+    cmd.arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg(host)
+        .arg(remote)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let limit = std::time::Duration::from_millis(timeout_ms);
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return SshOutput {
+                observation: format!("Could not run ssh: {e}"),
+                preview: "ssh spawn error".into(),
+                is_error: true,
+                exit_code: None,
+            }
+        }
+    };
+    let out = match tokio::time::timeout(limit, child.wait_with_output()).await {
+        Ok(o) => o,
+        Err(_) => {
+            return SshOutput {
+                observation: format!("[ssh timed out after {}s — killed]", timeout_ms / 1000),
+                preview: "timeout".into(),
+                is_error: true,
+                exit_code: Some(124),
+            }
+        }
+    };
+    match out {
+        Ok(o) => {
+            let mut observation = String::new();
+            if !o.stdout.is_empty() {
+                observation.push_str(&String::from_utf8_lossy(&o.stdout));
+            }
+            if !o.stderr.is_empty() {
+                if !observation.is_empty() {
+                    observation.push('\n');
+                }
+                observation.push_str(&String::from_utf8_lossy(&o.stderr));
+            }
+            let observation = cap_ssh_observation(&observation);
+            let code = o.status.code().unwrap_or(-1) as i64;
+            let is_error = !o.status.success();
+            let preview = if is_error {
+                format!("exit {code}")
+            } else {
+                "ok".to_string()
+            };
+            SshOutput {
+                observation,
+                preview,
+                is_error,
+                exit_code: Some(code),
+            }
+        }
+        Err(e) => SshOutput {
+            observation: format!("ssh failed: {e}"),
+            preview: "ssh error".into(),
+            is_error: true,
+            exit_code: None,
+        },
+    }
+}
+
+// --- SSH command builders --------------------------------------------------
+//
+// ssh_run's command is the raw remote shell string the user approved (no
+// escaping — the user sees it in the approval dialog). The read tools inject
+// path/pattern/glob into a fixed command, so those args are single-quote
+// shell-escaped for the remote shell (ssh_shell_escape) as an injection guard.
+
+fn ssh_run_command(args: &str) -> String {
+    let v: serde_json::Value = match serde_json::from_str(args) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    v.get("command")
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn ssh_read_command(args: &str) -> String {
+    let v: serde_json::Value = match serde_json::from_str(args) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("");
+    if path.is_empty() {
+        return String::new();
+    }
+    format!("cat -- {}", ssh_shell_escape(path))
+}
+
+fn ssh_list_command(args: &str) -> String {
+    let v: serde_json::Value = match serde_json::from_str(args) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("");
+    if path.is_empty() {
+        "ls -la".to_string()
+    } else {
+        format!("ls -la -- {}", ssh_shell_escape(path))
+    }
+}
+
+fn ssh_grep_command(args: &str) -> String {
+    let v: serde_json::Value = match serde_json::from_str(args) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    let pattern = v.get("pattern").and_then(|p| p.as_str()).unwrap_or("");
+    if pattern.is_empty() {
+        return String::new();
+    }
+    let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("");
+    let include = v.get("include").and_then(|p| p.as_str()).unwrap_or("");
+    let mut cmd = String::from("grep -rn");
+    if !include.is_empty() {
+        cmd.push_str(&format!(" --include={}", ssh_shell_escape(include)));
+    }
+    cmd.push_str(" -- ");
+    cmd.push_str(&ssh_shell_escape(pattern));
+    if !path.is_empty() {
+        cmd.push(' ');
+        cmd.push_str(&ssh_shell_escape(path));
+    }
+    cmd
+}
+
+// ssh_shell_escape wraps s in single quotes for the remote shell, escaping any
+// embedded single quotes. This makes path/pattern/glob args safe to inject into
+// a fixed remote command (cat/ls/grep). The result is one shell-quoted token.
+fn ssh_shell_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            // Close the quote, add an escaped quote, reopen.
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+// is_safe_ssh_alias reports whether s is a safe bare SSH alias: no whitespace or
+// shell metacharacters, conservative charset. The alias is passed to ssh as a
+// single argv element, so this guards against injecting ssh options. Mirrors the
+// backend's isSSHAlias — the sidecar re-validates as the trust boundary that
+// actually runs ssh.
+fn is_safe_ssh_alias(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+}
+
+// cap_ssh_observation truncates ssh output to MAX_OBS_CHARS bytes on a UTF-8
+// char boundary and appends an overflow marker, mirroring cap_preview.
+fn cap_ssh_observation(s: &str) -> String {
+    let s = s.trim();
+    if s.len() <= MAX_OBS_CHARS {
+        return s.to_string();
+    }
+    let mut end = MAX_OBS_CHARS;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n…[truncated]", &s[..end])
+}
+
 // StreamMsg is one frame of the streaming exec SSE: a piped output chunk, or the
 // terminal exit carrying the command's exit code + wall-clock duration.
 enum StreamMsg {
@@ -3954,6 +4323,8 @@ pub fn router(state: AppState) -> Router {
         .route("/__sidecar/repos/open", post(repos_open))
         .route("/__sidecar/repos/exec", post(repos_exec))
         .route("/__sidecar/repos/exec/stream", post(repos_exec_stream))
+        .route("/__sidecar/ssh/exec", post(ssh_exec))
+        .route("/__sidecar/ssh/exec/stream", post(ssh_exec_stream))
         .route("/__sidecar/repos/diff", post(repos_diff))
         .route("/__sidecar/repos/revert", post(repos_revert))
         .route("/__sidecar/repos/changelog", post(repos_changelog))
@@ -4325,6 +4696,93 @@ mod tests {
         let r2 = exec_grep(&root, &j(serde_json::json!({"pattern":"TOPSECRET"}))).await;
         assert!(!r2.is_error);
         assert!(!r2.observation.contains("TOPSECRET"), "grep leaked ignored-only match: {}", r2.observation);
+    }
+
+    #[test]
+    fn ssh_shell_escape_quotes_and_escapes() {
+        // plain path → single-quoted
+        assert_eq!(ssh_shell_escape("/var/log/syslog"), "'/var/log/syslog'");
+        // empty → '' (still a valid quoted token; builders guard empty upstream)
+        assert_eq!(ssh_shell_escape(""), "''");
+        // embedded single quote → close, escape, reopen
+        assert_eq!(ssh_shell_escape("a'b"), "'a'\\''b'");
+        // shell metacharacters are inert inside single quotes
+        assert_eq!(ssh_shell_escape("$(whoami)"), "'$(whoami)'");
+        assert_eq!(ssh_shell_escape("a;rm -rf /"), "'a;rm -rf /'");
+    }
+
+    #[test]
+    fn ssh_command_builders_inject_escaped_args() {
+        // ssh_run passes the command through verbatim (the user approves it).
+        assert_eq!(
+            ssh_run_command(&j(serde_json::json!({"host":"nas","command":"uname -a"}))),
+            "uname -a"
+        );
+        // ssh_read wraps the path in cat -- '<escaped>'.
+        assert_eq!(
+            ssh_read_command(&j(serde_json::json!({"host":"nas","path":"/etc/hosts"}))),
+            "cat -- '/etc/hosts'"
+        );
+        // a path with a quote is escaped, not injected.
+        assert_eq!(
+            ssh_read_command(&j(serde_json::json!({"host":"nas","path":"a'b"}))),
+            "cat -- 'a'\\''b'"
+        );
+        // missing path → empty (caller surfaces "no command").
+        assert_eq!(ssh_read_command(&j(serde_json::json!({"host":"nas"}))), "");
+        // ssh_list defaults to ls -la when no path.
+        assert_eq!(ssh_list_command(&j(serde_json::json!({"host":"nas"}))), "ls -la");
+        assert_eq!(
+            ssh_list_command(&j(serde_json::json!({"host":"nas","path":"/srv"}))),
+            "ls -la -- '/srv'"
+        );
+        // ssh_grep escapes pattern + path and optional include glob.
+        assert_eq!(
+            ssh_grep_command(&j(serde_json::json!({"host":"nas","pattern":"foo","path":"/srv"}))),
+            "grep -rn -- 'foo' '/srv'"
+        );
+        assert_eq!(
+            ssh_grep_command(&j(serde_json::json!({"host":"nas","pattern":"foo bar"}))),
+            "grep -rn -- 'foo bar'"
+        );
+        assert_eq!(
+            ssh_grep_command(&j(serde_json::json!({"host":"nas","pattern":"x","path":"/etc","include":"*.conf"}))),
+            "grep -rn --include='*.conf' -- 'x' '/etc'"
+        );
+        // missing pattern → empty.
+        assert_eq!(ssh_grep_command(&j(serde_json::json!({"host":"nas"}))), "");
+    }
+
+    #[test]
+    fn is_safe_ssh_alias_rejects_metacharacters() {
+        assert!(is_safe_ssh_alias("nas"));
+        assert!(is_safe_ssh_alias("mac.lan"));
+        assert!(is_safe_ssh_alias("host-1"));
+        assert!(is_safe_ssh_alias("vm_2"));
+        // reject empty, whitespace, shell metacharacters, ssh-option injection.
+        assert!(!is_safe_ssh_alias(""));
+        assert!(!is_safe_ssh_alias("nas;rm"));
+        assert!(!is_safe_ssh_alias("-oProxyCommand=x"));
+        assert!(!is_safe_ssh_alias("nas host"));
+        assert!(!is_safe_ssh_alias("nas`whoami`"));
+    }
+
+    #[test]
+    fn cap_ssh_observation_trims_and_caps_on_char_boundary() {
+        assert_eq!(cap_ssh_observation("  hi\n"), "hi");
+        let big = "x".repeat(MAX_OBS_CHARS + 50);
+        let capped = cap_ssh_observation(&big);
+        assert!(capped.ends_with("…[truncated]"));
+        // ASCII body is exactly MAX_OBS_CHARS bytes before the marker.
+        assert_eq!(capped.len(), MAX_OBS_CHARS + "\n…[truncated]".len());
+        // A multibyte cut is backed off to a char boundary: valid UTF-8 end to
+        // end, with the marker present.
+        let mut multi = String::from("a").repeat(MAX_OBS_CHARS - 1);
+        multi.push('\u{00E9}'); // 2-byte é right at the cap boundary
+        multi.push_str("zz");
+        let capped = cap_ssh_observation(&multi);
+        std::str::from_utf8(capped.as_bytes()).expect("valid utf-8");
+        assert!(capped.ends_with("…[truncated]"));
     }
 }
 
