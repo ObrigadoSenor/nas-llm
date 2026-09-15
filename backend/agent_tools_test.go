@@ -278,3 +278,124 @@ func TestSSHToolWiring(t *testing.T) {
 		}
 	}
 }
+
+// TestPrToolsWiring guards the backend registration of the seven PR agent tools
+// added to round out the harness's GitHub PR support: pr_view, pr_diff,
+// pr_checks (read-only) and pr_comment, pr_close, pr_ready, pr_edit
+// (approval-gated, never auto-approved). For each it checks the surfaces that
+// must agree for the tool to be offered to a repo-bound agent run: the default
+// allowlist (defaultAgentTools), the tool registry (schema + local-relay flag +
+// required args), the UI-facing availableTools list, and the localFileTools /
+// localGitTools partition. It also asserts the plan-mode split: the four
+// mutating tools are in planWriteTools (gated out pre-approval) while the three
+// read-only ones are not. Mirrors TestMergePrToolWiring's membership style — it
+// prevents a silent wiring regression that would make a tool vanish without any
+// other test failing. It does NOT exercise the sidecar executors (exec_pr_*) or
+// the GitHub API — those run in the desktop app with a real token and PR.
+func TestPrToolsWiring(t *testing.T) {
+	readOnly := []struct {
+		name    string
+		require []string
+	}{
+		{"pr_view", []string{"number"}},
+		{"pr_diff", []string{"number"}},
+		{"pr_checks", []string{"number"}},
+	}
+	mutating := []struct {
+		name    string
+		require []string
+	}{
+		{"pr_comment", []string{"number", "body"}},
+		{"pr_close", []string{"number"}},
+		{"pr_ready", []string{"number"}},
+		{"pr_edit", []string{"number"}},
+	}
+	type want struct {
+		name    string
+		require []string
+	}
+	all := make([]want, 0, len(readOnly)+len(mutating))
+	for _, w := range readOnly {
+		all = append(all, want{w.name, w.require})
+	}
+	for _, w := range mutating {
+		all = append(all, want{w.name, w.require})
+	}
+
+	defaults := defaultAgentTools()
+	menuByName := map[string]bool{}
+	for _, tm := range availableTools(false, nil) {
+		menuByName[tm.Name] = true
+	}
+	st, err := newStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	defer st.close()
+	srv := &server{cfg: config{contextLength: 8192}, store: st}
+	reg := srv.toolRegistry("")
+
+	// Every PR tool is a git tool: in localGitTools + localRepoTools, and
+	// absent from localFileTools (a non-git workspace must not get them).
+	for _, w := range all {
+		if !slicesContains(localGitTools(), w.name) {
+			t.Errorf("localGitTools() does not include %s", w.name)
+		}
+		if !slicesContains(localRepoTools(), w.name) {
+			t.Errorf("localRepoTools() does not include %s", w.name)
+		}
+		if slicesContains(localFileTools(), w.name) {
+			t.Errorf("localFileTools() must not include git-only tool %s", w.name)
+		}
+	}
+
+	for _, w := range all {
+		if !slicesContains(defaults, w.name) {
+			t.Errorf("defaultAgentTools() does not include %s", w.name)
+		}
+		if !menuByName[w.name] {
+			t.Errorf("availableTools(false, nil) does not include %s", w.name)
+		}
+		tool, ok := reg[w.name]
+		if !ok {
+			t.Errorf("toolRegistry does not register %s", w.name)
+			continue
+		}
+		if tool.schema.Function.Name != w.name {
+			t.Errorf("%s schema name = %q, want %s", w.name, tool.schema.Function.Name, w.name)
+		}
+		if !tool.local {
+			t.Errorf("%s must be a local (sidecar-relayed) tool, got local=false", w.name)
+		}
+		req, _ := tool.schema.Function.Parameters["required"].([]string)
+		for _, r := range w.require {
+			found := false
+			for _, got := range req {
+				if got == r {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("%s schema missing required %q arg: %v", w.name, r, req)
+			}
+		}
+	}
+
+	// Plan-mode split: the four mutating PR tools are write tools (gated out
+	// pre-approval); the three read-only ones are not.
+	planWrite := map[string]bool{}
+	for _, w := range planWriteTools() {
+		planWrite[w] = true
+	}
+	for _, w := range mutating {
+		if !planWrite[w.name] {
+			t.Errorf("planWriteTools() does not include mutating PR tool %s", w.name)
+		}
+	}
+	for _, w := range readOnly {
+		if planWrite[w.name] {
+			t.Errorf("planWriteTools() must not include read-only PR tool %s", w.name)
+		}
+	}
+}
