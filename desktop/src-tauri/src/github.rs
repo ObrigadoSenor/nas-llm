@@ -21,6 +21,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
@@ -1346,10 +1347,11 @@ async fn repos_exec(State(st): State<AppState>, Json(body): Json<ExecBody>) -> R
         Err(e) => return json_ok(&ExecResult { observation: format!("repo dir: {e}"), preview: "error".into(), is_error: true, ..Default::default() }),
     };
     let result = match body.tool.as_str() {
-        "read_file" => exec_read_file(&root, &body.args),
-        "list_files" => exec_list_files(&root, &body.args),
-        "glob" => exec_glob(&root, &body.args),
-        "grep" => exec_grep(&root, &body.args),
+        "read_file" => exec_read_file(&root, &body.args).await,
+        "list_files" => exec_list_files(&root, &body.args).await,
+        "tree" => exec_tree(&root, &body.args).await,
+        "glob" => exec_glob(&root, &body.args).await,
+        "grep" => exec_grep(&root, &body.args).await,
         "git_status" => exec_git_status(&root).await,
         "git_log" => exec_git_log(&root, &body.args).await,
         "list_prs" => exec_list_prs(&st.client, &root, &body.args).await,
@@ -1519,7 +1521,24 @@ async fn pipe_lines<R: AsyncRead + Unpin + Send>(reader: R, tx: mpsc::Sender<Str
 // move-source tools; create-oriented tools (write_file, move destination) use
 // resolve_new_path instead.
 fn safe_path(root: &Path, rel: &str) -> Result<PathBuf, String> {
-    let cleaned = rel.trim_start_matches(['/', '.']);
+    // Strip a leading "/" and any "./" prefix, but keep a leading "." that is
+    // part of a real name like ".gitignore" or ".env" (trim_start_matches(['/',
+    // '.']) would eat the dot and turn ".env" into "env", making every
+    // root-level dotfile unreadable). Mirrors resolve_new_path's dot handling.
+    let stripped = rel.trim_start_matches('/');
+    let cleaned = stripped.strip_prefix("./").unwrap_or(stripped);
+    if cleaned.is_empty() {
+        return Err("no path provided".into());
+    }
+    let norm = cleaned.replace('\\', "/");
+    if norm == ".git" || norm.starts_with(".git/") {
+        return Err("paths inside .git are not allowed".into());
+    }
+    for comp in std::path::Path::new(&norm).components() {
+        if matches!(comp, std::path::Component::ParentDir) {
+            return Err("path traversal (..) is not allowed".into());
+        }
+    }
     let candidate = root.join(cleaned);
     let canon = std::fs::canonicalize(&candidate).map_err(|e| format!("path not found: {e}"))?;
     if !canon.starts_with(root) {
@@ -1690,7 +1709,77 @@ fn cap(s: &str) -> String {
     }
 }
 
-fn exec_read_file(root: &Path, args: &str) -> ExecResult {
+// git_ignored_set returns (ignored_files, ignored_dirs) as repo-relative paths
+// via `git ls-files --others -i --exclude-standard --directory -z`. `--directory`
+// collapses a wholly-ignored directory into one `dir/` entry so a walk can prune
+// it without enumerating its contents; individual ignored files in otherwise-
+// tracked directories are listed by path. Empty on a fresh worktree (no ignored
+// files are materialized) — correct, since those files aren't on disk to walk.
+// A failed/missing git invocation yields empty sets (tools list everything),
+// never an error, so a non-git repo degrades gracefully.
+async fn git_ignored_set(root: &Path) -> (HashSet<String>, HashSet<String>) {
+    let out = tokio::process::Command::new("git")
+        .arg("-C").arg(root)
+        .arg("ls-files").arg("--others").arg("-i")
+        .arg("--exclude-standard").arg("--directory").arg("-z")
+        .output().await;
+    let mut files = HashSet::new();
+    let mut dirs = HashSet::new();
+    if let Ok(o) = out {
+        if o.status.success() {
+            for part in String::from_utf8_lossy(&o.stdout).split('\0') {
+                let p = part.trim();
+                if p.is_empty() {
+                    continue;
+                }
+                if let Some(d) = p.strip_suffix('/') {
+                    dirs.insert(d.to_string());
+                } else {
+                    files.insert(p.to_string());
+                }
+            }
+        }
+    }
+    (files, dirs)
+}
+
+// git_check_ignore reports whether a single resolved path is gitignored, via
+// `git check-ignore --quiet <rel>`. It classifies by name, so it catches a path
+// that does not exist on disk (a fresh worktree has no .env, but .env is still
+// ignored). Used by read_file to refuse secrets.
+async fn git_check_ignore(root: &Path, abs_path: &Path) -> bool {
+    let rel = match abs_path.strip_prefix(root) {
+        Ok(r) => r.to_string_lossy().to_string(),
+        Err(_) => return false,
+    };
+    let out = tokio::process::Command::new("git")
+        .arg("-C").arg(root)
+        .arg("check-ignore").arg("--quiet").arg(&rel)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status().await;
+    matches!(out, Ok(s) if s.success())
+}
+
+// is_ignored reports whether a repo-relative path is gitignored, using a
+// precomputed ignore set from git_ignored_set. A path is ignored if it is an
+// ignored file, an ignored directory, or lives beneath an ignored directory.
+fn is_ignored(rel: &str, files: &HashSet<String>, dirs: &HashSet<String>) -> bool {
+    if files.contains(rel) || dirs.contains(rel) {
+        return true;
+    }
+    let mut p = rel;
+    while let Some(i) = p.rfind('/') {
+        let ancestor = &p[..i];
+        if dirs.contains(ancestor) {
+            return true;
+        }
+        p = ancestor;
+    }
+    false
+}
+
+async fn exec_read_file(root: &Path, args: &str) -> ExecResult {
     let p = match serde_json::from_str::<serde_json::Value>(args) {
         Ok(v) => v.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string(),
         Err(_) => return ExecResult { observation: "Invalid args for read_file.".into(), preview: "bad args".into(), is_error: true,
@@ -1708,13 +1797,24 @@ fn exec_read_file(root: &Path, args: &str) -> ExecResult {
             ..Default::default()
         },
     };
+    // Refuse gitignored paths (e.g. .env): they are secrets, and in a per-branch
+    // worktree they are absent anyway. git check-ignore classifies by name, so
+    // this fires whether or not the file is materialized on disk.
+    if git_check_ignore(root, &path).await {
+        return ExecResult {
+            observation: format!("{p} is gitignored and not materialized in this isolated worktree; it is a secret and won't be read. See .gitignore."),
+            preview: "ignored (secret)".into(),
+            is_error: true,
+            ..Default::default()
+        };
+    }
     match std::fs::read_to_string(&path) {
         Ok(content) => ExecResult { observation: cap(&content), preview: format!("read {} ({} bytes)", p, content.len()), is_error: false, ..Default::default() },
         Err(e) => ExecResult { observation: format!("Could not read {p}: {e}"), preview: format!("read error: {p}"), is_error: true, ..Default::default() },
     }
 }
 
-fn exec_list_files(root: &Path, args: &str) -> ExecResult {
+async fn exec_list_files(root: &Path, args: &str) -> ExecResult {
     let subdir = serde_json::from_str::<serde_json::Value>(args)
         .ok()
         .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(String::from))
@@ -1732,11 +1832,20 @@ fn exec_list_files(root: &Path, args: &str) -> ExecResult {
     if !dir.is_dir() {
         return ExecResult { observation: format!("{subdir} is not a directory."), preview: "not a dir".into(), is_error: true, ..Default::default() };
     }
+    let (files, dirs) = git_ignored_set(root).await;
     let mut entries: Vec<String> = std::fs::read_dir(&dir)
         .map(|rd| rd.filter_map(|e| e.ok())
             .map(|e| {
                 let name = e.file_name().to_string_lossy().to_string();
-                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) { format!("{name}/") } else { name }
+                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                let suffix = if is_dir { "/" } else { "" };
+                let path = e.path();
+                let rel = path.strip_prefix(root).unwrap_or(&path).display().to_string();
+                if is_ignored(&rel, &files, &dirs) {
+                    format!("{name}{suffix} (ignored)")
+                } else {
+                    format!("{name}{suffix}")
+                }
             })
             .collect())
         .unwrap_or_default();
@@ -1745,7 +1854,7 @@ fn exec_list_files(root: &Path, args: &str) -> ExecResult {
     ExecResult { observation: cap(&listing), preview: format!("{} entries", entries.len()), is_error: false, ..Default::default() }
 }
 
-fn exec_glob(root: &Path, args: &str) -> ExecResult {
+async fn exec_glob(root: &Path, args: &str) -> ExecResult {
     let pattern = match serde_json::from_str::<serde_json::Value>(args) {
         Ok(v) => v.get("pattern").and_then(|p| p.as_str()).unwrap_or("").to_string(),
         Err(_) => return ExecResult { observation: "Invalid args for glob.".into(), preview: "bad args".into(), is_error: true,
@@ -1757,19 +1866,24 @@ fn exec_glob(root: &Path, args: &str) -> ExecResult {
             ..Default::default()
         };
     }
-    let matches = glob_walk(root, root, &pattern, 0, 1000);
+    let (files, dirs) = git_ignored_set(root).await;
+    let matches = glob_walk(root, root, &pattern, 0, 1000, &files, &dirs);
     let result = matches.join("\n");
     ExecResult { observation: cap(&result), preview: format!("{} matches", matches.len()), is_error: false, ..Default::default() }
 }
 
 // glob_walk recursively walks the tree and collects paths matching a simple
-// glob pattern (supports ** and * wildcards). Capped at max_results.
-fn glob_walk(root: &Path, dir: &Path, pattern: &str, depth: usize, max: usize) -> Vec<String> {
+// glob pattern (supports ** and * wildcards). Capped at max_results. Dotfiles
+// are NOT skipped (so .gitignore/.env.example are findable); only .git,
+// node_modules, and target are pruned as noise. Gitignored matches are returned
+// with an " (ignored)" suffix so the agent learns they exist without reading
+// them; ignored directories are not recursed into.
+fn glob_walk(root: &Path, dir: &Path, pattern: &str, depth: usize, max: usize, files: &HashSet<String>, dirs: &HashSet<String>) -> Vec<String> {
     if depth > 15 {
         return vec![];
     }
     let mut out = Vec::new();
-    let skip = |name: &str| name.starts_with('.') || name == "node_modules" || name == "target" || name == ".git";
+    let skip = |name: &str| name == ".git" || name == "node_modules" || name == "target";
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
             if out.len() >= max {
@@ -1781,9 +1895,16 @@ fn glob_walk(root: &Path, dir: &Path, pattern: &str, depth: usize, max: usize) -
             }
             let path = e.path();
             let rel = path.strip_prefix(root).unwrap_or(&path).display().to_string();
-            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                out.extend(glob_walk(root, &path, pattern, depth + 1, max - out.len()));
-            } else if glob_match(&pattern, &rel) {
+            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if is_ignored(&rel, files, dirs) {
+                if glob_match(pattern, &rel) {
+                    out.push(if is_dir { format!("{rel}/ (ignored)") } else { format!("{rel} (ignored)") });
+                }
+                continue;
+            }
+            if is_dir {
+                out.extend(glob_walk(root, &path, pattern, depth + 1, max - out.len(), files, dirs));
+            } else if glob_match(pattern, &rel) {
                 out.push(rel);
             }
         }
@@ -1821,7 +1942,7 @@ fn glob_match_segments(pat: &[&str], path: &[&str]) -> bool {
     }
 }
 
-fn exec_grep(root: &Path, args: &str) -> ExecResult {
+async fn exec_grep(root: &Path, args: &str) -> ExecResult {
     let v = match serde_json::from_str::<serde_json::Value>(args) {
         Ok(v) => v,
         Err(_) => return ExecResult { observation: "Invalid args for grep.".into(), preview: "bad args".into(), is_error: true,
@@ -1838,17 +1959,18 @@ fn exec_grep(root: &Path, args: &str) -> ExecResult {
     let search_root = if subdir.is_empty() { root.to_path_buf() } else { match safe_path(root, &subdir) { Ok(p) => p, Err(e) => return ExecResult { observation: e.clone(), preview: e, is_error: true,
             ..Default::default()
         } } };
+    let (files, dirs) = git_ignored_set(root).await;
     let mut matches = Vec::new();
-    grep_walk(root, &search_root, &pattern, &mut matches, 0, 200);
+    grep_walk(root, &search_root, &pattern, &mut matches, 0, 200, &files, &dirs);
     let result = matches.join("\n");
     ExecResult { observation: cap(&result), preview: format!("{} matches", matches.len()), is_error: false, ..Default::default() }
 }
 
-fn grep_walk(root: &Path, dir: &Path, pattern: &str, out: &mut Vec<String>, depth: usize, max: usize) {
+fn grep_walk(root: &Path, dir: &Path, pattern: &str, out: &mut Vec<String>, depth: usize, max: usize, files: &HashSet<String>, dirs: &HashSet<String>) {
     if depth > 15 || out.len() >= max {
         return;
     }
-    let skip = |name: &str| name.starts_with('.') || name == "node_modules" || name == "target" || name == ".git";
+    let skip = |name: &str| name == ".git" || name == "node_modules" || name == "target";
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
             if out.len() >= max {
@@ -1859,10 +1981,15 @@ fn grep_walk(root: &Path, dir: &Path, pattern: &str, out: &mut Vec<String>, dept
                 continue;
             }
             let path = e.path();
+            let rel = path.strip_prefix(root).unwrap_or(&path).display().to_string();
+            // Never open gitignored files (secrets) and don't descend into
+            // ignored directories.
+            if is_ignored(&rel, files, dirs) {
+                continue;
+            }
             if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                grep_walk(root, &path, pattern, out, depth + 1, max);
+                grep_walk(root, &path, pattern, out, depth + 1, max, files, dirs);
             } else if let Ok(content) = std::fs::read_to_string(&path) {
-                let rel = path.strip_prefix(root).unwrap_or(&path).display().to_string();
                 for (i, line) in content.lines().enumerate() {
                     if line.contains(pattern) {
                         let snippet = if line.len() > 200 { format!("{}...", &line[..200]) } else { line.to_string() };
@@ -1873,6 +2000,77 @@ fn grep_walk(root: &Path, dir: &Path, pattern: &str, out: &mut Vec<String>, dept
                     }
                 }
             }
+        }
+    }
+}
+
+async fn exec_tree(root: &Path, args: &str) -> ExecResult {
+    let v = match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(v) => v,
+        Err(_) => return ExecResult { observation: "Invalid args for tree.".into(), preview: "bad args".into(), is_error: true, ..Default::default() },
+    };
+    let subdir = v.get("path").and_then(|p| p.as_str()).unwrap_or("").trim().to_string();
+    let depth = v
+        .get("depth")
+        .and_then(|d| d.as_u64())
+        .filter(|d| *d > 0)
+        .unwrap_or(3)
+        .min(6) as usize;
+    let dir = if subdir.is_empty() || subdir == "." {
+        root.to_path_buf()
+    } else {
+        match safe_path(root, &subdir) {
+            Ok(p) => p,
+            Err(e) => return ExecResult { observation: e.clone(), preview: e, is_error: true, ..Default::default() },
+        }
+    };
+    if !dir.is_dir() {
+        return ExecResult { observation: format!("{subdir} is not a directory."), preview: "not a dir".into(), is_error: true, ..Default::default() };
+    }
+    let (files, dirs) = git_ignored_set(root).await;
+    let mut out: Vec<String> = Vec::new();
+    tree_walk(root, &dir, "", 0, depth, &mut out, &files, &dirs);
+    out.sort();
+    if out.len() > 1000 {
+        out.truncate(1000);
+    }
+    let result = out.join("\n");
+    ExecResult { observation: cap(&result), preview: format!("{} entries", out.len()), is_error: false, ..Default::default() }
+}
+
+// tree_walk collects a depth-limited recursive listing of repo-relative paths
+// into out (directories suffixed with /). .git/node_modules/target are pruned
+// as noise; gitignored entries are emitted with an " (ignored)" suffix and not
+// recursed into. rel_prefix is the repo-relative path of dir ("" for root).
+fn tree_walk(root: &Path, dir: &Path, rel_prefix: &str, depth: usize, max_depth: usize, out: &mut Vec<String>, files: &HashSet<String>, dirs: &HashSet<String>) {
+    if depth >= max_depth {
+        return;
+    }
+    let rd = match std::fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let mut entries: Vec<(String, bool, PathBuf)> = Vec::new();
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name == ".git" || name == "node_modules" || name == "target" {
+            continue;
+        }
+        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        entries.push((name, is_dir, e.path()));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, is_dir, path) in entries {
+        let rel = if rel_prefix.is_empty() { name.clone() } else { format!("{rel_prefix}/{name}") };
+        if is_ignored(&rel, files, dirs) {
+            out.push(if is_dir { format!("{rel}/ (ignored)") } else { format!("{rel} (ignored)") });
+            continue;
+        }
+        if is_dir {
+            out.push(format!("{rel}/"));
+            tree_walk(root, &path, &rel, depth + 1, max_depth, out, files, dirs);
+        } else {
+            out.push(rel);
         }
     }
 }
@@ -4007,6 +4205,126 @@ mod tests {
         assert!(res.observation.contains("unchanged"));
         // file untouched
         assert_eq!(std::fs::read_to_string(root.join("f.txt")).unwrap(), "a\nb\n");
+    }
+
+    // init_test_repo_with_ignore is init_test_repo plus a committed .gitignore
+    // (ignoring .env and ignored_dir/) with .env and ignored_dir/x.txt left
+    // untracked on disk, so the gitignore-aware file tools have something to
+    // mark (discovery) / skip (content). f.txt holds a distinctive token so grep
+    // can assert ignored files are never searched.
+    async fn init_test_repo_with_ignore() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path();
+        let env = [
+            ("GIT_AUTHOR_NAME", "T"),
+            ("GIT_AUTHOR_EMAIL", "t@t"),
+            ("GIT_COMMITTER_NAME", "T"),
+            ("GIT_COMMITTER_EMAIL", "t@t"),
+        ];
+        let mut cmd = tokio::process::Command::new("git");
+        cmd.arg("-C").arg(p).arg("init").arg("-q");
+        for (k, v) in env { cmd.env(k, v); }
+        let _ = cmd.output().await.expect("git init");
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(p).arg("config").arg("user.name").arg("T")
+            .output().await.expect("git config name");
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(p).arg("config").arg("user.email").arg("t@t")
+            .output().await.expect("git config email");
+        // .gitignore is committed BEFORE git add -A so .env/ignored_dir/ stay
+        // untracked (ignored), while .gitignore and f.txt are tracked.
+        std::fs::write(p.join(".gitignore"), ".env\nignored_dir/\n").unwrap();
+        std::fs::write(p.join("f.txt"), "a\nb\nSECRETTOKEN\n").unwrap();
+        std::fs::write(p.join(".env"), "TOPSECRET=value\n").unwrap();
+        std::fs::create_dir_all(p.join("ignored_dir")).unwrap();
+        std::fs::write(p.join("ignored_dir/x.txt"), "ignored content\n").unwrap();
+        let mut add = tokio::process::Command::new("git");
+        add.arg("-C").arg(p).arg("add").arg("-A");
+        for (k, v) in env { add.env(k, v); }
+        let _ = add.output().await.expect("git add");
+        let mut commit = tokio::process::Command::new("git");
+        commit.arg("-C").arg(p).arg("commit").arg("-q").arg("-m").arg("init");
+        for (k, v) in env { commit.env(k, v); }
+        let _ = commit.output().await.expect("git commit");
+        dir
+    }
+
+    #[tokio::test]
+    async fn read_file_refuses_gitignored_secret() {
+        let dir = init_test_repo_with_ignore().await;
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        // .env is gitignored → refused, and its contents never enter the
+        // observation (the agent must not be able to read a secret).
+        let r = exec_read_file(&root, &j(serde_json::json!({"path":".env"}))).await;
+        assert!(r.is_error, "expected refusal, got: {}", r.observation);
+        assert!(r.observation.contains("gitignored"), "got: {}", r.observation);
+        assert!(r.observation.contains("secret"), "got: {}", r.observation);
+        assert!(!r.observation.contains("TOPSECRET"), "refusal leaked contents: {}", r.observation);
+        // A tracked dotfile (.gitignore) reads normally now that safe_path
+        // preserves leading dots (previously ".gitignore" → "gitignore", fail).
+        let r2 = exec_read_file(&root, &j(serde_json::json!({"path":".gitignore"}))).await;
+        assert!(!r2.is_error, "expected .gitignore to read, got: {}", r2.observation);
+        assert!(r2.observation.contains(".env"));
+    }
+
+    #[tokio::test]
+    async fn tree_marks_ignored_and_lists_dotfiles() {
+        let dir = init_test_repo_with_ignore().await;
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let r = exec_tree(&root, &j(serde_json::json!({"path":"."}))).await;
+        assert!(!r.is_error, "{}", r.observation);
+        // tracked dotfile is listed (no longer hidden behind the dotfile skip).
+        assert!(r.observation.contains(".gitignore"), "missing .gitignore: {}", r.observation);
+        // ignored file + dir are marked (ignored); the dir's contents are not
+        // listed as normal entries (asserted via the content not leaking).
+        assert!(r.observation.contains(".env (ignored)"), "missing .env mark: {}", r.observation);
+        assert!(r.observation.contains("ignored_dir/"), "ignored dir not surfaced: {}", r.observation);
+        assert!(r.observation.contains("(ignored)"), "ignored dir not marked: {}", r.observation);
+        assert!(r.observation.contains("f.txt"), "missing f.txt: {}", r.observation);
+        assert!(!r.observation.contains("TOPSECRET"), "leaked .env content: {}", r.observation);
+        assert!(!r.observation.contains("ignored content"), "leaked ignored_dir content: {}", r.observation);
+    }
+
+    #[tokio::test]
+    async fn tree_depth_cap_recurses_only_to_max_depth() {
+        let dir = init_test_repo_with_ignore().await;
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/nested.txt"), "n\n").unwrap();
+        // depth=1 lists the top-level subdir but does not recurse into it.
+        let r1 = exec_tree(&root, &j(serde_json::json!({"path":".","depth":1}))).await;
+        assert!(r1.observation.contains("sub/"), "depth=1 should list sub/: {}", r1.observation);
+        assert!(!r1.observation.contains("sub/nested.txt"), "depth=1 recursed: {}", r1.observation);
+        // depth=3 reaches the nested file.
+        let r2 = exec_tree(&root, &j(serde_json::json!({"path":".","depth":3}))).await;
+        assert!(r2.observation.contains("sub/nested.txt"), "depth=3 missed nested: {}", r2.observation);
+    }
+
+    #[tokio::test]
+    async fn glob_finds_tracked_dotfile_and_marks_ignored() {
+        let dir = init_test_repo_with_ignore().await;
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let r = exec_glob(&root, &j(serde_json::json!({"pattern":"*"}))).await;
+        assert!(!r.is_error, "{}", r.observation);
+        assert!(r.observation.contains(".gitignore"), "missing .gitignore: {}", r.observation);
+        assert!(r.observation.contains(".env (ignored)"), "missing .env mark: {}", r.observation);
+        assert!(!r.observation.contains("TOPSECRET"), "glob leaked .env: {}", r.observation);
+    }
+
+    #[tokio::test]
+    async fn grep_skips_gitignored_files() {
+        let dir = init_test_repo_with_ignore().await;
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        // "SECRET" is in f.txt (tracked) and .env (ignored): only f.txt matches.
+        let r = exec_grep(&root, &j(serde_json::json!({"pattern":"SECRET"}))).await;
+        assert!(!r.is_error, "{}", r.observation);
+        assert!(r.observation.contains("f.txt"), "expected f.txt match: {}", r.observation);
+        assert!(!r.observation.contains(".env"), "grep searched ignored .env: {}", r.observation);
+        assert!(!r.observation.contains("TOPSECRET"), "grep leaked .env: {}", r.observation);
+        // A token present only in the ignored file yields no matches at all.
+        let r2 = exec_grep(&root, &j(serde_json::json!({"pattern":"TOPSECRET"}))).await;
+        assert!(!r2.is_error);
+        assert!(!r2.observation.contains("TOPSECRET"), "grep leaked ignored-only match: {}", r2.observation);
     }
 }
 

@@ -127,3 +127,48 @@ func TestMergePrToolWiring(t *testing.T) {
 		t.Errorf("merge_pr schema missing required \"number\" arg: %v", req)
 	}
 }
+
+// TestTreeToolWiring guards the backend registration of the read-only tree
+// agent tool across the four surfaces that must agree for it to be offered to a
+// repo-bound agent run: the local repo tool list (localRepoTools), the default
+// allowlist (defaultAgentTools, which appends localRepoTools), the tool registry
+// (schema + local-relay flag), and the UI-facing availableTools list (which
+// appends localToolMetas). Mirrors TestMergePrToolWiring's pattern: it prevents
+// a silent wiring regression that would make tree vanish without any other test
+// failing. The sidecar executor (exec_tree) is covered by the Rust #[cfg(test)]
+// module in github.rs.
+func TestTreeToolWiring(t *testing.T) {
+	if !slicesContains(localRepoTools(), "tree") {
+		t.Errorf("localRepoTools() does not include tree")
+	}
+	if !slicesContains(defaultAgentTools(), "tree") {
+		t.Errorf("defaultAgentTools() does not include tree")
+	}
+	seenUI := false
+	for _, tm := range availableTools(false) {
+		if tm.Name == "tree" {
+			seenUI = true
+			break
+		}
+	}
+	if !seenUI {
+		t.Errorf("availableTools(false) does not include tree")
+	}
+	st, err := newStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	defer st.close()
+	srv := &server{cfg: config{contextLength: 8192}, store: st}
+	reg := srv.toolRegistry("")
+	tool, ok := reg["tree"]
+	if !ok {
+		t.Fatalf("toolRegistry does not register tree")
+	}
+	if tool.schema.Function.Name != "tree" {
+		t.Errorf("tree schema name = %q, want tree", tool.schema.Function.Name)
+	}
+	if !tool.local {
+		t.Error("tree must be a local (sidecar-relayed) tool, got local=false")
+	}
+}

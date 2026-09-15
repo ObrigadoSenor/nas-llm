@@ -1075,3 +1075,54 @@ func TestReconcileJobsLeavesPausedAlone(t *testing.T) {
 		t.Errorf("generating job status = %q, want error", genStatus)
 	}
 }
+
+// TestInjectRepoContext verifies the repo-context system-prompt block is
+// worktree- and secret-aware: a branch-bound (worktree) run names the bound
+// branch, states gitignored files like .env are absent by design and must never
+// be read, and lists tree among the exploration tools; a branchless run uses
+// the repo's main working tree. Guards the primary remedy for the "agent can't
+// find .env" confusion — .env is gitignored, so it is not materialized in a
+// fresh per-branch worktree, and the prompt now says so instead of leaving the
+// model to flail.
+func TestInjectRepoContext(t *testing.T) {
+	repo := &Repo{
+		FullName: "owner/repo",
+		Branch:   "main",
+		Head:     "0123456789abcdef0123456789abcdef01234567",
+		Tree:     []string{"backend/", "www/", ".gitignore"},
+	}
+	const sys = "BASE PROMPT"
+
+	gotWorktree := injectRepoContext(sys, repo, "agent/foo-123")
+	if !strings.Contains(gotWorktree, "owner/repo") {
+		t.Errorf("worktree prompt missing repo name: %q", gotWorktree)
+	}
+	if !strings.Contains(gotWorktree, "agent/foo-123") {
+		t.Errorf("worktree prompt missing bound branch: %q", gotWorktree)
+	}
+	if !strings.Contains(gotWorktree, "isolated per-branch git worktree") {
+		t.Errorf("worktree prompt missing worktree notice: %q", gotWorktree)
+	}
+	if !strings.Contains(gotWorktree, ".env") || !strings.Contains(gotWorktree, "secret") {
+		t.Errorf("worktree prompt missing .env/secret guidance: %q", gotWorktree)
+	}
+	if !strings.Contains(gotWorktree, "tree") {
+		t.Errorf("worktree prompt missing tree tool: %q", gotWorktree)
+	}
+	if !strings.Contains(gotWorktree, sys) {
+		t.Errorf("worktree prompt did not append base system prompt: %q", gotWorktree)
+	}
+
+	// Branchless: uses the repo's main working tree, still secret-aware, and
+	// must NOT claim an isolated worktree.
+	gotMain := injectRepoContext(sys, repo, "")
+	if !strings.Contains(gotMain, "main working tree") {
+		t.Errorf("branchless prompt missing main-tree notice: %q", gotMain)
+	}
+	if !strings.Contains(gotMain, ".env") || !strings.Contains(gotMain, "secret") {
+		t.Errorf("branchless prompt missing .env/secret guidance: %q", gotMain)
+	}
+	if strings.Contains(gotMain, "isolated per-branch git worktree") {
+		t.Errorf("branchless prompt wrongly claims a worktree: %q", gotMain)
+	}
+}
