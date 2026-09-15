@@ -435,7 +435,7 @@ async function titleForConv(convId) {
 // so they always prompt regardless of the auto-approve setting.
 const AUTO_APPROVE_TOOLS = new Set(["apply_patch", "run_command", "git_commit", "git_push", "write_file", "edit_file", "move_path"]);
 // Command-shaped tools render a Warp-style block; run_command additionally streams.
-const COMMAND_TOOLS = new Set(["run_command", "apply_patch", "git_commit", "git_push", "create_pr", "merge_pr", "pr_comment", "pr_close", "pr_ready", "pr_edit", "write_file", "edit_file", "move_path", "delete_path", "ssh_run"]);
+const COMMAND_TOOLS = new Set(["run_command", "apply_patch", "git_commit", "git_push", "create_pr", "merge_pr", "pr_comment", "pr_close", "pr_ready", "pr_edit", "create_repo", "link_remote", "write_file", "edit_file", "move_path", "delete_path", "ssh_run"]);
 // Keep last ~64KB of streamed command output for the observation / block body.
 const STREAM_OUTPUT_CAP = 65536;
 function capStreamOutput(s){ s = String(s||""); return s.length > STREAM_OUTPUT_CAP ? s.slice(-STREAM_OUTPUT_CAP) : s; }

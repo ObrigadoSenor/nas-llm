@@ -46,7 +46,7 @@ func TestLocalToolPartition(t *testing.T) {
 		}
 	}
 	// Specifically: the git workflow tools are gated out of a non-git workspace.
-	wantGit := []string{"git_status", "git_log", "list_prs", "git_commit", "git_push", "create_pr", "merge_pr", "pr_view", "pr_diff", "pr_checks", "pr_comment", "pr_close", "pr_ready", "pr_edit"}
+	wantGit := []string{"git_status", "git_log", "list_prs", "git_commit", "git_push", "create_pr", "merge_pr", "pr_view", "pr_diff", "pr_checks", "pr_comment", "pr_close", "pr_ready", "pr_edit", "create_repo", "link_remote"}
 	for _, name := range wantGit {
 		if fileSet[name] {
 			t.Errorf("localFileTools() includes git-only tool %s (should be gated for non-git)", name)
@@ -87,7 +87,7 @@ func TestInjectWorkspaceContext(t *testing.T) {
 	if !strings.Contains(out, "README.md") || !strings.Contains(out, "drafts/") {
 		t.Error("injectWorkspaceContext does not list the top-level tree")
 	}
-	for _, git := range []string{"git_status", "git_log", "git_commit", "git_push", "create_pr", "list_prs", "merge_pr", "pr_view", "pr_diff", "pr_checks", "pr_comment", "pr_close", "pr_ready", "pr_edit"} {
+	for _, git := range []string{"git_status", "git_log", "git_commit", "git_push", "create_pr", "list_prs", "merge_pr", "pr_view", "pr_diff", "pr_checks", "pr_comment", "pr_close", "pr_ready", "pr_edit", "create_repo", "link_remote"} {
 		if !strings.Contains(out, git) {
 			t.Errorf("injectWorkspaceContext does not forbid git tool %s", git)
 		}
