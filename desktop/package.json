@@ -6,7 +6,8 @@
   "scripts": {
     "tauri": "tauri",
     "desktop": "tauri dev",
-    "desktop:build": "tauri build"
+    "desktop:build": "tauri build",
+    "desktop:signed": "bash scripts/dev.sh"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0"
