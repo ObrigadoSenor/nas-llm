@@ -342,7 +342,7 @@ fn git_not_enabled() -> Response {
 fn is_git_tool(tool: &str) -> bool {
 	matches!(
 		tool,
-		"git_status" | "git_log" | "list_prs" | "git_commit" | "git_push" | "create_pr" | "merge_pr"
+		"git_status" | "git_log" | "list_prs" | "git_commit" | "git_push" | "create_pr" | "merge_pr" | "pr_view" | "pr_diff" | "pr_checks" | "pr_comment" | "pr_close" | "pr_ready" | "pr_edit"
 	)
 }
 
@@ -1652,10 +1652,17 @@ async fn repos_exec(State(st): State<AppState>, Json(body): Json<ExecBody>) -> R
         "git_status" => exec_git_status(&root).await,
         "git_log" => exec_git_log(&root, &body.args).await,
         "list_prs" => exec_list_prs(&st.client, &root, &body.args).await,
+        "pr_view" => exec_pr_view(&st.client, &root, &body.args).await,
+        "pr_diff" => exec_pr_diff(&st.client, &root, &body.args).await,
+        "pr_checks" => exec_pr_checks(&st.client, &root, &body.args).await,
         "git_commit" => exec_git_commit(&root, &body.args, body.approved).await,
         "git_push" => exec_git_push(&root, &body.args, body.approved).await,
         "create_pr" => exec_create_pr(&st.client, &root, &body.args, body.approved).await,
         "merge_pr" => exec_merge_pr(&st.client, &root, &body.args, body.approved).await,
+        "pr_comment" => exec_pr_comment(&st.client, &root, &body.args, body.approved).await,
+        "pr_close" => exec_pr_close(&st.client, &root, &body.args, body.approved).await,
+        "pr_ready" => exec_pr_ready(&st.client, &root, &body.args, body.approved).await,
+        "pr_edit" => exec_pr_edit(&st.client, &root, &body.args, body.approved).await,
         "apply_patch" => exec_apply_patch(&root, &body.args, body.approved).await,
         "run_command" => exec_run_command(&root, &body.args, body.approved, body.run_command_timeout_ms).await,
         "write_file" => exec_write_file(&root, &body.args, body.approved).await,
@@ -3520,6 +3527,485 @@ async fn exec_merge_pr(client: &reqwest::Client, root: &Path, args: &str, approv
             is_error: true,
             ..Default::default()
         },
+    }
+}
+
+// parse_pr_number extracts the "number" field from a PR tool's args JSON.
+fn parse_pr_number(args: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(args)
+        .ok()
+        .and_then(|v| v.get("number").and_then(|n| n.as_u64()))
+}
+
+// exec_pr_view returns a single PR's full details: title, body, state, draft,
+// merged, head→base, mergeable state, CI status, and review state. Read-only —
+// never approval-gated. Reuses pr_ci_state/pr_review_state for enrichment.
+// github.com repos only.
+async fn exec_pr_view(client: &reqwest::Client, root: &Path, args: &str) -> ExecResult {
+    let number = match parse_pr_number(args) {
+        Some(n) => n,
+        None => return ExecResult { observation: "No PR number provided.".into(), preview: "no number".into(), is_error: true, ..Default::default() },
+    };
+    let remote = match git_remote_url(root).await {
+        Some(r) => r,
+        None => return ExecResult { observation: "no remote configured".into(), preview: "no remote".into(), is_error: true, ..Default::default() },
+    };
+    let full_name = match github_full_name(&remote) {
+        Some(f) => f,
+        None => return ExecResult { observation: "pr_view is only supported for github.com repos".into(), preview: "not github".into(), is_error: true, ..Default::default() },
+    };
+    let token = match token_get() {
+        Some(t) => t,
+        None => return ExecResult { observation: "no github token stored (connect github first)".into(), preview: "no token".into(), is_error: true, ..Default::default() },
+    };
+    let url = format!("{GH_API}/repos/{}/pulls/{}", full_name, number);
+    let resp = match client.get(&url).headers(gh_headers(&token)).timeout(std::time::Duration::from_secs(10)).send().await {
+        Ok(r) => r,
+        Err(e) => return ExecResult { observation: format!("github unreachable: {}", scrub(e.to_string(), &token)), preview: "github error".into(), is_error: true, ..Default::default() },
+    };
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let msg = parse_github_error(&body).unwrap_or_else(|| format!("github returned {}", body));
+        return ExecResult { observation: format!("pr_view failed: {}", scrub(msg, &token)), preview: "PR fetch failed".into(), is_error: true, ..Default::default() };
+    }
+    let pr: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => return ExecResult { observation: format!("bad github response: {}", scrub(e.to_string(), &token)), preview: "github error".into(), is_error: true, ..Default::default() },
+    };
+    let title = pr.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let state = pr.get("state").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let draft = pr.get("draft").and_then(|v| v.as_bool()).unwrap_or(false);
+    let merged = pr.get("merged").and_then(|v| v.as_bool()).unwrap_or(false);
+    let merged_at = pr.get("merged_at").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let head = pr.get("head").and_then(|h| h.get("ref")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let base = pr.get("base").and_then(|b| b.get("ref")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let body = pr.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let mergeable = pr.get("mergeable_state").and_then(|v| v.as_str()).map(String::from).filter(|s| !s.is_empty() && s != "unknown");
+    let head_sha = pr.get("head").and_then(|h| h.get("sha")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let ci_state = if head_sha.is_empty() { None } else { pr_ci_state(client, &full_name, &head_sha, &token).await };
+    let review_state = pr_review_state(client, &full_name, number, &token).await;
+    let html_url = pr.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let mut s = format!("#{} \"{}\" {}→{} state={}", number, title, head, base, state);
+    if draft {
+        s.push_str(" [draft]");
+    }
+    if merged {
+        s.push_str(" [merged");
+        if !merged_at.is_empty() {
+            s.push_str(&format!(" at {}", merged_at));
+        }
+        s.push(']');
+    }
+    if let Some(m) = &mergeable {
+        s.push_str(&format!(" mergeable={}", m));
+    }
+    if let Some(ci) = &ci_state {
+        s.push_str(&format!(" CI={}", ci));
+    }
+    if let Some(rv) = &review_state {
+        s.push_str(&format!(" reviews={}", rv));
+    }
+    if !html_url.is_empty() {
+        s.push_str(&format!("\n{}", html_url));
+    }
+    if !body.is_empty() {
+        s.push_str(&format!("\n\n{}", body));
+    }
+    ExecResult { observation: cap(&s), preview: format!("PR #{} \"{}\"", number, title), is_error: false, ..Default::default() }
+}
+
+// exec_pr_diff fetches a PR's unified diff via the application/vnd.github.v3.diff
+// media type. Read-only. The diff is capped before being fed to the model.
+// github.com repos only.
+async fn exec_pr_diff(client: &reqwest::Client, root: &Path, args: &str) -> ExecResult {
+    let number = match parse_pr_number(args) {
+        Some(n) => n,
+        None => return ExecResult { observation: "No PR number provided.".into(), preview: "no number".into(), is_error: true, ..Default::default() },
+    };
+    let remote = match git_remote_url(root).await {
+        Some(r) => r,
+        None => return ExecResult { observation: "no remote configured".into(), preview: "no remote".into(), is_error: true, ..Default::default() },
+    };
+    let full_name = match github_full_name(&remote) {
+        Some(f) => f,
+        None => return ExecResult { observation: "pr_diff is only supported for github.com repos".into(), preview: "not github".into(), is_error: true, ..Default::default() },
+    };
+    let token = match token_get() {
+        Some(t) => t,
+        None => return ExecResult { observation: "no github token stored (connect github first)".into(), preview: "no token".into(), is_error: true, ..Default::default() },
+    };
+    let url = format!("{GH_API}/repos/{}/pulls/{}", full_name, number);
+    let mut h = gh_headers(&token);
+    h.insert(reqwest::header::ACCEPT, HeaderValue::from_static("application/vnd.github.v3.diff"));
+    let resp = match client.get(&url).headers(h).timeout(std::time::Duration::from_secs(15)).send().await {
+        Ok(r) => r,
+        Err(e) => return ExecResult { observation: format!("github unreachable: {}", scrub(e.to_string(), &token)), preview: "github error".into(), is_error: true, ..Default::default() },
+    };
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let msg = parse_github_error(&body).unwrap_or_else(|| format!("github returned {}", body));
+        return ExecResult { observation: format!("pr_diff failed: {}", scrub(msg, &token)), preview: "diff failed".into(), is_error: true, ..Default::default() };
+    }
+    let diff = resp.text().await.unwrap_or_default();
+    if diff.trim().is_empty() {
+        return ExecResult { observation: "No diff available (the PR may have no changes or be already merged).".into(), preview: "empty diff".into(), is_error: false, ..Default::default() };
+    }
+    ExecResult { observation: cap(&diff), preview: format!("diff for PR #{}", number), is_error: false, ..Default::default() }
+}
+
+// exec_pr_checks reports a PR's per-context CI states and review state summary.
+// Read-only. Fetches the PR for its head sha, then the combined commit status
+// (with per-context breakdown) and the review summary. github.com repos only.
+async fn exec_pr_checks(client: &reqwest::Client, root: &Path, args: &str) -> ExecResult {
+    let number = match parse_pr_number(args) {
+        Some(n) => n,
+        None => return ExecResult { observation: "No PR number provided.".into(), preview: "no number".into(), is_error: true, ..Default::default() },
+    };
+    let remote = match git_remote_url(root).await {
+        Some(r) => r,
+        None => return ExecResult { observation: "no remote configured".into(), preview: "no remote".into(), is_error: true, ..Default::default() },
+    };
+    let full_name = match github_full_name(&remote) {
+        Some(f) => f,
+        None => return ExecResult { observation: "pr_checks is only supported for github.com repos".into(), preview: "not github".into(), is_error: true, ..Default::default() },
+    };
+    let token = match token_get() {
+        Some(t) => t,
+        None => return ExecResult { observation: "no github token stored (connect github first)".into(), preview: "no token".into(), is_error: true, ..Default::default() },
+    };
+    let pr_url = format!("{GH_API}/repos/{}/pulls/{}", full_name, number);
+    let pr_resp = match client.get(&pr_url).headers(gh_headers(&token)).timeout(std::time::Duration::from_secs(10)).send().await {
+        Ok(r) => r,
+        Err(e) => return ExecResult { observation: format!("github unreachable: {}", scrub(e.to_string(), &token)), preview: "github error".into(), is_error: true, ..Default::default() },
+    };
+    if !pr_resp.status().is_success() {
+        let body = pr_resp.text().await.unwrap_or_default();
+        let msg = parse_github_error(&body).unwrap_or_else(|| format!("github returned {}", body));
+        return ExecResult { observation: format!("pr_checks failed: {}", scrub(msg, &token)), preview: "PR fetch failed".into(), is_error: true, ..Default::default() };
+    }
+    let pr: serde_json::Value = match pr_resp.json().await {
+        Ok(v) => v,
+        Err(e) => return ExecResult { observation: format!("bad github response: {}", scrub(e.to_string(), &token)), preview: "github error".into(), is_error: true, ..Default::default() },
+    };
+    let title = pr.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let head_sha = pr.get("head").and_then(|h| h.get("sha")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let review_state = pr_review_state(client, &full_name, number, &token).await;
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!("#{} \"{}\"", number, title));
+    if head_sha.is_empty() {
+        lines.push("No head sha; CI state unavailable.".into());
+    } else {
+        let st_url = format!("{GH_API}/repos/{}/commits/{}/status", full_name, head_sha);
+        let st_resp = client.get(&st_url).headers(gh_headers(&token)).timeout(std::time::Duration::from_secs(10)).send().await;
+        let combined = match st_resp {
+            Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await.ok(),
+            _ => None,
+        };
+        let state = combined.as_ref().and_then(|c| c.get("state").and_then(|v| v.as_str())).map(String::from);
+        let total = combined.as_ref().and_then(|c| c.get("total_count").and_then(|v| v.as_u64())).unwrap_or(0);
+        lines.push(format!("CI: {} ({} contexts)", state.unwrap_or_else(|| "unknown".into()), total));
+        if let Some(statuses) = combined.as_ref().and_then(|c| c.get("statuses").and_then(|s| s.as_array())) {
+            for st in statuses.iter().take(20) {
+                let ctx = st.get("context").and_then(|v| v.as_str()).unwrap_or("");
+                let st_state = st.get("state").and_then(|v| v.as_str()).unwrap_or("");
+                lines.push(format!("  - {} : {}", ctx, st_state));
+            }
+        }
+    }
+    match review_state {
+        Some(rv) => lines.push(format!("Reviews: {}", rv)),
+        None => lines.push("Reviews: none".into()),
+    }
+    ExecResult { observation: cap(&lines.join("\n")), preview: format!("checks for PR #{}", number), is_error: false, ..Default::default() }
+}
+
+// exec_pr_comment adds a top-level comment to a PR. Approval-gated and external
+// — never auto-approved. github.com repos only.
+async fn exec_pr_comment(client: &reqwest::Client, root: &Path, args: &str, approved: bool) -> ExecResult {
+    let v = match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(v) => v,
+        Err(_) => return ExecResult { observation: "Invalid args for pr_comment.".into(), preview: "bad args".into(), is_error: true, ..Default::default() },
+    };
+    let number = v.get("number").and_then(|n| n.as_u64()).unwrap_or(0);
+    let body_text = v.get("body").and_then(|b| b.as_str()).unwrap_or("").to_string();
+    if number == 0 {
+        return ExecResult { observation: "No PR number provided.".into(), preview: "no number".into(), is_error: true, ..Default::default() };
+    }
+    if body_text.trim().is_empty() {
+        return ExecResult { observation: "No comment body provided.".into(), preview: "no body".into(), is_error: true, ..Default::default() };
+    }
+    if !approved {
+        let preview = format!("Comment on PR #{}: {}", number, cap_preview(&body_text, 200));
+        return ExecResult {
+            observation: String::new(),
+            preview: "awaiting approval".into(),
+            is_error: false,
+            needs_approval: Some(true),
+            approval_kind: Some("pr_comment".into()),
+            approval_preview: Some(preview),
+            ..Default::default()
+        };
+    }
+    match pr_comment_for_repo(client, root, number, &body_text).await {
+        Ok(url) => ExecResult { observation: format!("Comment posted: {}", url), preview: "comment posted".into(), is_error: false, ..Default::default() },
+        Err(e) => ExecResult { observation: format!("pr_comment failed: {}", e), preview: "comment failed".into(), is_error: true, ..Default::default() },
+    }
+}
+
+// exec_pr_close closes a PR without merging. Approval-gated and irreversible.
+// The not-approved path fetches the PR so the approval dialog shows the title.
+// github.com repos only.
+async fn exec_pr_close(client: &reqwest::Client, root: &Path, args: &str, approved: bool) -> ExecResult {
+    let number = match parse_pr_number(args) {
+        Some(n) => n,
+        None => return ExecResult { observation: "No PR number provided.".into(), preview: "no number".into(), is_error: true, ..Default::default() },
+    };
+    if !approved {
+        let preview = match pr_detail(client, root, number).await {
+            Ok(d) => format!("Close PR #{} \"{}\": {} → {}", number, d.title, d.head, d.base),
+            Err(_) => format!("Close PR #{}", number),
+        };
+        return ExecResult {
+            observation: String::new(),
+            preview: "awaiting approval".into(),
+            is_error: false,
+            needs_approval: Some(true),
+            approval_kind: Some("pr_close".into()),
+            approval_preview: Some(preview),
+            ..Default::default()
+        };
+    }
+    match pr_close_for_repo(client, root, number).await {
+        Ok(()) => ExecResult { observation: format!("Closed PR #{}.", number), preview: "closed".into(), is_error: false, ..Default::default() },
+        Err(e) => ExecResult { observation: format!("pr_close failed: {}", e), preview: "close failed".into(), is_error: true, ..Default::default() },
+    }
+}
+
+// exec_pr_ready marks a draft PR ready for review. Approval-gated. The REST API
+// cannot un-draft a PR (PATCH pulls/{n} silently ignores draft:false), so this
+// uses the GraphQL markPullRequestReadyForReview mutation with the PR node_id.
+// github.com repos only.
+async fn exec_pr_ready(client: &reqwest::Client, root: &Path, args: &str, approved: bool) -> ExecResult {
+    let number = match parse_pr_number(args) {
+        Some(n) => n,
+        None => return ExecResult { observation: "No PR number provided.".into(), preview: "no number".into(), is_error: true, ..Default::default() },
+    };
+    if !approved {
+        let preview = match pr_detail(client, root, number).await {
+            Ok(d) => format!("Mark PR #{} \"{}\" ready for review (currently {})", number, d.title, if d.draft { "draft" } else { "not draft" }),
+            Err(_) => format!("Mark PR #{} ready for review", number),
+        };
+        return ExecResult {
+            observation: String::new(),
+            preview: "awaiting approval".into(),
+            is_error: false,
+            needs_approval: Some(true),
+            approval_kind: Some("pr_ready".into()),
+            approval_preview: Some(preview),
+            ..Default::default()
+        };
+    }
+    match pr_ready_for_repo(client, root, number).await {
+        Ok(()) => ExecResult { observation: format!("Marked PR #{} as ready for review.", number), preview: "ready for review".into(), is_error: false, ..Default::default() },
+        Err(e) => ExecResult { observation: format!("pr_ready failed: {}", e), preview: "ready failed".into(), is_error: true, ..Default::default() },
+    }
+}
+
+// exec_pr_edit updates a PR's title and/or body. Approval-gated. At least one of
+// title/body must be provided (validated here so the model gets a clear error).
+// github.com repos only.
+async fn exec_pr_edit(client: &reqwest::Client, root: &Path, args: &str, approved: bool) -> ExecResult {
+    let v = match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(v) => v,
+        Err(_) => return ExecResult { observation: "Invalid args for pr_edit.".into(), preview: "bad args".into(), is_error: true, ..Default::default() },
+    };
+    let number = v.get("number").and_then(|n| n.as_u64()).unwrap_or(0);
+    if number == 0 {
+        return ExecResult { observation: "No PR number provided.".into(), preview: "no number".into(), is_error: true, ..Default::default() };
+    }
+    let title = v.get("title").and_then(|t| t.as_str()).map(|s| s.trim().to_string()).unwrap_or_default();
+    let body_text = v.get("body").and_then(|b| b.as_str()).map(|s| s.to_string()).unwrap_or_default();
+    if title.is_empty() && body_text.is_empty() {
+        return ExecResult { observation: "pr_edit needs at least one of title or body.".into(), preview: "no fields".into(), is_error: true, ..Default::default() };
+    }
+    if !approved {
+        let mut parts: Vec<String> = Vec::new();
+        if !title.is_empty() {
+            parts.push(format!("title=\"{}\"", cap_preview(&title, 120)));
+        }
+        if !body_text.is_empty() {
+            parts.push(format!("body={} chars", body_text.len()));
+        }
+        let preview = format!("Edit PR #{}: {}", number, parts.join(", "));
+        return ExecResult {
+            observation: String::new(),
+            preview: "awaiting approval".into(),
+            is_error: false,
+            needs_approval: Some(true),
+            approval_kind: Some("pr_edit".into()),
+            approval_preview: Some(preview),
+            ..Default::default()
+        };
+    }
+    match pr_edit_for_repo(client, root, number, &title, &body_text).await {
+        Ok(()) => ExecResult { observation: format!("Updated PR #{}.", number), preview: "PR updated".into(), is_error: false, ..Default::default() },
+        Err(e) => ExecResult { observation: format!("pr_edit failed: {}", e), preview: "edit failed".into(), is_error: true, ..Default::default() },
+    }
+}
+
+// --- PR REST/GraphQL helpers (shared by the pr_* executors) ---
+
+// gh_graphql runs a GitHub GraphQL mutation/query against api.github.com/graphql
+// using the keychain token. Returns the response data on success; surfaces
+// GraphQL errors (joined) and REST-level failures as Err strings. The token is
+// scrubbed from any captured error text.
+async fn gh_graphql(client: &reqwest::Client, token: &str, query: &str, variables: serde_json::Value) -> Result<serde_json::Value, String> {
+    let body = serde_json::json!({ "query": query, "variables": variables });
+    let resp = client
+        .post("https://api.github.com/graphql")
+        .headers(gh_headers(token))
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("github unreachable: {}", scrub(e.to_string(), token)))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(parse_github_error(&text).unwrap_or_else(|| format!("github returned {}", status)));
+    }
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("bad github response: {}", scrub(e.to_string(), token)))?;
+    if let Some(errors) = v.get("errors").and_then(|e| e.as_array()) {
+        if !errors.is_empty() {
+            let msgs: Vec<String> = errors
+                .iter()
+                .filter_map(|e| e.get("message").and_then(|m| m.as_str()).map(String::from))
+                .collect();
+            if !msgs.is_empty() {
+                return Err(msgs.join("; "));
+            }
+        }
+    }
+    Ok(v)
+}
+
+// pr_comment_for_repo posts a top-level PR comment via the issue-comments
+// endpoint (POST /repos/{o}/{r}/issues/{n}/comments). Returns the comment
+// html_url. github.com repos only; token scrubbed from any error text.
+async fn pr_comment_for_repo(client: &reqwest::Client, root: &Path, number: u64, body: &str) -> Result<String, String> {
+    let remote = git_remote_url(root).await.ok_or_else(|| "no remote configured".to_string())?;
+    let full_name = github_full_name(&remote).ok_or_else(|| "pr_comment is only supported for github.com repos".to_string())?;
+    let token = token_get().ok_or_else(|| "no github token stored (connect github first)".to_string())?;
+    let url = format!("{GH_API}/repos/{}/issues/{}/comments", full_name, number);
+    let resp = client
+        .post(&url)
+        .headers(gh_headers(&token))
+        .json(&serde_json::json!({ "body": body }))
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("github unreachable: {}", scrub(e.to_string(), &token)))?;
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        let v: serde_json::Value = serde_json::from_str(&body_text)
+            .map_err(|e| format!("bad github response: {}", scrub(e.to_string(), &token)))?;
+        Ok(v
+            .get("html_url")
+            .and_then(|u| u.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| "posted (no url)".to_string()))
+    } else {
+        let msg = parse_github_error(&body_text).unwrap_or_else(|| format!("github returned {}", status));
+        Err(scrub(msg, &token))
+    }
+}
+
+// pr_close_for_repo closes a PR via PATCH /repos/{o}/{r}/pulls/{n} with
+// state=closed. github.com repos only; token scrubbed from any error text.
+async fn pr_close_for_repo(client: &reqwest::Client, root: &Path, number: u64) -> Result<(), String> {
+    let remote = git_remote_url(root).await.ok_or_else(|| "no remote configured".to_string())?;
+    let full_name = github_full_name(&remote).ok_or_else(|| "pr_close is only supported for github.com repos".to_string())?;
+    let token = token_get().ok_or_else(|| "no github token stored (connect github first)".to_string())?;
+    let url = format!("{GH_API}/repos/{}/pulls/{}", full_name, number);
+    let resp = client
+        .patch(&url)
+        .headers(gh_headers(&token))
+        .json(&serde_json::json!({ "state": "closed" }))
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("github unreachable: {}", scrub(e.to_string(), &token)))?;
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        let msg = parse_github_error(&body).unwrap_or_else(|| format!("github returned {}", body));
+        Err(scrub(msg, &token))
+    }
+}
+
+// pr_ready_for_repo marks a draft PR ready for review. REST cannot un-draft a
+// PR, so this fetches the PR's node_id then runs the GraphQL
+// markPullRequestReadyForReview mutation. github.com repos only.
+async fn pr_ready_for_repo(client: &reqwest::Client, root: &Path, number: u64) -> Result<(), String> {
+    let remote = git_remote_url(root).await.ok_or_else(|| "no remote configured".to_string())?;
+    let full_name = github_full_name(&remote).ok_or_else(|| "pr_ready is only supported for github.com repos".to_string())?;
+    let token = token_get().ok_or_else(|| "no github token stored (connect github first)".to_string())?;
+    let url = format!("{GH_API}/repos/{}/pulls/{}", full_name, number);
+    let resp = client
+        .get(&url)
+        .headers(gh_headers(&token))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("github unreachable: {}", scrub(e.to_string(), &token)))?;
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(parse_github_error(&body).unwrap_or_else(|| format!("github returned {}", body)));
+    }
+    let pr: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("bad github response: {}", scrub(e.to_string(), &token)))?;
+    let node_id = pr
+        .get("node_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "no node_id in PR response".to_string())?;
+    let query = "mutation($id:ID!){ markPullRequestReadyForReview(input:{pullRequestId:$id}){ pullRequest{ number isDraft url } } }";
+    gh_graphql(client, &token, query, serde_json::json!({ "id": node_id })).await?;
+    Ok(())
+}
+
+// pr_edit_for_repo updates a PR's title and/or body via PATCH /repos/{o}/{r}/pulls/{n}.
+// Only non-empty fields are sent. github.com repos only; token scrubbed.
+async fn pr_edit_for_repo(client: &reqwest::Client, root: &Path, number: u64, title: &str, body: &str) -> Result<(), String> {
+    let remote = git_remote_url(root).await.ok_or_else(|| "no remote configured".to_string())?;
+    let full_name = github_full_name(&remote).ok_or_else(|| "pr_edit is only supported for github.com repos".to_string())?;
+    let token = token_get().ok_or_else(|| "no github token stored (connect github first)".to_string())?;
+    let mut patch = serde_json::Map::new();
+    if !title.is_empty() {
+        patch.insert("title".into(), serde_json::Value::String(title.to_string()));
+    }
+    if !body.is_empty() {
+        patch.insert("body".into(), serde_json::Value::String(body.to_string()));
+    }
+    let url = format!("{GH_API}/repos/{}/pulls/{}", full_name, number);
+    let resp = client
+        .patch(&url)
+        .headers(gh_headers(&token))
+        .json(&serde_json::Value::Object(patch))
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("github unreachable: {}", scrub(e.to_string(), &token)))?;
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        let body_text = resp.text().await.unwrap_or_default();
+        let msg = parse_github_error(&body_text).unwrap_or_else(|| format!("github returned {}", body_text));
+        Err(scrub(msg, &token))
     }
 }
 

@@ -327,6 +327,13 @@ func (s *server) toolRegistry(email string) map[string]agentTool {
 		"git_push":    gitPushTool(),
 		"create_pr":   createPrTool(),
 		"merge_pr":    mergePrTool(),
+		"pr_view":     prViewTool(),
+		"pr_diff":     prDiffTool(),
+		"pr_checks":   prChecksTool(),
+		"pr_comment":  prCommentTool(),
+		"pr_close":    prCloseTool(),
+		"pr_ready":    prReadyTool(),
+		"pr_edit":     prEditTool(),
 		"todo_write":  todoWriteTool(),
 		"todo_read":   todoReadTool(),
 	} {
@@ -537,6 +544,93 @@ func listPrsTool() oaiTool {
 	}}
 }
 
+// prViewTool returns a single PR's full details (title, body, state, draft/
+// merged, head→base, mergeable, CI, reviews). Read-only, never approval-gated.
+func prViewTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "pr_view",
+		Description: "View a pull request's full details: title, body, state (open/closed/merged), draft flag, head→base, mergeable state, CI status, and review state. Read-only. Use this to inspect a PR before acting on it. GitHub.com repos only.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"number": map[string]any{"type": "integer", "description": "The pull request number."},
+		}, "required": []string{"number"}},
+	}}
+}
+
+// prDiffTool fetches a PR's unified diff. Read-only; the diff is capped before
+// being fed back to the model.
+func prDiffTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "pr_diff",
+		Description: "Fetch the unified diff of a pull request's changes. Read-only. Use this to review what a PR changes before merging or commenting. The diff may be large and is capped. GitHub.com repos only.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"number": map[string]any{"type": "integer", "description": "The pull request number."},
+		}, "required": []string{"number"}},
+	}}
+}
+
+// prChecksTool reports a PR's per-context CI states and review summary.
+// Read-only.
+func prChecksTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "pr_checks",
+		Description: "Show a pull request's CI check states (per-context status) and review state summary. Read-only. Use this to decide whether a PR is safe to merge. GitHub.com repos only.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"number": map[string]any{"type": "integer", "description": "The pull request number."},
+		}, "required": []string{"number"}},
+	}}
+}
+
+// prCommentTool adds a top-level PR comment. Approval-gated and external —
+// only used when the user explicitly asks. GitHub.com repos only.
+func prCommentTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "pr_comment",
+		Description: "Add a top-level comment to a pull request. Approval-gated — only use it when the user explicitly asks you to comment. GitHub.com repos only.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"number": map[string]any{"type": "integer", "description": "The pull request number."},
+			"body":   map[string]any{"type": "string", "description": "The comment body (Markdown)."},
+		}, "required": []string{"number", "body"}},
+	}}
+}
+
+// prCloseTool closes a PR without merging. Approval-gated and irreversible.
+func prCloseTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "pr_close",
+		Description: "Close a pull request without merging. Approval-gated and irreversible — only use it when the user explicitly asks you to close the PR. GitHub.com repos only.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"number": map[string]any{"type": "integer", "description": "The pull request number to close."},
+		}, "required": []string{"number"}},
+	}}
+}
+
+// prReadyTool marks a draft PR ready for review. Approval-gated. The REST API
+// cannot un-draft a PR, so the sidecar uses the GraphQL
+// markPullRequestReadyForReview mutation (transparent to the model).
+func prReadyTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "pr_ready",
+		Description: "Mark a draft pull request as ready for review. Approval-gated — only use it when the user explicitly asks. GitHub.com repos only.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"number": map[string]any{"type": "integer", "description": "The draft pull request number to mark ready for review."},
+		}, "required": []string{"number"}},
+	}}
+}
+
+// prEditTool updates a PR's title and/or body. Approval-gated; at least one of
+// title/body must be provided (validated by the sidecar executor).
+func prEditTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "pr_edit",
+		Description: "Edit a pull request's title and/or body. Approval-gated — only use it when the user explicitly asks. At least one of title or body must be provided. GitHub.com repos only.",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{
+			"number": map[string]any{"type": "integer", "description": "The pull request number."},
+			"title":  map[string]any{"type": "string", "description": "The new pull request title. Omit to leave unchanged."},
+			"body":   map[string]any{"type": "string", "description": "The new pull request body (Markdown). Omit to leave unchanged."},
+		}, "required": []string{"number"}},
+	}}
+}
+
 // --- Tasks Pill (in-session todo list) ---
 
 // todoWriteTool lets the agent update the session's task checklist. The todos
@@ -643,8 +737,10 @@ func sshGrepTool(hosts []string) oaiTool {
 func localRepoTools() []string {
 	return []string{
 		"read_file", "list_files", "tree", "glob", "grep", "git_status", "git_log", "list_prs",
+		"pr_view", "pr_diff", "pr_checks",
 		"write_file", "edit_file", "move_path", "delete_path", "apply_patch", "run_command",
 		"git_commit", "git_push", "create_pr", "merge_pr",
+		"pr_comment", "pr_close", "pr_ready", "pr_edit",
 		"todo_write", "todo_read",
 	}
 }
@@ -664,14 +760,14 @@ func localFileTools() []string {
 // localGitTools is the git-workflow subset of localRepoTools: status/log/PRs
 // plus commit/push/PR/merge. Only appended when the workspace is git-enabled.
 func localGitTools() []string {
-	return []string{"git_status", "git_log", "list_prs", "git_commit", "git_push", "create_pr", "merge_pr"}
+	return []string{"git_status", "git_log", "list_prs", "pr_view", "pr_diff", "pr_checks", "git_commit", "git_push", "create_pr", "merge_pr", "pr_comment", "pr_close", "pr_ready", "pr_edit"}
 }
 
 // planWriteTools lists the write tools gated out during Plan mode (before the
 // plan is approved). Used by jobs.go to filter the allowlist for a plan-mode run
 // that hasn't been approved yet. Mirrors is_write_tool but lives backend-side.
 func planWriteTools() []string {
-	return []string{"write_file", "edit_file", "delete_path", "move_path", "apply_patch", "run_command", "git_commit", "git_push", "create_pr", "merge_pr"}
+	return []string{"write_file", "edit_file", "delete_path", "move_path", "apply_patch", "run_command", "git_commit", "git_push", "create_pr", "merge_pr", "pr_comment", "pr_close", "pr_ready", "pr_edit"}
 }
 
 // localToolMetas is the UI-facing metadata for localRepoTools, in the same
@@ -686,6 +782,9 @@ func localToolMetas() []toolMeta {
 		{Name: "git_status", Label: "Git status", Description: "Show the working tree status (desktop only)."},
 		{Name: "git_log", Label: "Git log", Description: "List recent commits on the current branch (desktop only)."},
 		{Name: "list_prs", Label: "List PRs", Description: "List the repo's open pull requests with CI/review state (desktop only)."},
+		{Name: "pr_view", Label: "View PR", Description: "View a pull request's full details (desktop only)."},
+		{Name: "pr_diff", Label: "PR diff", Description: "Fetch a pull request's unified diff (desktop only)."},
+		{Name: "pr_checks", Label: "PR checks", Description: "Show a pull request's CI checks and review state (desktop only)."},
 		{Name: "write_file", Label: "Write file", Description: "Create or overwrite a file (desktop only)."},
 		{Name: "edit_file", Label: "Edit file", Description: "Exact string replacement in a file (desktop only)."},
 		{Name: "move_path", Label: "Move/rename", Description: "Rename or move a file/directory (desktop only)."},
@@ -696,6 +795,10 @@ func localToolMetas() []toolMeta {
 		{Name: "git_push", Label: "Git push", Description: "Push the current branch to its remote (desktop only)."},
 		{Name: "create_pr", Label: "Create PR", Description: "Open a pull request from the current branch (desktop only)."},
 		{Name: "merge_pr", Label: "Merge PR", Description: "Merge a GitHub pull request by number (desktop only). Approval-gated."},
+		{Name: "pr_comment", Label: "Comment on PR", Description: "Add a top-level comment to a pull request (desktop only). Approval-gated."},
+		{Name: "pr_close", Label: "Close PR", Description: "Close a pull request without merging (desktop only). Approval-gated."},
+		{Name: "pr_ready", Label: "Mark PR ready", Description: "Mark a draft pull request ready for review (desktop only). Approval-gated."},
+		{Name: "pr_edit", Label: "Edit PR", Description: "Edit a pull request's title/body (desktop only). Approval-gated."},
 		{Name: "todo_write", Label: "Update tasks", Description: "Update this session's task checklist (desktop only)."},
 		{Name: "todo_read", Label: "Read tasks", Description: "Read this session's task checklist (desktop only)."},
 	}
@@ -897,7 +1000,7 @@ func injectRepoContext(sys string, r *Repo, convBranch string) string {
 	} else {
 		b.WriteString("This checkout shares the repo's main working tree. ")
 	}
-	b.WriteString("A gitignored file (such as .env) is a secret you must NEVER read, print, or paste into an answer: read_file refuses ignored paths, grep skips them, and the discovery tools (tree, list_files, glob) mark them (ignored) so you learn they exist without seeing their contents. Make single-file edits with edit_file (exact string replacement) or write_file (create/overwrite); both are reliable on every model. Reserve apply_patch (a unified diff) for genuine multi-file or multi-hunk edits, and if a diff fails to apply, do not re-emit it; switch to edit_file or write_file. Then commit ONCE with git_commit when the work is complete — do NOT commit after each individual edit. Do not push with git_push and do not open a pull request with create_pr unless the user explicitly asks you to. Do not write diffs or commands as prose — call the tool so the change is actually applied. Keep answers grounded in what you read — do not guess at file contents.\n\n")
+	b.WriteString("A gitignored file (such as .env) is a secret you must NEVER read, print, or paste into an answer: read_file refuses ignored paths, grep skips them, and the discovery tools (tree, list_files, glob) mark them (ignored) so you learn they exist without seeing their contents. Make single-file edits with edit_file (exact string replacement) or write_file (create/overwrite); both are reliable on every model. Reserve apply_patch (a unified diff) for genuine multi-file or multi-hunk edits, and if a diff fails to apply, do not re-emit it; switch to edit_file or write_file. Then commit ONCE with git_commit when the work is complete — do NOT commit after each individual edit. Do not push with git_push, open a pull request with create_pr, or comment on / close / edit / mark ready a PR (pr_comment, pr_close, pr_edit, pr_ready) unless the user explicitly asks you to; the read-only list_prs, pr_view, pr_diff, and pr_checks tools are fine for inspecting PRs. Do not write diffs or commands as prose — call the tool so the change is actually applied. Keep answers grounded in what you read — do not guess at file contents.\n\n")
 	b.WriteString(sys)
 	return b.String()
 }
@@ -918,7 +1021,7 @@ func injectWorkspaceContext(sys string, r *Repo) string {
 		b.WriteString("(empty)")
 	}
 	b.WriteString(". Use the tree, list_files, glob, grep, and read_file tools to explore the workspace and discover what you need yourself — do NOT ask the user about the workspace (which files, where something is, how it works); look it up. ")
-	b.WriteString("This workspace is not under git version control: do not call git_status, git_log, git_commit, git_push, create_pr, list_prs, or merge_pr — they are not available and will error. Make single-file edits with edit_file (exact string replacement) or write_file (create/overwrite); both are reliable on every model. Reserve apply_patch (a unified diff) for genuine multi-file or multi-hunk edits, and if a diff fails to apply, do not re-emit it; switch to edit_file or write_file. A secret file (such as .env) must NEVER be read, printed, or pasted into an answer: read_file refuses ignored paths, grep skips them, and the discovery tools (tree, list_files, glob) mark them (ignored) so you learn they exist without seeing their contents. Do not write diffs or commands as prose — call the tool so the change is actually applied. Keep answers grounded in what you read — do not guess at file contents.\n\n")
+	b.WriteString("This workspace is not under git version control: do not call git_status, git_log, git_commit, git_push, create_pr, list_prs, merge_pr, pr_view, pr_diff, pr_checks, pr_comment, pr_close, pr_ready, or pr_edit — they are not available and will error. Make single-file edits with edit_file (exact string replacement) or write_file (create/overwrite); both are reliable on every model. Reserve apply_patch (a unified diff) for genuine multi-file or multi-hunk edits, and if a diff fails to apply, do not re-emit it; switch to edit_file or write_file. A secret file (such as .env) must NEVER be read, printed, or pasted into an answer: read_file refuses ignored paths, grep skips them, and the discovery tools (tree, list_files, glob) mark them (ignored) so you learn they exist without seeing their contents. Do not write diffs or commands as prose — call the tool so the change is actually applied. Keep answers grounded in what you read — do not guess at file contents.\n\n")
 	b.WriteString(sys)
 	return b.String()
 }
