@@ -654,7 +654,7 @@ func TestJob_EmitToolStartAndCommandFields(t *testing.T) {
 	defer j.unsubscribe(ch)
 
 	// emitToolExec fires toolStart first, then the relay cue.
-	j.emitToolExec(2, "run_command", `{"command":"go test ./..."}`, "owner/repo", "main", true, 0)
+	j.emitToolExec(2, "run_command", `{"command":"go test ./..."}`, "owner/repo", "main", "", true, 0)
 
 	first := nextEvent(t, ch, time.Second)
 	if first.kind != "toolStart" {
@@ -709,7 +709,7 @@ func TestJob_EmitToolStartOmitsEmptyCommandFields(t *testing.T) {
 	ch, _ := j.subscribe()
 	defer j.unsubscribe(ch)
 
-	j.emitToolExec(1, "grep", `{"pattern":"foo"}`, "owner/repo", "main", true, 0)
+	j.emitToolExec(1, "grep", `{"pattern":"foo"}`, "owner/repo", "main", "", true, 0)
 	ev := nextEvent(t, ch, time.Second)
 	if ev.kind != "toolStart" {
 		t.Fatalf("event kind = %q, want toolStart", ev.kind)
@@ -911,11 +911,11 @@ func TestLocalRepoToolsContainsGitLogAndListPrs(t *testing.T) {
 		t.Errorf("defaultAgentTools() does not include git_log/list_prs")
 	}
 	seen := map[string]bool{}
-	for _, tm := range availableTools(false) {
+	for _, tm := range availableTools(false, nil) {
 		seen[tm.Name] = true
 	}
 	if !seen["git_log"] || !seen["list_prs"] {
-		t.Errorf("availableTools(false) does not include git_log/list_prs")
+		t.Errorf("availableTools(false, nil) does not include git_log/list_prs")
 	}
 	st, err := newStore(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {

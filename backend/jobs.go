@@ -215,6 +215,11 @@ type toolExecPayload struct {
 	// means "use the repo's main working tree" — the sidecar/renderer treat a
 	// missing branch exactly like an old client that never sent one.
 	Branch string `json:"branch"`
+	// Host is the SSH alias for ssh_* tools (empty for repo file tools). The
+	// renderer routes ssh_* tools to the sidecar's /__sidecar/ssh/exec endpoint
+	// and passes host so the sidecar resolves it via ~/.ssh/config. Empty for
+	// repo file tools, which keep using Repo/Branch.
+	Host string `json:"host,omitempty"`
 	// AutoApprove is the conversation's effective auto-approve setting for write
 	// tools (write_file/edit_file/move_path/apply_patch/run_command/git_commit/
 	// git_push). When true the renderer runs those tools without an approval
@@ -360,20 +365,22 @@ func (j *job) clearPendingModelCall() {
 	j.mu.Unlock()
 }
 
-// emitToolExec stashes the current file-tool call on the job (so a browser that
-// attaches after the cue fired gets it replayed on subscribe) and broadcasts a
-// "toolExec" event to every live subscriber plus the owner's /api/events hub.
-// Called by the agent loop when it hits a local file tool, parallel to
-// emitModelCall for local-model inference. branch is the conversation's bound
-// branch ("" for the repo's main working tree; see toolExecPayload).
-// runCommandTimeoutMs carries the backend's RUN_COMMAND_TIMEOUT so the sidecar
-// enforces it for run_command (0 = sidecar default).
-func (j *job) emitToolExec(step int, tool, args, repo, branch string, autoApprove bool, runCommandTimeoutMs int) {
+// emitToolExec stashes the current local tool call on the job (so a browser
+// that attaches after the cue fired gets it replayed on subscribe) and
+// broadcasts a "toolExec" event to every live subscriber plus the owner's
+// /api/events hub. Called by the agent loop when it hits a local tool (a repo
+// file tool or an ssh_* tool), parallel to emitModelCall for local-model
+// inference. branch is the conversation's bound branch ("" for the repo's main
+// working tree; see toolExecPayload); host is the SSH alias for ssh_* tools
+// ("" for repo file tools). runCommandTimeoutMs carries the backend's
+// RUN_COMMAND_TIMEOUT so the sidecar enforces it for run_command/ssh_run
+// (0 = sidecar default).
+func (j *job) emitToolExec(step int, tool, args, repo, branch, host string, autoApprove bool, runCommandTimeoutMs int) {
 	// Open the command block the moment the tool starts — before the relay cue
 	// fires — so streamed output has a block to land in. (Read-only tools get a
 	// toolStart too; the UI only opens a block for command-shaped tools.)
 	j.emitToolStart(step, tool, args)
-	payload := toolExecPayload{ConvID: j.convID, JobID: j.id, Step: step, Tool: tool, Args: args, Repo: repo, Branch: branch, AutoApprove: autoApprove, RunCommandTimeoutMs: runCommandTimeoutMs}
+	payload := toolExecPayload{ConvID: j.convID, JobID: j.id, Step: step, Tool: tool, Args: args, Repo: repo, Branch: branch, Host: host, AutoApprove: autoApprove, RunCommandTimeoutMs: runCommandTimeoutMs}
 	b, _ := json.Marshal(payload)
 	j.mu.Lock()
 	j.pendingToolExecPayload = &payload
@@ -1394,68 +1401,100 @@ func (s *server) runGeneration(j *job) error {
 	if j.agent {
 		allow, sys := s.agentConfig(j)
 		repoID, _ := s.store.getConvRepoID(j.email, j.convID)
-		var toolExecRelay func(context.Context, int, string, string) toolOutcome
+		sshHosts, _ := s.store.listSSHHosts(j.email)
+		// SSH tools are opt-in (not in defaultAgentTools). When the user has no
+		// configured hosts, drop any ssh_* tools from the allowlist so a run never
+		// offers tools whose host enum would be empty (toolRegistry also won't
+		// register them — this guards a host deleted after the allowlist was saved).
+		if len(sshHosts) == 0 {
+			allow = filterSSHTools(allow)
+		}
+		sshEnabled := len(sshHosts) > 0 && containsAnySSHTool(allow)
+
+		var repo *Repo
 		if repoID != "" {
-			if repo, err := s.store.getRepo(j.email, repoID); err == nil && repo != nil {
+			if r, err := s.store.getRepo(j.email, repoID); err == nil && r != nil {
+				repo = r
 				allow = append(allow, localRepoTools()...)
 				sys = injectRepoContext(sys, repo, conv.RepoBranch)
-				// Resolve the conversation's effective auto-approve once for this run;
-				// the renderer uses it to skip the approval dialog for write tools
-				// (delete_path/create_pr/merge_pr always prompt regardless).
-				autoApprove := s.store.convAutoApprove(j.email, j.convID)
-				// Carry the backend's RUN_COMMAND_TIMEOUT (ms) on each toolExec so the
-				// sidecar enforces it for run_command; 0 lets the sidecar use its
-				// own default when the backend didn't configure one.
-				runCmdTimeoutMs := 0
-				if s.cfg.runCommandTimeout > 0 {
-					runCmdTimeoutMs = int(s.cfg.runCommandTimeout / time.Millisecond)
-				}
-				toolExecRelay = func(ctx context.Context, step int, tool, args string) toolOutcome {
-					respCh := make(chan toolExecResponse, 1)
+			}
+		}
+
+		var toolExecRelay func(context.Context, int, string, string) toolOutcome
+		if repo != nil || sshEnabled {
+			// Resolve the conversation's effective auto-approve once for this run;
+			// the renderer uses it to skip the approval dialog for write tools
+			// (delete_path/create_pr/merge_pr/ssh_run always prompt regardless).
+			autoApprove := s.store.convAutoApprove(j.email, j.convID)
+			// Carry the backend's RUN_COMMAND_TIMEOUT (ms) on each toolExec so the
+			// sidecar enforces it for run_command/ssh_run; 0 lets the sidecar use
+			// its own default when the backend didn't configure one.
+			runCmdTimeoutMs := 0
+			if s.cfg.runCommandTimeout > 0 {
+				runCmdTimeoutMs = int(s.cfg.runCommandTimeout / time.Millisecond)
+			}
+			toolExecRelay = func(ctx context.Context, step int, tool, args string) toolOutcome {
+				respCh := make(chan toolExecResponse, 1)
+				j.mu.Lock()
+				j.pendingToolExec = respCh
+				j.mu.Unlock()
+				defer func() {
 					j.mu.Lock()
-					j.pendingToolExec = respCh
-					j.mu.Unlock()
-					defer func() {
-						j.mu.Lock()
-						if j.pendingToolExec == respCh {
-							j.pendingToolExec = nil
-						}
-						j.mu.Unlock()
-					}()
-					j.emitToolExec(step, tool, args, repo.FullName, conv.RepoBranch, autoApprove, runCmdTimeoutMs)
-					// apply_patch/run_command/git_* block on a user approval dialog, which
-					// can take far longer than a plain tool call — give it its own budget
-					// (TOOL_EXEC_TIMEOUT) rather than the whole-job timeout.
-					toolTimeout := s.cfg.toolExecTimeout
-					if toolTimeout <= 0 {
-						toolTimeout = defaultToolExecTimeout
+					if j.pendingToolExec == respCh {
+						j.pendingToolExec = nil
 					}
-					timer := time.NewTimer(toolTimeout)
-					defer timer.Stop()
-					select {
-					case resp, ok := <-respCh:
-						if !ok {
-							return toolOutcome{observation: "tool execution cancelled", preview: "cancelled", isError: true}
-						}
-						if resp.Error != "" {
-							j.clearPendingToolExec()
-							return toolOutcome{observation: resp.Error, preview: trimPreview(resp.Error), isError: true}
-						}
-						j.clearPendingToolExec()
-						return toolOutcome{
-							observation: capObservation(resp.Observation, agentObsMaxChars),
-							preview:     resp.Preview,
-							isError:     resp.IsError,
-							exitCode:    resp.ExitCode,
-							output:      capObservation(resp.Output, agentOutputMaxChars),
-							cwd:         resp.Cwd,
-							branch:      resp.Branch,
-						}
-					case <-timer.C:
-						return toolOutcome{observation: "tool execution timed out", preview: "timeout", isError: true}
-					case <-ctx.Done():
+					j.mu.Unlock()
+				}()
+				// Build the cue payload. SSH tools carry the host alias (parsed from
+				// args and validated against the user's allowlist) and no repo/branch;
+				// repo tools carry the repo fullname + branch. The renderer routes on
+				// tool name to the sidecar endpoint (ssh_* → /__sidecar/ssh/exec).
+				var repoName, branch, host string
+				if isSSHTool(tool) {
+					host = parseSSHHost(args)
+					if host == "" {
+						return toolOutcome{observation: "No host provided for " + tool + ". Set the host parameter to one of your configured SSH aliases.", preview: "no host", isError: true}
+					}
+					if !sshHostAllowed(sshHosts, host) {
+						return toolOutcome{observation: "Unknown SSH host: " + host + ". Use one of your configured hosts: " + sshHostList(sshHosts) + ".", preview: "unknown host", isError: true}
+					}
+				} else if repo != nil {
+					repoName = repo.FullName
+					branch = conv.RepoBranch
+				}
+				j.emitToolExec(step, tool, args, repoName, branch, host, autoApprove, runCmdTimeoutMs)
+				// apply_patch/run_command/git_*/ssh_run block on a user approval
+				// dialog, which can take far longer than a plain tool call — give it
+				// its own budget (TOOL_EXEC_TIMEOUT) rather than the whole-job timeout.
+				toolTimeout := s.cfg.toolExecTimeout
+				if toolTimeout <= 0 {
+					toolTimeout = defaultToolExecTimeout
+				}
+				timer := time.NewTimer(toolTimeout)
+				defer timer.Stop()
+				select {
+				case resp, ok := <-respCh:
+					if !ok {
 						return toolOutcome{observation: "tool execution cancelled", preview: "cancelled", isError: true}
 					}
+					if resp.Error != "" {
+						j.clearPendingToolExec()
+						return toolOutcome{observation: resp.Error, preview: trimPreview(resp.Error), isError: true}
+					}
+					j.clearPendingToolExec()
+					return toolOutcome{
+						observation: capObservation(resp.Observation, agentObsMaxChars),
+						preview:     resp.Preview,
+						isError:     resp.IsError,
+						exitCode:    resp.ExitCode,
+						output:      capObservation(resp.Output, agentOutputMaxChars),
+						cwd:         resp.Cwd,
+						branch:      resp.Branch,
+					}
+				case <-timer.C:
+					return toolOutcome{observation: "tool execution timed out", preview: "timeout", isError: true}
+				case <-ctx.Done():
+					return toolOutcome{observation: "tool execution cancelled", preview: "cancelled", isError: true}
 				}
 			}
 		}

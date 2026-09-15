@@ -37,6 +37,7 @@ const ICONS = {
   'image':       '<rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/>',
   'help':        '<circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><path d="M12 17h.01"/>',
   'wrench':      '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>',
+  'terminal':    '<polyline points="4 17 10 11 4 5"/><line x1="12" x2="20" y1="19" y2="19"/>',
 };
 
 // Render an icon by name. Returns an SVG string (currentColor stroke).
@@ -256,7 +257,8 @@ export function clearSearchPending(container) {
 // questions event / persisted Clarify, so the row is just a trace entry.
 function stepIcon(tool) {
   return { web_search: 'globe', ask_user: 'help', get_time: 'clock', calculator: 'gauge',
-    memory_read: 'boxes', memory_write: 'boxes', fetch_page: 'search' }[tool] || 'wrench';
+    memory_read: 'boxes', memory_write: 'boxes', fetch_page: 'search',
+    ssh_run: 'terminal', ssh_read: 'terminal', ssh_list: 'terminal', ssh_grep: 'search' }[tool] || 'wrench';
 }
 function truncateArgs(s) {
   s = String(s || '').replace(/\s+/g, ' ').trim();
@@ -271,7 +273,7 @@ function truncateArgs(s) {
 // compact step row so a run doesn't become a wall of blocks. Live blocks are
 // driven by the window.nasllm.blocks hook (open on toolStart, append on
 // streamed output, close on exit/result, requestApproval for inline Approve/Reject).
-const COMMAND_TOOLS = new Set(['run_command','apply_patch','git_commit','git_push','create_pr']);
+const COMMAND_TOOLS = new Set(['run_command','apply_patch','git_commit','git_push','create_pr','ssh_run']);
 export function isCommandTool(tool){ return COMMAND_TOOLS.has(tool); }
 
 // DOM-side cap so a chatty command can't grow the page unbounded (keep last ~64KB).
@@ -280,7 +282,7 @@ const ANSI_RE = /\x1b\[[0-9;?]*[ -\/]*[@-~]/g;
 function stripAnsi(s){ return String(s||'').replace(ANSI_RE, ''); }
 
 function toolLabel(tool){
-  return ({ run_command:'Run command', apply_patch:'Apply patch', git_commit:'Commit', git_push:'Push', create_pr:'Open PR' })[tool] || tool;
+  return ({ run_command:'Run command', apply_patch:'Apply patch', git_commit:'Commit', git_push:'Push', create_pr:'Open PR', ssh_run:'SSH run' })[tool] || tool;
 }
 function commandTarget(tool, args){
   try{
@@ -289,6 +291,7 @@ function commandTarget(tool, args){
     if(tool==='apply_patch') return v.patch ? '(unified diff)' : '';
     if(tool==='git_commit') return v.message||'';
     if(tool==='create_pr') return v.title||'';
+    if(tool==='ssh_run') return (v.host ? v.host+': ' : '')+(v.command||'');
   }catch{}
   return '';
 }
@@ -475,6 +478,9 @@ function stepArgSummary(tool, args){
       case 'calculator': return v.expression||'';
       case 'memory_read': case 'memory_write': return v.key||'';
       case 'fetch_page': return v.url||'';
+      case 'ssh_read': return v.path ? ((v.host ? v.host+':' : '')+v.path) : '';
+      case 'ssh_list': return (v.host ? v.host+':' : '')+(v.path||'');
+      case 'ssh_grep': return v.pattern ? ((v.host ? v.host+':' : '')+v.pattern+(v.path ? ' in '+v.path : '')) : '';
       default: return '';
     }
   }catch{ return ''; }

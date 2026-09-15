@@ -27,7 +27,7 @@ func TestFileToolWiring(t *testing.T) {
 		{"move_path", []string{"from", "to"}},
 	}
 	defaults := defaultAgentTools()
-	menu := availableTools(false)
+	menu := availableTools(false, nil)
 	menuByName := map[string]bool{}
 	for _, tm := range menu {
 		menuByName[tm.Name] = true
@@ -44,7 +44,7 @@ func TestFileToolWiring(t *testing.T) {
 			t.Errorf("defaultAgentTools() does not include %s", w.name)
 		}
 		if !menuByName[w.name] {
-			t.Errorf("availableTools(false) does not include %s", w.name)
+			t.Errorf("availableTools(false, nil) does not include %s", w.name)
 		}
 		tool, ok := reg[w.name]
 		if !ok {
@@ -90,14 +90,14 @@ func TestMergePrToolWiring(t *testing.T) {
 		t.Errorf("defaultAgentTools() does not include merge_pr")
 	}
 	seenUI := false
-	for _, tm := range availableTools(false) {
+	for _, tm := range availableTools(false, nil) {
 		if tm.Name == "merge_pr" {
 			seenUI = true
 			break
 		}
 	}
 	if !seenUI {
-		t.Errorf("availableTools(false) does not include merge_pr")
+		t.Errorf("availableTools(false, nil) does not include merge_pr")
 	}
 	st, err := newStore(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
@@ -145,14 +145,14 @@ func TestTreeToolWiring(t *testing.T) {
 		t.Errorf("defaultAgentTools() does not include tree")
 	}
 	seenUI := false
-	for _, tm := range availableTools(false) {
+	for _, tm := range availableTools(false, nil) {
 		if tm.Name == "tree" {
 			seenUI = true
 			break
 		}
 	}
 	if !seenUI {
-		t.Errorf("availableTools(false) does not include tree")
+		t.Errorf("availableTools(false, nil) does not include tree")
 	}
 	st, err := newStore(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
@@ -170,5 +170,111 @@ func TestTreeToolWiring(t *testing.T) {
 	}
 	if !tool.local {
 		t.Error("tree must be a local (sidecar-relayed) tool, got local=false")
+	}
+}
+
+// TestSSHToolWiring guards the backend registration of the four ssh_* agent
+// tools across the surfaces that must agree for them to be offered to an
+// SSH-enabled agent run: sshTools (the ordered name list), the tool registry
+// (schema + local-relay flag + host enum), and the UI-facing availableTools
+// list (which gates them on the user's configured hosts). It confirms the host
+// enum is populated from the user's aliases, that the tools are absent when the
+// user has no hosts, and that they are never in defaultAgentTools (opt-in). It
+// does NOT exercise the sidecar executor (the real ssh shell-out runs in the
+// desktop app) — that is covered by the Rust #[cfg(test)] module in github.rs.
+func TestSSHToolWiring(t *testing.T) {
+	want := []struct {
+		name    string
+		require []string
+	}{
+		{"ssh_run", []string{"host", "command"}},
+		{"ssh_read", []string{"host", "path"}},
+		{"ssh_list", []string{"host"}},
+		{"ssh_grep", []string{"host", "pattern"}},
+	}
+	// sshTools lists all four, in order.
+	gotTools := sshTools()
+	if len(gotTools) != len(want) {
+		t.Fatalf("sshTools() = %v, want %d names", gotTools, len(want))
+	}
+	for i, w := range want {
+		if gotTools[i] != w.name {
+			t.Errorf("sshTools()[%d] = %q, want %q", i, gotTools[i], w.name)
+		}
+	}
+	// ssh tools are NOT in defaultAgentTools (opt-in) and are NOT offered by
+	// availableTools when the user has no hosts.
+	for _, w := range want {
+		if slicesContains(defaultAgentTools(), w.name) {
+			t.Errorf("defaultAgentTools() must not include %s (ssh tools are opt-in)", w.name)
+		}
+	}
+	for _, tm := range availableTools(false, nil) {
+		if isSSHTool(tm.Name) {
+			t.Errorf("availableTools(false, nil) offers %s with no hosts configured", tm.Name)
+		}
+	}
+	// With hosts configured, availableTools offers all four ssh tools.
+	menu := map[string]bool{}
+	for _, tm := range availableTools(false, []string{"nas", "mac"}) {
+		menu[tm.Name] = true
+	}
+	for _, w := range want {
+		if !menu[w.name] {
+			t.Errorf("availableTools(false, [nas,mac]) does not include %s", w.name)
+		}
+	}
+	// toolRegistry registers the ssh tools with a host enum when the user has
+	// hosts, and omits them when the user has none.
+	st, err := newStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	defer st.close()
+	const email = "ssh-user@example.com"
+	if _, err := st.upsertSSHHost(email, "nas", "the NAS box"); err != nil {
+		t.Fatalf("upsertSSHHost: %v", err)
+	}
+	srv := &server{cfg: config{contextLength: 8192}, store: st}
+	reg := srv.toolRegistry(email)
+	for _, w := range want {
+		tool, ok := reg[w.name]
+		if !ok {
+			t.Errorf("toolRegistry does not register %s when a host is configured", w.name)
+			continue
+		}
+		if tool.schema.Function.Name != w.name {
+			t.Errorf("%s schema name = %q, want %s", w.name, tool.schema.Function.Name, w.name)
+		}
+		if !tool.local {
+			t.Errorf("%s must be a local (sidecar-relayed) tool, got local=false", w.name)
+		}
+		// The host param must carry an enum containing the user's alias.
+		props, _ := tool.schema.Function.Parameters["properties"].(map[string]any)
+		hostProp, _ := props["host"].(map[string]any)
+		enum, _ := hostProp["enum"].([]string)
+		if !slicesContains(enum, "nas") {
+			t.Errorf("%s host enum = %v, want to contain \"nas\"", w.name, enum)
+		}
+		req, _ := tool.schema.Function.Parameters["required"].([]string)
+		for _, r := range w.require {
+			found := false
+			for _, got := range req {
+				if got == r {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("%s schema missing required %q arg: %v", w.name, r, req)
+			}
+		}
+	}
+	// A different user (no hosts) gets no ssh tools from the registry.
+	reg2 := srv.toolRegistry("no-hosts@example.com")
+	for _, w := range want {
+		if _, ok := reg2[w.name]; ok {
+			t.Errorf("toolRegistry registers %s for a user with no hosts", w.name)
+		}
 	}
 }
