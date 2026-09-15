@@ -1088,7 +1088,11 @@ func agentSystemNudge() string {
 		"structured tool call (read_file / edit_file / write_file / run_command), not an explanation of what you plan to do — never say \"I will\" " +
 		"or \"Let me\" without immediately emitting the tool call. After the work is done, synthesize a clear final " +
 		"answer for the user. Do not repeat the same tool call with the same arguments. If a tool returns an error, read " +
-		"it and adjust — do not retry blindly. Keep answers concise.\n\n" +
+		"it and adjust — do not retry blindly. Keep answers concise. End your final answer with a short " +
+		"follow-up question that proposes a logical next step and asks whether the user would like you to take it " +
+		"(for example, \"Shall I run the tests now?\" or \"Want me to update the docs to match?\"). This is ordinary " +
+		"prose in your answer — do not use the ask_user tool for it; reserve ask_user for genuinely ambiguous " +
+		"requests as described above.\n\n" +
 		"Example loop: to add a comment to main.go, first call read_file to see its contents, then " +
 		"call edit_file with the exact old_string and new_string, then answer concisely. Each step is " +
 		"a structured tool call — never describe the edit in prose."

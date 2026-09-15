@@ -143,11 +143,11 @@ func TestAgentSystemPromptInjection(t *testing.T) {
 }
 
 // TestAgentSystemPromptInjection_OnlyAppliesToAgentMode guards the documented
-// scope: the configurable system prompt is an agent-harness concern. A plain
-// (non-agent) turn must NOT carry a system message even when a global
-// agent_system setting exists — plain chat runs a bare streamed pass with no
-// prepended system prompt. This keeps the harness boundary explicit so a later
-// change that widens injection is intentional.
+// scope: the configurable agent_system setting is an agent-harness concern. A
+// plain (non-agent) turn carries only the short built-in plainChatNudge (a
+// style hint) as a leading system message, and must NEVER leak the global
+// agent_system setting. This keeps the harness boundary explicit: the
+// configurable prompt does not widen into plain chat.
 func TestAgentSystemPromptInjection_OnlyAppliesToAgentMode(t *testing.T) {
 	st, err := newStore(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
@@ -192,16 +192,25 @@ func TestAgentSystemPromptInjection_OnlyAppliesToAgentMode(t *testing.T) {
 		sawModelCall = true
 	}
 
-	// A plain turn's messages are exactly the conversation turns — no system
-	// prefix at all, and never the agent_system setting.
+	// A plain turn carries the built-in plainChatNudge as a leading system
+	// message, but must NEVER leak the configurable agent_system setting (that
+	// is an agent-harness concern).
+	var sawNudge bool
 	for i, m := range mc.Messages {
 		if m.Role == "system" {
-			t.Errorf("plain turn messages[%d] is role %q with content %q; plain chat must not inject a system prompt",
-				i, m.Role, contentText(m.Content))
+			if i != 0 {
+				t.Errorf("plain turn system nudge should be messages[0], got index %d", i)
+			}
+			if strings.Contains(contentText(m.Content), "SECRET AGENT PROMPT") {
+				t.Errorf("plain turn leaked the agent_system setting at messages[%d]: %q", i, contentText(m.Content))
+			}
+			if strings.Contains(contentText(m.Content), "follow-up question") {
+				sawNudge = true
+			}
 		}
-		if strings.Contains(contentText(m.Content), "SECRET AGENT PROMPT") {
-			t.Errorf("plain turn leaked the agent_system setting at messages[%d]: %q", i, contentText(m.Content))
-		}
+	}
+	if !sawNudge {
+		t.Errorf("plain turn did not inject the built-in plainChatNudge; messages=%+v", mc.Messages)
 	}
 
 	claimRelay(t, j, relayResponse{content: "hello"})
