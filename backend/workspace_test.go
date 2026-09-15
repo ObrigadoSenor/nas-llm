@@ -55,11 +55,18 @@ func TestLocalToolPartition(t *testing.T) {
 			t.Errorf("localGitTools() missing %s", name)
 		}
 	}
-	// The file tools a non-git workspace needs are present.
-	wantFile := []string{"read_file", "list_files", "tree", "glob", "grep", "write_file", "edit_file", "move_path", "delete_path", "apply_patch", "run_command"}
+	// The file tools a non-git workspace needs are present, plus the Tasks Pill
+	// tools (todo_write/todo_read) which are workspace-agnostic local tools.
+	wantFile := []string{"read_file", "list_files", "tree", "glob", "grep", "write_file", "edit_file", "move_path", "delete_path", "apply_patch", "run_command", "todo_write", "todo_read"}
 	for _, name := range wantFile {
 		if !fileSet[name] {
 			t.Errorf("localFileTools() missing file tool %s", name)
+		}
+	}
+	// The Tasks Pill tools are in the full repo set too.
+	for _, name := range []string{"todo_write", "todo_read"} {
+		if !slicesContains(all, name) {
+			t.Errorf("localRepoTools() does not include tasks tool %s", name)
 		}
 	}
 }
@@ -162,5 +169,146 @@ func TestRepoUseGitRoundTrip(t *testing.T) {
 	}
 	if !sawNonGit {
 		t.Error("listRepos did not return the non-git workspace as UseGit=false")
+	}
+}
+
+// TestTodosPlanRoundTrip exercises the store round-trip for the Tasks Pill
+// (todos) and Plan mode (planMode/plan/planApproved) fields: PATCH them onto a
+// conversation and confirm getConversation + listConversations read them back.
+// Guards against a migration or column regression that would silently drop
+// the Tasks Pill or Plan mode state.
+func TestTodosPlanRoundTrip(t *testing.T) {
+	st, err := newStore(":memory:")
+	if err != nil {
+		st, err = newStore(filepath.Join(t.TempDir(), "ws.db"))
+		if err != nil {
+			t.Fatalf("newStore: %v", err)
+		}
+	}
+	defer st.close()
+	const email = "ws@example.com"
+	c, err := st.createConversation(email, "conv-todos", "t", "local:1b", nil)
+	if err != nil {
+		t.Fatalf("createConversation: %v", err)
+	}
+	todos := []Todo{{Text: "Read main.go", Status: "completed"}, {Text: "Edit lib.ts", Status: "in_progress"}}
+	plan := "1. Read. 2. Edit. 3. Test."
+	planMode := true
+	if _, err := st.patchConversation(email, c.ID, nil, nil, nil, nil, nil, nil, nil, nil, &todos, &plan, &planMode, nil); err != nil {
+		t.Fatalf("patchConversation: %v", err)
+	}
+	got, err := st.getConversation(email, c.ID)
+	if err != nil || got == nil {
+		t.Fatalf("getConversation: %v", err)
+	}
+	if len(got.Todos) != 2 || got.Todos[0].Text != "Read main.go" || got.Todos[1].Status != "in_progress" {
+		t.Errorf("todos round-trip = %+v, want 2 items", got.Todos)
+	}
+	if got.Plan != plan || !got.PlanMode {
+		t.Errorf("plan/planMode round-trip: plan=%q planMode=%v", got.Plan, got.PlanMode)
+	}
+	// listConversations must surface todos + planMode too.
+	list, err := st.listConversations(email)
+	if err != nil {
+		t.Fatalf("listConversations: %v", err)
+	}
+	var sawTodos bool
+	for _, lc := range list {
+		if lc.ID == c.ID && len(lc.Todos) == 2 && lc.PlanMode {
+			sawTodos = true
+		}
+	}
+	if !sawTodos {
+		t.Error("listConversations did not surface todos/planMode")
+	}
+}
+
+// TestFilterPlanWriteTools guards the Plan-mode write-tool gate: filtering
+// removes every planWriteTools entry (write + git-workflow tools) and leaves
+// the read-only + planning tools (read_file, grep, todo_write, ask_user, …).
+// Guards against a regression that would let a pre-approval plan-mode run edit.
+func TestFilterPlanWriteTools(t *testing.T) {
+	allow := defaultAgentTools()
+	allow = append(allow, localRepoTools()...)
+	filtered := filterPlanWriteTools(append([]string{}, allow...))
+	write := planWriteTools()
+	writeSet := map[string]bool{}
+	for _, w := range write {
+		writeSet[w] = true
+	}
+	for _, t2 := range filtered {
+		if writeSet[t2] {
+			t.Errorf("filterPlanWriteTools left a write tool %s in the allowlist", t2)
+		}
+	}
+	// The read-only + planning tools must survive.
+	for _, keep := range []string{"read_file", "grep", "tree", "ask_user", "get_time", "todo_write", "todo_read", "web_search"} {
+		if !slicesContains(filtered, keep) {
+			t.Errorf("filterPlanWriteTools dropped a read/planning tool %s", keep)
+		}
+	}
+}
+
+// TestInjectPlanContext checks the Plan-mode system-prompt block: it names
+// plan mode, forbids editing pre-approval (or says approved post-approval),
+// and includes the plan text. Pre-approval must NOT say "implement".
+func TestInjectPlanContext(t *testing.T) {
+	pre := injectPlanContext("BASE", "a plan", false)
+	if !strings.Contains(pre, "PLAN MODE") {
+		t.Error("injectPlanContext (pre-approval) does not name plan mode")
+	}
+	if !strings.Contains(pre, "DO NOT edit") {
+		t.Error("injectPlanContext (pre-approval) does not forbid editing")
+	}
+	if strings.Contains(pre, "Implement it now") {
+		t.Error("injectPlanContext (pre-approval) says implement")
+	}
+	if !strings.Contains(pre, "a plan") {
+		t.Error("injectPlanContext (pre-approval) does not include the plan text")
+	}
+	post := injectPlanContext("BASE", "a plan", true)
+	if !strings.Contains(post, "Implement it now") {
+		t.Error("injectPlanContext (post-approval) does not say implement")
+	}
+	if strings.Contains(post, "PLAN MODE") {
+		t.Error("injectPlanContext (post-approval) still says PLAN MODE")
+	}
+}
+
+// TestTodoToolsRegistered guards the todo_write/todo_read tool wiring: both
+// are local (sidecar-relayed) tools in the registry and appear in availableTools
+// so the UI can list them. Mirrors TestFileToolWiring's membership style.
+func TestTodoToolsRegistered(t *testing.T) {
+	if !slicesContains(localRepoTools(), "todo_write") || !slicesContains(localRepoTools(), "todo_read") {
+		t.Error("localRepoTools() does not include todo_write/todo_read")
+	}
+	seenUI := map[string]bool{}
+	for _, tm := range availableTools(false, nil) {
+		seenUI[tm.Name] = true
+	}
+	for _, name := range []string{"todo_write", "todo_read"} {
+		if !seenUI[name] {
+			t.Errorf("availableTools does not include %s", name)
+		}
+	}
+	st, err := newStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	defer st.close()
+	srv := &server{cfg: config{contextLength: 8192}, store: st}
+	reg := srv.toolRegistry("")
+	for _, name := range []string{"todo_write", "todo_read"} {
+		tool, ok := reg[name]
+		if !ok {
+			t.Errorf("toolRegistry does not register %s", name)
+			continue
+		}
+		if !tool.local {
+			t.Errorf("%s must be a local (sidecar-relayed) tool, got local=false", name)
+		}
+		if tool.schema.Function.Name != name {
+			t.Errorf("%s schema name = %q, want %s", name, tool.schema.Function.Name, name)
+		}
 	}
 }

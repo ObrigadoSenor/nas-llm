@@ -327,6 +327,8 @@ func (s *server) toolRegistry(email string) map[string]agentTool {
 		"git_push":    gitPushTool(),
 		"create_pr":   createPrTool(),
 		"merge_pr":    mergePrTool(),
+		"todo_write":  todoWriteTool(),
+		"todo_read":   todoReadTool(),
 	} {
 		reg[name] = agentTool{schema: schema, local: true}
 	}
@@ -535,6 +537,47 @@ func listPrsTool() oaiTool {
 	}}
 }
 
+// --- Tasks Pill (in-session todo list) ---
+
+// todoWriteTool lets the agent update the session's task checklist. The todos
+// are an array of {text, status} (status: pending | in_progress | completed).
+// It replaces the whole list each call (set, don't merge) so the agent reasons
+// about the full set. Relayed through the toolExec path like the file tools;
+// the renderer intercepts it and PATCHes /api/conversations/:id.
+func todoWriteTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "todo_write",
+		Description: "Update this session's task checklist. Pass the full todos array (it replaces the current list). Each todo is {text, status} where status is \"pending\", \"in_progress\", or \"completed\". Use this to show the user what you're working through and mark steps done as you finish them.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"todos": map[string]any{
+					"type":        "array",
+					"description": "The full task list. Replaces the current list.",
+					"items": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"text":   map[string]any{"type": "string"},
+							"status": map[string]any{"type": "string", "enum": []string{"pending", "in_progress", "completed"}},
+						},
+						"required": []string{"text", "status"},
+					},
+				},
+			},
+			"required": []string{"todos"},
+		},
+	}}
+}
+
+// todoReadTool lets the agent read the current task checklist (e.g. on resume).
+func todoReadTool() oaiTool {
+	return oaiTool{Type: "function", Function: oaiToolFunction{
+		Name:        "todo_read",
+		Description: "Read this session's current task checklist. Use this on resume to recall what was planned and what's already done.",
+		Parameters:  map[string]any{"type": "object", "properties": map[string]any{}},
+	}}
+}
+
 // --- SSH tools (local: executed by the desktop sidecar over ssh, using the ---
 // user's ~/.ssh/config + keys). Opt-in: only registered when the user has ≥1
 // configured SSH host (see toolRegistry). The host param is an enum of the
@@ -592,15 +635,17 @@ func sshGrepTool(hosts []string) oaiTool {
 // allow append in jobs.go so the three lists cannot drift. git_log and list_prs
 // are included here — they already had sidecar executors but were missing from
 // every backend list, so the model could never call them. Read-only tools first,
-// then write tools, then git workflow tools. The literal order is preserved
-// exactly (agent_tools_test.go and the UI menu depend on it); the file/git
-// subsets below are sliced out of this same set so a non-git workspace gets the
-// file tools only without reordering the git-repo case.
+// then write tools, then git workflow tools, then the Tasks Pill tools. The
+// literal order is preserved exactly (agent_tools_test.go and the UI menu depend
+// on it); the file/git subsets below are sliced out of this same set so a
+// non-git workspace gets the file tools only without reordering the git-repo
+// case.
 func localRepoTools() []string {
 	return []string{
 		"read_file", "list_files", "tree", "glob", "grep", "git_status", "git_log", "list_prs",
 		"write_file", "edit_file", "move_path", "delete_path", "apply_patch", "run_command",
 		"git_commit", "git_push", "create_pr", "merge_pr",
+		"todo_write", "todo_read",
 	}
 }
 
@@ -612,6 +657,7 @@ func localFileTools() []string {
 	return []string{
 		"read_file", "list_files", "tree", "glob", "grep",
 		"write_file", "edit_file", "move_path", "delete_path", "apply_patch", "run_command",
+		"todo_write", "todo_read",
 	}
 }
 
@@ -619,6 +665,13 @@ func localFileTools() []string {
 // plus commit/push/PR/merge. Only appended when the workspace is git-enabled.
 func localGitTools() []string {
 	return []string{"git_status", "git_log", "list_prs", "git_commit", "git_push", "create_pr", "merge_pr"}
+}
+
+// planWriteTools lists the write tools gated out during Plan mode (before the
+// plan is approved). Used by jobs.go to filter the allowlist for a plan-mode run
+// that hasn't been approved yet. Mirrors is_write_tool but lives backend-side.
+func planWriteTools() []string {
+	return []string{"write_file", "edit_file", "delete_path", "move_path", "apply_patch", "run_command", "git_commit", "git_push", "create_pr", "merge_pr"}
 }
 
 // localToolMetas is the UI-facing metadata for localRepoTools, in the same
@@ -643,6 +696,8 @@ func localToolMetas() []toolMeta {
 		{Name: "git_push", Label: "Git push", Description: "Push the current branch to its remote (desktop only)."},
 		{Name: "create_pr", Label: "Create PR", Description: "Open a pull request from the current branch (desktop only)."},
 		{Name: "merge_pr", Label: "Merge PR", Description: "Merge a GitHub pull request by number (desktop only). Approval-gated."},
+		{Name: "todo_write", Label: "Update tasks", Description: "Update this session's task checklist (desktop only)."},
+		{Name: "todo_read", Label: "Read tasks", Description: "Read this session's task checklist (desktop only)."},
 	}
 }
 
@@ -689,6 +744,52 @@ func filterSSHTools(allow []string) []string {
 		}
 	}
 	return out
+}
+
+// filterPlanWriteTools returns allow with the plan-mode write tools removed, so
+// a plan-mode run that hasn't been approved yet only offers read-only + planning
+// tools (read_file, grep, tree, todo_write, ask_user, …) and cannot edit. After
+// approval the caller stops filtering, unlocking write tools for the implementation
+// run. Filters in place over the backing array, mirroring filterSSHTools.
+func filterPlanWriteTools(allow []string) []string {
+	write := planWriteTools()
+	isWrite := map[string]bool{}
+	for _, t := range write {
+		isWrite[t] = true
+	}
+	out := allow[:0]
+	for _, t := range allow {
+		if !isWrite[t] {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// injectPlanContext prepends a plan-mode block to the agent system prompt. When
+// the plan isn't approved yet, it tells the model to research with read-only tools
+// and produce a plan (not edit); when approved, it tells it the plan was approved
+// and to implement it now. The plan text (if any) is included so a resumed or
+// approved run stays grounded in it.
+func injectPlanContext(sys string, plan string, approved bool) string {
+	var b strings.Builder
+	if approved {
+		b.WriteString("The user approved your plan. Implement it now with the write tools (edit_file, write_file, apply_patch, run_command as needed). Stay grounded in the approved plan; do not re-plan unless the user asks. ")
+		if strings.TrimSpace(plan) != "" {
+			b.WriteString("Approved plan:\n")
+			b.WriteString(plan)
+			b.WriteString("\n\n")
+		}
+	} else {
+		b.WriteString("You are in PLAN MODE. Research the task with read-only tools (read_file, list_files, tree, glob, grep, git_status, git_log) and produce a concise plan: a summary, the steps, and any open questions. DO NOT edit, write, or run any mutating tool yet — the user will review and approve the plan first. Use todo_write to draft the step checklist. When the plan is ready, present it to the user and stop (do not proceed to implementation until they approve). ")
+		if strings.TrimSpace(plan) != "" {
+			b.WriteString("Current plan draft (refine and present it):\n")
+			b.WriteString(plan)
+			b.WriteString("\n\n")
+		}
+	}
+	b.WriteString(sys)
+	return b.String()
 }
 
 // sshHostAliases extracts the alias list from a user's SSHHost records, in the

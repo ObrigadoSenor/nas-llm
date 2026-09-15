@@ -484,3 +484,52 @@
 /* Session panel no-git note + Enable-git button spacing. */
 .ds-session-nogit { margin: 10px 0; }
 #dsSessionEnableGit { margin-top: 8px; }
+
+/* --- Sessions vs Chats sidebar split --- */
+/* "Chats" header above #convList (non-workspace conversations), mirroring the
+   Workspaces section header style so the split reads as two peer groups. */
+.ds-sidebar-chats-head {
+  display: flex; align-items: center; gap: 6px;
+  padding: 10px 12px 4px;
+  font-size: 11px; color: #6b707a;
+  text-transform: uppercase; letter-spacing: .06em; font-weight: 600;
+  user-select: none;
+}
+.ds-sidebar-chats-title { flex: 1; }
+
+/* --- Tasks Pill (in-session todo list) --- */
+.ds-tasks-pill { margin: 4px 4px 0; font-size: 12px; color: #8b909a; }
+.ds-tasks-pill.hidden { display: none; }
+.ds-tasks-pill-head {
+  display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none;
+  padding: 2px 0;
+}
+.ds-tasks-pill-chev { color: #6b707a; }
+.ds-tasks-pill.expanded .ds-tasks-pill-chev { transform: rotate(90deg); }
+.ds-tasks-pill-title { font-weight: 600; color: #c7ccd4; }
+.ds-tasks-pill-body { display: none; margin-top: 4px; }
+.ds-tasks-pill.expanded .ds-tasks-pill-body { display: block; }
+.ds-task-item { display: flex; align-items: flex-start; gap: 8px; padding: 3px 0; }
+.ds-task-mark {
+  flex: none; width: 16px; height: 16px; border-radius: 50%;
+  font-size: 10px; line-height: 16px; text-align: center;
+  background: #1a1d24; color: #8b909a; border: 1px solid #2a2e37;
+}
+.ds-task-mark.done { background: #15281a; color: #60c890; border-color: #2d5a3a; }
+.ds-task-mark.active { background: #1a2436; color: #8ab4f8; border-color: #2d3f5a; }
+.ds-task-text { flex: 1; min-width: 0; word-break: break-word; }
+
+/* --- Plan Pill (plan mode) --- */
+.ds-plan-chip {
+  cursor: pointer; padding: 0 4px; border-radius: 4px; user-select: none;
+  color: #c39bd3; background: #2a2330;
+}
+.ds-plan-chip.approved { color: #60c890; background: #15281a; }
+.ds-plan-chip:hover { text-decoration: underline; }
+.ds-plan-body {
+  max-height: 50vh; overflow: auto; white-space: pre-wrap; word-break: break-word;
+  background: #0e1014; border: 1px solid #2a2e37; border-radius: 8px;
+  padding: 10px 12px; font-size: 12px; line-height: 1.5; color: #c7ccd4;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+.ds-pr-open { color: #8ab4f8; text-decoration: none; font-weight: 600; }

@@ -1461,6 +1461,17 @@ func (s *server) runGeneration(j *job) error {
 				}
 			}
 		}
+		// Plan mode: when the conversation is in plan mode, inject the plan
+		// context. If the plan hasn't been approved yet, gate write tools out so
+		// the agent researches with read-only tools and emits a plan for the
+		// user to approve; after approval, write tools are unlocked and the plan
+		// context persists so the implementation run stays grounded in it.
+		if conv.PlanMode {
+			sys = injectPlanContext(sys, conv.Plan, conv.PlanApproved)
+			if !conv.PlanApproved {
+				allow = filterPlanWriteTools(allow)
+			}
+		}
 
 		var toolExecRelay func(context.Context, int, string, string) toolOutcome
 		if repo != nil || sshEnabled {

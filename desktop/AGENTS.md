@@ -44,7 +44,9 @@ The cookie jar is persisted to `<app-data>/nas-llm-desktop/session.json`; the ba
 - `GET/POST /__sidecar/ollama/{status,start,stop}` — local Ollama lifecycle.
 - `ANY /__ollama/*path` — `proxy_ollama` (`:835`): same-origin proxy to `localhost:11434`, strips browser `Origin`/`Referer` (Ollama 403s them).
 
-GitHub/repos routes are in `github.rs:2541-2568` (merged into the same axum app at `main.rs:148`): `/__sidecar/github/{status,connect,disconnect,repos}` and `/__sidecar/repos/{local,add-local,create-workspace,init-git,scan-local,clone,refresh,open,exec,diff,revert,changelog,ship,set-folder,branch,create-branch,state,branches,checkout,commit,create-pr,worktree}`.
+GitHub/repos routes are in `github.rs:2541-2568` (merged into the same axum app at `main.rs:148`): `/__sidecar/github/{status,connect,disconnect,repos}` and `/__sidecar/repos/{local,add-local,create-workspace,init-git,open-in,undo-last,scan-local,clone,refresh,open,exec,diff,revert,changelog,ship,set-folder,branch,create-branch,state,branches,checkout,commit,create-pr,worktree}`.
+
+`open-in` opens a workspace in an external app (editor/Finder/terminal); `undo-last` restores the newest recovery snapshot for a non-git workspace (the non-git analog of `revert`). `repos_exec` snapshots the workspace tree before each approved write tool on a non-git workspace (into `<data_dir>/snapshots/<name>/`) so `undo-last` can restore it.
 
 A connected codebase is a "workspace": either a git repo (`useGit=true`, the default and the only case before this feature) or a plain folder (`useGit=false`). The sidecar registry (`repos.json`) records `use_git` + `name` per record; git-only routes (`state`/`branches`/`checkout`/`branch`/`create-branch`/`commit`/`create-pr`/`prs`/`merge-pr`/`worktree`/`ship`/`changelog`/`refresh`/`diff`/`revert`) gate on `use_git` and return `{ok:false,error:"workspace is not git-enabled"}` for a non-git workspace. `repos_exec` short-circuits the git tools (`git_status`/`git_log`/`list_prs`/`git_commit`/`git_push`/`create_pr`/`merge_pr`) for a non-git workspace with a clear observation; file tools run unchanged. `repos_state` returns `useGit:false` + zeros for branch/dirty/ahead/behind for a non-git workspace. `create-workspace` registers a folder with a name + optional `git init`; `init-git` promotes a non-git workspace to git-enabled in place.
 
@@ -52,8 +54,8 @@ A connected codebase is a "workspace": either a git repo (`useGit=true`, the def
 
 `sidecar.rs:308-332` (`index_html`) reads `www/index.html`, injects a `<link>` for `desktop.css` before `</head>` and a `<script>` for `desktop.js` before `</body>`, then serves it. The `?v=` query strings on those URLs are **hardcoded literals in Rust source**:
 
-- `desktop.css?v=21` — `sidecar.rs:317`
-- `desktop.js?v=29` — `sidecar.rs:324`
+- `desktop.css?v=22` — `sidecar.rs:317`
+- `desktop.js?v=30` — `sidecar.rs:324`
 
 (These numbers go stale on every bump; always re-read the lines before quoting them.)
 
@@ -79,14 +81,15 @@ This is a cross-language coupling with no build-time check. The `www/` side has 
 - `640-736` — **Connect folder flow**: native pick → `/__sidecar/repos/scan-local` → single add or checklist picker. `scan-local` returns a `git` flag per candidate; a non-git candidate routes to the named-workspace flow (`createWorkspaceForPath`) instead of `add-local`.
 - `738-776` — `dsConfirm` (replaces native `confirm()`).
 - `778-829` — Workspace data helpers (`loadWorkspaceData`, `ensureWorkspaceFolder`).
-- `831-1036` — **Branch rail + composer status line**: binds to the active repo-bound chat, polls `/__sidecar/repos/state` every 5s, renders `repo · ⎇ branch · ●N dirty · ↑a ↓b`, auto-approve toggle chip.
-- `1038-1178` — `createWorkspaceChat` (was `createRepoChat`): registers workspace with backend, creates conversation, cuts an `agent/<slug>-<id>` branch (git workspaces only — skipped for `useGit=false`), enables file+git agent tools (file-only for non-git), navigates without reload.
+- `831-1036` — **Branch rail + composer status line**: binds to the active repo-bound chat, polls `/__sidecar/repos/state` every 5s, renders `repo · ⎇ branch · ●N dirty · ↑a ↓b`, auto-approve + auto-sync toggle chips, Plan Pill (plan mode).
+- `1038-1178` — `createWorkspaceChat` (was `createRepoChat`): registers workspace with backend, creates conversation, cuts an `agent/<slug>-<id>` branch (git workspaces only — skipped for `useGit=false`), enables file+git agent tools (file-only for non-git); `openBaseBranchPicker` starts a session from an existing branch. Tasks Pill (`ensureTasksPill`/`renderTasksPill`/`runTodoTool`) renders the agent-maintained checklist below the composer.
 - `1180-1733` — **Repos overlay + local repo sidebar**: GitHub connect/browse/clone, local repo dropdown rows, `openBranchPicker` (repo folder switch), `openChatBranchPicker`/`switchChatBranch` (per-chat branch), `repoMenu` (⋯ actions), `refreshLocal`/`refreshGithub`, toasts.
 - `1735-1800` — **Working changes panel**: cross-repo `git diff` + revert.
 - `1802-1904` — **Ship wizard**: version + changelog + commit/push.
-- `1906-2077` — **Session panel**: diff review, commit & push, open PR, revert, ship.
-- `2078-2119` — Sidebar "Repos" section injection into `#sidebar`; the "+" opens `openConnectMenu` (Connect git repo / New workspace…).
+- `1906-2077` — **Session panel**: diff review, commit & push, open PR, revert, ship; Agent Merge toggle on the Merge tab (polls CI/reviews, auto-merges); Undo-last-write button for non-git workspaces.
+- `2078-2119` — Sidebar "Workspaces" section injection into `#sidebar`; the "+" opens `openConnectMenu` (Connect git repo / New workspace…); `buildSidebarChatsHeader` injects the "Chats" label above `#convList`.
 - `2121-2168` — First-load connect wizard (shown once when zero workspaces); offers both git and non-git.
+- `openMyWork` — cross-workspace dashboard overlay (sessions, dirty/ahead, open PRs across all workspaces); header "My Work" button.
 - `2170-2212` — Gear button placement (header when authed, fixed when on login view).
 - `2214-2254` — `hookLogin`: paste-link box on the login card.
 - `2256-2325` — `bootDesktop`: orchestrates all of the above on load; MutationObservers on `#app`/`#convList`; auto-starts Ollama.

@@ -2838,7 +2838,10 @@ const COMMANDS = [
   { name:"models", desc:"Open the model picker", icon:"boxes", args:false, run(){ openModelsPanel("installed"); } },
   { name:"model", desc:"Pick a model", icon:"chevron-down", args:false, run(){ openModelsPanel("installed"); } },
   { name:"agent-settings", desc:"Open Agent settings", icon:"wrench", args:false, run(){ openAgentPanel(); } },
-  { name:"plan", desc:"Pre-fill a planning prompt", icon:"sparkles", args:true, run(a){ const task=(a||"").trim(); if(!task){ slashNote("Usage: /plan <task>"); return; } input.value=PLAN_TEMPLATE.replace("{task}", task); autosize(); closeSlashPopup(); input.focus(); } },
+  { name:"plan", desc:"Enter Plan mode + pre-fill a planning prompt", icon:"sparkles", args:true, async run(a){ const task=(a||"").trim(); if(!task){ slashNote("Usage: /plan <task>"); return; } if(activeId){ try{ await fetchRetry("/api/conversations/"+encodeURIComponent(activeId),{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({planMode:true,planApproved:false})},{label:"Enter plan mode"}); }catch(e){ /* best-effort; still pre-fill */ } if(!activeExtras.has("agent")) toggleExtra("agent"); } input.value=PLAN_TEMPLATE.replace("{task}", task); autosize(); closeSlashPopup(); slashNote("Plan mode on — the agent will research and plan, then wait for your approval."); input.focus(); } },
+  { name:"autopilot", desc:"Agent mode + auto-approve (hands-off)", icon:"sparkles", args:false, async run(){ if(!activeExtras.has("agent")) toggleExtra("agent"); if(activeId){ try{ await fetchRetry("/api/conversations/"+encodeURIComponent(activeId),{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({agentAutoApprove:true})},{label:"Autopilot"}); }catch(e){ /* best-effort */ } } slashNote("Autopilot on — agent mode with auto-approve. Edits/commands run without asking."); } },
+  { name:"spar", desc:"Pre-fill a devil's-advocate critique prompt", icon:"help", args:true, run(a){ const task=(a||"").trim(); if(!task){ slashNote("Usage: /spar <plan or approach>"); return; } input.value="Play devil's advocate against the following plan or approach. Surface assumptions it makes that could be wrong, edge cases it misses, risks it underweights, and simpler alternatives it overlooked. Be concrete and specific — not generic.\n\n"+task; autosize(); closeSlashPopup(); input.focus(); } },
+  { name:"security-review", desc:"Pre-fill a security-review prompt", icon:"shield", args:false, run(){ input.value="Review the current working changes for high-confidence security vulnerabilities: injection, authn/authz gaps, secret handling, path traversal, unsafe deserialization, and SSRF. List findings by severity with the file:line and a suggested fix for each. If there are none, say so plainly."; autosize(); closeSlashPopup(); input.focus(); } },
   { name:"logout", desc:"Sign out", icon:"logout", args:false, run(){ logout(); } },
   { name:"help", desc:"Show available commands", icon:"help", args:false, run(){ renderSlashItems(COMMANDS); } },
 ];
@@ -2846,7 +2849,7 @@ let slashItems=[], slashSelected=0;
 function slashPopupOpen(){ return !slashPopup.classList.contains("hidden"); }
 function closeSlashPopup(){ slashPopup.classList.add("hidden"); }
 function findCommand(name){ return COMMANDS.find(c=>c.name===name||(c.aliases||[]).includes(name))||null; }
-function argHint(name){ return {rename:"<title>", plan:"<task>"}[name]||"<args>"; }
+function argHint(name){ return {rename:"<title>", plan:"<task>", spar:"<plan or approach>"}[name]||"<args>"; }
 // Parse a "/name args" line. Returns {name,args} or null when it isn't a slash
 // line. args is everything after the first space (trimmed); a bare "/" yields
 // null so it isn't treated as a command.

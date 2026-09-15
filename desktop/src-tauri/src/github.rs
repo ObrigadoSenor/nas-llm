@@ -357,6 +357,144 @@ fn is_safe_workspace_name(s: &str) -> bool {
 	t.chars().all(|c| c.is_alphanumeric() || c == ' ' || c == '.' || c == '-' || c == '_')
 }
 
+// is_write_tool reports whether an agent tool mutates files (so a non-git
+// workspace snapshots before running it, enabling /repos/undo-last). run_command
+// is intentionally excluded: it's not a direct file mutation by the tool itself,
+// and snapshotting before every command would be too aggressive.
+fn is_write_tool(tool: &str) -> bool {
+	matches!(
+		tool,
+		"write_file" | "edit_file" | "delete_path" | "move_path" | "apply_patch"
+	)
+}
+
+// --- Recovery snapshots for non-git workspaces (undo-last) -----------------
+//
+// A non-git workspace has no `git stash` / `git checkout -- .` to undo an
+// approved write. Instead, repos_exec snapshots the workspace tree into
+// <data_dir>/snapshots/<name>/<millis>/ before each approved write tool, and
+// /repos/undo-last restores the newest snapshot. Heavy dirs (node_modules,
+// build caches, .git) are skipped to keep snapshots small. Only the last 3 are
+// kept per workspace.
+
+fn snapshots_dir(data_dir: &Path) -> PathBuf {
+	data_dir.join("snapshots")
+}
+
+const SNAPSHOT_SKIP_DIRS: &[&str] = &[
+	"node_modules",
+	".git",
+	"target",
+	"dist",
+	"build",
+	".venv",
+	"__pycache__",
+	".next",
+	".cache",
+	".DS_Store",
+];
+
+// copy_tree recursively copies src into dst, skipping directory entries whose
+// names are in `skip` (heavy build/dep dirs) and symlinks (never followed, so a
+// symlink can't escape the workspace root). Best-effort: special files are
+// skipped silently.
+fn copy_tree(src: &Path, dst: &Path, skip: &[&str]) -> Result<(), String> {
+	std::fs::create_dir_all(dst).map_err(|e| format!("mkdir {dst:?}: {e}"))?;
+	for ent in std::fs::read_dir(src).map_err(|e| format!("readdir {src:?}: {e}"))? {
+		let ent = ent.map_err(|e| format!("dirent: {e}"))?;
+		let ft = ent.file_type().map_err(|e| format!("filetype: {e}"))?;
+		if ft.is_symlink() {
+			continue;
+		}
+		let name = ent.file_name();
+		let name_s = name.to_string_lossy();
+		if ft.is_dir() && skip.iter().any(|s| *s == name_s) {
+			continue;
+		}
+		let from = ent.path();
+		let to = dst.join(&name);
+		if ft.is_dir() {
+			copy_tree(&from, &to, skip)?;
+		} else if ft.is_file() {
+			let _ = std::fs::copy(&from, &to);
+		}
+	}
+	Ok(())
+}
+
+// snapshot_workspace copies the workspace tree into a timestamped snapshot dir and
+// prunes to the last 3. Returns the snapshot path. Used by repos_exec before an
+// approved write tool on a non-git workspace.
+fn snapshot_workspace(data_dir: &Path, name: &str, root: &Path) -> Result<PathBuf, String> {
+	let base = snapshots_dir(data_dir).join(safe_name(name));
+	std::fs::create_dir_all(&base).map_err(|e| format!("snapshots dir: {e}"))?;
+	let stamp = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map(|d| d.as_millis())
+		.unwrap_or(0);
+	let snap = base.join(format!("{stamp}"));
+	// If a snapshot for the same millisecond already exists (unlikely), reuse it.
+	if !snap.is_dir() {
+		copy_tree(root, &snap, SNAPSHOT_SKIP_DIRS)?;
+	}
+	// Prune to the newest 3 (names are zero-padded millis timestamps, so lexical
+	// sort = chronological).
+	if let Ok(entries) = std::fs::read_dir(&base) {
+		let mut names: Vec<String> = entries
+			.filter_map(|e| e.ok())
+			.filter_map(|e| e.file_name().into_string().ok())
+			.collect();
+		names.sort();
+		names.reverse();
+		for old in names.into_iter().skip(3) {
+			let _ = std::fs::remove_dir_all(base.join(&old));
+		}
+	}
+	Ok(snap)
+}
+
+// remove_path removes a file or directory tree (the workspace clear step uses
+// this so a non-dir entry doesn't trip remove_dir_all's NotADirectory).
+fn remove_path(p: &Path) {
+	if p.is_dir() {
+		let _ = std::fs::remove_dir_all(p);
+	} else {
+		let _ = std::fs::remove_file(p);
+	}
+}
+
+// undo_last_snapshot restores the newest snapshot into the workspace: clears the
+// workspace's non-skip contents, copies the snapshot back, and removes the
+// restored snapshot so the next undo goes one further back. Returns an error
+// string when there's nothing to restore.
+fn undo_last_snapshot(data_dir: &Path, name: &str, root: &Path) -> Result<(), String> {
+	let base = snapshots_dir(data_dir).join(safe_name(name));
+	let mut entries: Vec<String> = std::fs::read_dir(&base)
+		.map_err(|e| format!("snapshots dir: {e}"))?
+		.filter_map(|e| e.ok())
+		.filter_map(|e| e.file_name().into_string().ok())
+		.collect();
+	if entries.is_empty() {
+		return Err("no snapshot to restore".to_string());
+	}
+	entries.sort();
+	entries.reverse();
+	let snap = base.join(&entries[0]);
+	// Clear the workspace's non-skip contents (keep node_modules/.git/etc).
+	for ent in std::fs::read_dir(root).map_err(|e| format!("readdir root: {e}"))? {
+		let ent = ent.map_err(|e| format!("dirent: {e}"))?;
+		let name_s = ent.file_name().to_string_lossy().to_string();
+		if SNAPSHOT_SKIP_DIRS.iter().any(|s| *s == name_s.as_str()) {
+			continue;
+		}
+		remove_path(&ent.path());
+	}
+	copy_tree(&snap, root, SNAPSHOT_SKIP_DIRS)?;
+	// Remove the restored snapshot so the next undo restores the prior one.
+	let _ = std::fs::remove_dir_all(&snap);
+	Ok(())
+}
+
 // resolve_repo finds a repo's local root by full_name: linked/registered repos
 // first, then a cloned workspace dir. Returns None if neither exists on disk.
 fn resolve_repo(data_dir: &Path, name: &str) -> Option<PathBuf> {
@@ -1185,9 +1323,20 @@ async fn repos_clone(State(st): State<AppState>, Json(body): Json<CloneBody>) ->
 async fn repos_refresh(State(st): State<AppState>, Json(body): Json<NameBody>) -> Response {
     let name = body.name.trim().to_string();
     if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
-    let dest = match resolve_repo(&st.data_dir, &name) {
-        Some(p) => p,
-        None => return json_err("not found locally", StatusCode::NOT_FOUND),
+    // Branch-aware: when a per-chat branch is carried, pull inside that branch's
+    // worktree (so a session auto-sync fast-forwards its own isolated tree, not
+    // the repo's shared main checkout). Empty branch preserves the original
+    // main-tree pull behaviour.
+    let dest = if body.branch.trim().is_empty() {
+        match resolve_repo(&st.data_dir, &name) {
+            Some(p) => p,
+            None => return json_err("not found locally", StatusCode::NOT_FOUND),
+        }
+    } else {
+        match resolve_repo_branch(&st.data_dir, &name, &body.branch).await {
+            Ok(p) => p,
+            Err((status, e)) => return json_err(&e, status),
+        }
     };
     // The token is only used to scrub captured output; pull uses the repo's
     // configured origin (a cloned repo's origin carries the token; a linked
@@ -1487,6 +1636,13 @@ async fn repos_exec(State(st): State<AppState>, Json(body): Json<ExecBody>) -> R
         Ok(r) => r,
         Err(e) => return json_ok(&ExecResult { observation: format!("repo dir: {e}"), preview: "error".into(), is_error: true, ..Default::default() }),
     };
+    // Non-git workspace + approved write tool: snapshot the tree first so the
+    // user can undo the last write via /repos/undo-last (the non-git analog of
+    // git revert). Best-effort: a snapshot failure is ignored so the write still
+    // runs (the agent shouldn't be blocked by a backup problem).
+    if !repo_use_git(&st.data_dir, &repo_name) && is_write_tool(&body.tool) && body.approved {
+        let _ = snapshot_workspace(&st.data_dir, &repo_name, &root);
+    }
     let result = match body.tool.as_str() {
         "read_file" => exec_read_file(&root, &body.args).await,
         "list_files" => exec_list_files(&root, &body.args).await,
@@ -4711,6 +4867,136 @@ async fn repos_init_git(State(st): State<AppState>, Json(body): Json<InitGitBody
     }))
 }
 
+// --- Undo last write for a non-git workspace (recovery snapshot restore) -------
+
+#[derive(Deserialize)]
+struct UndoLastBody {
+    name: String,
+}
+
+// repos_undo_last restores the newest recovery snapshot for a non-git workspace,
+// undoing the most recent approved write tool. Git workspaces are pointed at
+// /repos/revert instead (they have git to undo with). Returns {ok} or
+// {ok:false,error}.
+async fn repos_undo_last(State(st): State<AppState>, Json(body): Json<UndoLastBody>) -> Response {
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return json_err("name is required", StatusCode::BAD_REQUEST);
+    }
+    if repo_use_git(&st.data_dir, &name) {
+        return json_ok(&serde_json::json!({
+            "ok": false,
+            "error": "undo-last is for non-git workspaces; use /repos/revert for a git workspace",
+        }));
+    }
+    let dest = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_err("not found locally", StatusCode::NOT_FOUND),
+    };
+    match undo_last_snapshot(&st.data_dir, &name, &dest) {
+        Ok(_) => json_ok(&serde_json::json!({ "ok": true })),
+        Err(e) => json_ok(&serde_json::json!({ "ok": false, "error": e })),
+    }
+}
+
+// --- Open a workspace in an external app (editor / Finder / terminal) ------------
+
+#[derive(Deserialize)]
+struct OpenInBody {
+    name: String,
+    // "editor" | "finder" | "terminal"
+    target: String,
+}
+
+// repos_open_in opens a workspace folder in an external application: the user's
+// editor ($VISUAL/$EDITOR, else a platform default), the file manager
+// (Finder/Explorer/xdg), or a terminal. The child is detached + stdio null so
+// the sidecar never waits on it. Best-effort: returns {ok:false,error} when the
+// launch fails (e.g. no editor installed) so the UI can toast the reason.
+async fn repos_open_in(State(st): State<AppState>, Json(body): Json<OpenInBody>) -> Response {
+    let name = body.name.trim().to_string();
+    let target = body.target.trim().to_lowercase();
+    if name.is_empty() {
+        return json_err("name is required", StatusCode::BAD_REQUEST);
+    }
+    let dest = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_err("not found locally", StatusCode::NOT_FOUND),
+    };
+    let path_str = dest.display().to_string();
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c");
+    let script = match target.as_str() {
+        "editor" => {
+            // Prefer $VISUAL / $EDITOR; fall back to a platform default.
+            let exe = std::env::var("VISUAL")
+                .or_else(|_| std::env::var("EDITOR"))
+                .unwrap_or_else(|_| default_editor().to_string());
+            format!("{exe:?} {:?}", path_str)
+        }
+        "finder" => format!("{:?} {:?}", default_file_manager(), path_str),
+        "terminal" => default_terminal_command(&path_str),
+        other => {
+            return json_err(
+                &format!("unknown target \"{other}\" (want editor, finder, or terminal)"),
+                StatusCode::BAD_REQUEST,
+            )
+        }
+    };
+    cmd.arg(script);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    match cmd.spawn() {
+        Ok(_child) => json_ok(&serde_json::json!({ "ok": true })),
+        Err(e) => json_ok(&serde_json::json!({
+            "ok": false,
+            "error": format!("could not open: {e}"),
+        })),
+    }
+}
+
+// default_editor returns a platform-default editor command when $VISUAL/$EDITOR
+// is unset. macOS: `open -a "Visual Studio Code"` (the most common harness
+// editor); Windows/Linux: `code` (the VS Code CLI, widely installed).
+fn default_editor() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "open -a \"Visual Studio Code\""
+    } else {
+        "code"
+    }
+}
+
+// default_file_manager returns the command that opens a folder in the OS file
+// manager: `open` (macOS Finder), `explorer` (Windows Explorer), `xdg-open`
+// (Linux).
+fn default_file_manager() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(target_os = "windows") {
+        "explorer"
+    } else {
+        "xdg-open"
+    }
+}
+
+// default_terminal_command returns a `sh -c`-safe script that opens a
+// terminal cd'd into the workspace folder. macOS: `open -a Terminal`; Windows
+// opens `cmd` at the path; Linux tries x-terminal-emulator then xterm. The
+// path is injected via {:?} (Debug-quoted) so spaces/quotes are safe; workspace
+// paths are filesystem paths and won't contain the delimiter.
+fn default_terminal_command(path: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("open -a Terminal {:?}", path)
+    } else if cfg!(target_os = "windows") {
+        // cmd /c start cmd /k "cd /d <path>" — inner quotes escaped for sh -c.
+        // Workspace paths are filesystem paths and won't contain ", so no replace.
+        format!("cmd /c start cmd /k \"cd /d {}\"", path)
+    } else {
+        format!("x-terminal-emulator --directory {:?} 2>/dev/null || xterm -e 'cd {:?}' &", path, path)
+    }
+}
+
 // --- router ----------------------------------------------------------------
 
 pub fn router(state: AppState) -> Router {
@@ -4723,6 +5009,8 @@ pub fn router(state: AppState) -> Router {
         .route("/__sidecar/repos/add-local", post(repos_add_local))
         .route("/__sidecar/repos/create-workspace", post(repos_create_workspace))
         .route("/__sidecar/repos/init-git", post(repos_init_git))
+        .route("/__sidecar/repos/open-in", post(repos_open_in))
+        .route("/__sidecar/repos/undo-last", post(repos_undo_last))
         .route("/__sidecar/repos/scan-local", post(repos_scan_local))
         .route("/__sidecar/repos/clone", post(repos_clone))
         .route("/__sidecar/repos/refresh", post(repos_refresh))
@@ -5189,6 +5477,51 @@ mod tests {
         let capped = cap_ssh_observation(&multi);
         std::str::from_utf8(capped.as_bytes()).expect("valid utf-8");
         assert!(capped.ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn is_write_tool_covers_file_writes_not_git_or_read() {
+        // File-mutation tools that get snapshotted for undo-last.
+        for t in ["write_file", "edit_file", "delete_path", "move_path", "apply_patch"] {
+            assert!(is_write_tool(t), "{t} should be a write tool");
+        }
+        // git tools are NOT write tools here (they're gated separately by
+        // is_git_tool); run_command is intentionally excluded (too aggressive).
+        for t in ["read_file", "grep", "tree", "git_status", "git_commit", "run_command", "todo_write"] {
+            assert!(!is_write_tool(t), "{t} should not be a write tool");
+        }
+    }
+
+    #[test]
+    fn snapshot_and_undo_last_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("a.txt"), "before\n").unwrap();
+        std::fs::write(root.join("b.txt"), "keep\n").unwrap();
+        // node_modules is skipped by the snapshot (heavy dir).
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        std::fs::write(root.join("node_modules/x.js"), "deps").unwrap();
+
+        // Snapshot the pre-write state, then mutate, then undo restores it.
+        let snap = snapshot_workspace(data_dir.path(), "ws", &root).expect("snapshot");
+        assert!(snap.is_dir(), "snapshot dir was created");
+        assert!(snap.join("a.txt").is_file(), "a.txt was snapshotted");
+        assert!(!snap.join("node_modules").exists(), "node_modules was skipped");
+
+        // Simulate a write tool: overwrite a.txt and add a new file.
+        std::fs::write(root.join("a.txt"), "after\n").unwrap();
+        std::fs::write(root.join("new.txt"), "created\n").unwrap();
+
+        // Undo restores the snapshot: a.txt reverts, new.txt is removed, b.txt stays.
+        undo_last_snapshot(data_dir.path(), "ws", &root).expect("undo");
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "before\n");
+        assert!(!root.join("new.txt").exists(), "new.txt should be removed by undo");
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "keep\n");
+        // node_modules is skipped on restore too (kept, not cleared).
+        assert!(root.join("node_modules/x.js").exists(), "node_modules should be preserved");
+        // The restored snapshot was consumed.
+        assert!(!snap.exists(), "snapshot should be consumed by undo");
     }
 
     #[test]

@@ -305,16 +305,20 @@ func (s *server) handlePatchConversation(w http.ResponseWriter, r *http.Request)
 		RepoID           *string `json:"repoId"`
 		RepoBranch       *string `json:"repoBranch"`
 		AgentAutoApprove *bool   `json:"agentAutoApprove"`
+		Todos            *[]Todo `json:"todos"`
+		Plan             *string `json:"plan"`
+		PlanMode         *bool   `json:"planMode"`
+		PlanApproved     *bool   `json:"planApproved"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, "invalid request", http.StatusBadRequest)
 		return
 	}
-	if body.Title == nil && body.FolderID == nil && body.Model == nil && body.AgentSystem == nil && body.AgentTools == nil && body.RepoID == nil && body.RepoBranch == nil && body.AgentAutoApprove == nil {
+	if body.Title == nil && body.FolderID == nil && body.Model == nil && body.AgentSystem == nil && body.AgentTools == nil && body.RepoID == nil && body.RepoBranch == nil && body.AgentAutoApprove == nil && body.Todos == nil && body.Plan == nil && body.PlanMode == nil && body.PlanApproved == nil {
 		jsonError(w, "nothing to update", http.StatusBadRequest)
 		return
 	}
-	c, err := s.store.patchConversation(emailFrom(r), r.PathValue("id"), body.Title, body.FolderID, body.Model, body.AgentSystem, body.AgentTools, body.RepoID, body.RepoBranch, body.AgentAutoApprove)
+	c, err := s.store.patchConversation(emailFrom(r), r.PathValue("id"), body.Title, body.FolderID, body.Model, body.AgentSystem, body.AgentTools, body.RepoID, body.RepoBranch, body.AgentAutoApprove, body.Todos, body.Plan, body.PlanMode, body.PlanApproved)
 	if err != nil {
 		log.Printf("patchConversation: %v", err)
 		jsonError(w, "server error", http.StatusInternalServerError)
