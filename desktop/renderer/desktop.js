@@ -134,7 +134,6 @@ const DS_DRAWER_TABS = [
 ];
 let _dsDrawerTab = "changes";        // active top-level tab
 let _dsModelsTabActivating = false;  // guards modelBtn.click() re-entry when the Models tab opens
-let _dsChangesView = "session";      // "session" (this chat) | "all" (cross-workspace working changes)
 let _dsChangesRepo = "";             // repo for the session view (the active chat's repo)
 // GitHub repo list fetched by refreshGithub; shared with the filter input in
 // buildReposOverlay. Module-scoped (not function-local) so a later refreshGithub
@@ -1689,7 +1688,7 @@ async function refreshRailState() {
     }
     // Keep the Changes tab's session-view diff fresh while the drawer is open on it
     // and there is uncommitted/unpushed work — so changes stay visible until pushed.
-    if ($("dsDrawer") && $("dsDrawer").classList.contains("open") && _dsDrawerTab === "changes" && _dsChangesView === "session" && railState && (railState.dirty > 0 || railState.ahead > 0)) {
+    if ($("dsDrawer") && $("dsDrawer").classList.contains("open") && _dsDrawerTab === "changes" && railState && (railState.dirty > 0 || railState.ahead > 0)) {
       loadSessionPanel(railRepo, (railConv && railConv.repoBranch) || "");
     }
     refreshChangesBadge();
@@ -2573,19 +2572,29 @@ function buildReposOverlay() {
 // across every workspace without a terminal. The #dsChangesBody container is
 // built by openChangesPanel inside #dsChangesAll.
 function openWorkingChanges() {
-  _dsChangesView = "all";
   openDrawer("changes");
 }
 
 async function refreshWorkingChanges() {
   const body = $("dsChangesBody"); if (!body) return;
+  const label = $("dsChangesOtherLabel");
   body.innerHTML = "";
   body.appendChild(el("div", "ds-note", "Loading…"));
   const local = await sid("repos/local");
   body.innerHTML = "";
-  if (!local.ok || !Array.isArray(local.data)) { body.appendChild(el("div", "ds-note", "Could not load local clones.")); return; }
-  if (!local.data.length) { body.appendChild(el("div", "ds-note", "No local clones yet.")); return; }
-  for (const r of local.data) {
+  if (!local.ok || !Array.isArray(local.data)) { if (label) label.style.display = "none"; body.appendChild(el("div", "ds-note", "Could not load local clones.")); return; }
+  // Exclude the selected workspace (shown in the banner + session card above)
+  // so it isn't duplicated in the "Other workspaces" list.
+  const selected = railRepo || "";
+  const others = local.data.filter((r) => r.name !== selected);
+  if (!others.length) {
+    if (label) label.style.display = "none";
+    if (!local.data.length) body.appendChild(el("div", "ds-note", "No workspaces connected yet."));
+    else body.appendChild(el("div", "ds-note", "No other workspaces."));
+    return;
+  }
+  if (label) { label.style.display = ""; label.textContent = selected ? "Other workspaces" : "Workspaces"; }
+  for (const r of others) {
     const revertBtn = el("button", "ds-btn ds-btn-ghost ds-btn-sm", "Revert");
     const section = settingsSection(r.name + " (" + r.branch + ")", null, revertBtn);
     revertBtn.onclick = async () => {
@@ -2806,48 +2815,78 @@ async function shipCommit(r, push) {
 }
 
 // --- Changes tab (desktop-only) ---
-// The drawer's Changes tab hosts two views: this chat's session (commit/push/PR/
-// merge/revert on the chat's own branch) and cross-workspace working changes.
-// openSessionPanel (called from the composer status line) opens the session view;
-// openWorkingChanges opens the all-workspaces view. The session card
-// (id dsSessionOverlay) is built once into #dsChangesSession and rebound per chat.
+// The Changes tab shows the selected (active) workspace's session at the top —
+// a banner names it "Selected" (like the Models tab's current-model banner) —
+// with its commit/push/PR/merge card below, then every other workspace's working
+// changes listed below that. No view-toggle tabs: the one in use is pinned at
+// the top and the rest follow, so there are never tabs inside tabs.
+// openSessionPanel (composer status line) and openWorkingChanges (sidebar ⋯)
+// both just open the Changes tab; renderChangesPanel decides what to show from
+// the active chat's rail state. The session card (id dsSessionOverlay) is built
+// once into #dsChangesSession and rebound per chat.
 function openSessionPanel(repoName) {
   _dsChangesRepo = repoName || railRepo || "";
-  _dsChangesView = "session";
   openDrawer("changes");
 }
 
-// openChangesPanel builds the Changes tab's view toggle + two containers once,
-// then renders the active view. Called from openDrawer when the Changes tab opens.
+// openChangesPanel builds the Changes tab's structure once (banner + session +
+// other-workspaces label + list), then renders it. Called from openDrawer when
+// the Changes tab opens.
 function openChangesPanel() {
   const panel = $("dsDrawerPanel_changes"); if (!panel) return;
   if (!panel.firstChild) {
-    const seg = el("div", "ds-tabs"); seg.id = "dsChangesViewTabs";
-    const bSess = el("button", "ds-tab active", "This chat");
-    const bAll = el("button", "ds-tab", "All workspaces");
-    seg.appendChild(bSess); seg.appendChild(bAll);
-    panel.appendChild(seg);
+    // Selected-workspace banner (mirrors the Models tab's current-model banner):
+    // a bordered dark card naming the active chat's workspace with a "Selected"
+    // label, so the one in use is pinned at the top.
+    const banner = el("div", "ds-changes-banner"); banner.id = "dsChangesBanner";
+    banner.appendChild(el("div", "ds-changes-banner-title", "No chat selected"));
+    banner.appendChild(el("div", "ds-changes-banner-sub", "Open a workspace chat to review its changes, or browse all workspaces below."));
+    panel.appendChild(banner);
+    // Session card (commit/push/PR/merge for the selected chat).
     const sessWrap = el("div"); sessWrap.id = "dsChangesSession";
     panel.appendChild(sessWrap);
-    const allWrap = el("div"); allWrap.id = "dsChangesAll"; allWrap.style.display = "none";
+    // Other workspaces — a group label + the list, rendered by refreshWorkingChanges.
+    const otherLabel = el("div", "ds-changes-group-label", "Other workspaces"); otherLabel.id = "dsChangesOtherLabel";
+    panel.appendChild(otherLabel);
+    const allWrap = el("div"); allWrap.id = "dsChangesAll";
     const allBody = el("div"); allBody.id = "dsChangesBody";
     allWrap.appendChild(allBody);
     panel.appendChild(allWrap);
-    bSess.onclick = () => { _dsChangesView = "session"; bSess.classList.add("active"); bAll.classList.remove("active"); sessWrap.style.display = ""; allWrap.style.display = "none"; renderSessionView(); };
-    bAll.onclick = () => { _dsChangesView = "all"; bAll.classList.add("active"); bSess.classList.remove("active"); sessWrap.style.display = "none"; allWrap.style.display = ""; refreshWorkingChanges(); };
   }
-  const seg = $("dsChangesViewTabs");
-  const bSess = seg && seg.children[0], bAll = seg && seg.children[1];
-  const sessWrap = $("dsChangesSession"), allWrap = $("dsChangesAll");
-  if (_dsChangesView === "all") {
-    if (bSess) bSess.classList.remove("active"); if (bAll) bAll.classList.add("active");
-    if (sessWrap) sessWrap.style.display = "none"; if (allWrap) allWrap.style.display = "";
-    refreshWorkingChanges();
-  } else {
-    if (bSess) bSess.classList.add("active"); if (bAll) bAll.classList.remove("active");
-    if (sessWrap) sessWrap.style.display = ""; if (allWrap) allWrap.style.display = "none";
+  renderChangesPanel();
+}
+
+// renderChangesPanel updates the Changes tab from the active chat's rail state:
+// when a repo chat is active, the banner names it "Selected" and the session
+// card renders below; when no repo chat is active, the banner shows an empty
+// state and only the all-workspaces list is shown. The selected workspace is
+// excluded from the "Other workspaces" list so it isn't duplicated.
+function renderChangesPanel() {
+  const repoName = _dsChangesRepo || railRepo || "";
+  const chatTitle = (railConv && railConv.title) || "";
+  const banner = $("dsChangesBanner");
+  const sessWrap = $("dsChangesSession");
+  if (repoName) {
+    if (banner) {
+      banner.classList.remove("empty");
+      const bt = banner.querySelector(".ds-changes-banner-title");
+      const bs = banner.querySelector(".ds-changes-banner-sub");
+      if (bt) bt.textContent = chatTitle || repoName;
+      if (bs) bs.textContent = "Selected — " + repoName;
+    }
+    if (sessWrap) sessWrap.style.display = "";
     renderSessionView();
+  } else {
+    if (banner) {
+      banner.classList.add("empty");
+      const bt = banner.querySelector(".ds-changes-banner-title");
+      const bs = banner.querySelector(".ds-changes-banner-sub");
+      if (bt) bt.textContent = "No chat selected";
+      if (bs) bs.textContent = "Open a workspace chat to review its changes, or browse all workspaces below.";
+    }
+    if (sessWrap) sessWrap.style.display = "none";
   }
+  refreshWorkingChanges();
 }
 
 // renderSessionView builds (once) and rebinds the per-chat session card, then

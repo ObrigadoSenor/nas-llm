@@ -643,11 +643,21 @@ body.ds-drawer-resizing { user-select: none; cursor: col-resize; }
 .ds-drawer-panel > #modelsModal .browse-controls { margin-top: 14px; }
 .ds-drawer-panel > #modelsModal .browse-list { margin-top: 14px; }
 
-/* Changes tab view toggle (This chat / All workspaces) uses the shared .ds-tabs /
-   .ds-tab underline style (same as the session sub-tabs and Models sub-tabs), so
-   every tab strip in the drawer matches. It's a direct child of the Changes panel,
-   so it gets a bottom margin; the nested session sub-tabs sit in a section body. */
-#dsDrawerPanel_changes > .ds-tabs { margin-bottom: 14px; }
+/* Changes tab: selected-workspace banner (mirrors the Models tab's current-model
+   banner) — a bordered dark card naming the active chat's workspace with a
+   "Selected" label, so the one in use is pinned at the top. */
+.ds-changes-banner {
+  border: 1px solid #2a2e37; border-radius: 10px; background: #1a1d24;
+  padding: 10px 14px; margin-bottom: 14px;
+}
+.ds-changes-banner.empty { background: transparent; }
+.ds-changes-banner-title { font-size: 13px; font-weight: 600; color: #e6e6e6; }
+.ds-changes-banner-sub { font-size: 11px; color: #6b707a; line-height: 1.4; margin-top: 2px; }
+/* Group label for the "Other workspaces" list below the selected session. */
+.ds-changes-group-label {
+  font-size: 11px; color: #6b707a; text-transform: uppercase; letter-spacing: .04em;
+  font-weight: 600; margin: 6px 0 14px;
+}
 
 /* Persistent header changes button (dirty-file count badge). */
 .ds-changes-btn .ds-badge { background: #3b221f; color: #e87060; }
