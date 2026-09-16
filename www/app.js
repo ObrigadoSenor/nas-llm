@@ -2158,15 +2158,25 @@ async function renderInstalledTab(){
   syncSelectedFromEntries();
   renderModels();                                   // header button + banner in sync
   renderModelBanner();
-  // Grouped selectable rows: NAS, Mac, then Local (this computer).
+  // Grouped selectable rows: NAS, Mac, then Local (this computer). A model
+  // that is both server-hosted and local appears once under Local (matching
+  // buildModelEntries' name dedup), so drop the server duplicate here — the
+  // common case is a Mac host and localhost being the same machine.
+  const localNameSet=new Set(localModelNames);
   const groups={};
-  for(const m of list){ const h=m.host||"nas"; (groups[h]=groups[h]||[]).push(m); }
+  for(const m of list){ if(localNameSet.has(m.name)) continue; const h=m.host||"nas"; (groups[h]=groups[h]||[]).push(m); }
   const none=!((groups.nas&&groups.nas.length)||(groups.mac&&groups.mac.length)||localModelNames.length);
   if(none) body.appendChild(mutedNote("No models installed yet. Get more models to download one."));
   for(const h of ["nas","mac"]){
     const arr=groups[h]; if(!arr||!arr.length) continue;
-    body.appendChild(makeGroupLabel({nas:"NAS",mac:"Mac"}[h]));
-    arr.forEach(m=>body.appendChild(buildInstalledRow(m)));
+    // Wrap each host group in a .model-group card (head = label, body = rows)
+    // so the desktop drawer can render it as a settings-style section. The
+    // wrapper is unstyled on the plain web UI, so this is visually neutral there.
+    const g=document.createElement("div"); g.className="model-group";
+    g.appendChild(makeGroupLabel({nas:"NAS",mac:"Mac"}[h]));
+    const gb=document.createElement("div"); gb.className="model-group-body";
+    arr.forEach(m=>gb.appendChild(buildInstalledRow(m)));
+    g.appendChild(gb); body.appendChild(g);
   }
   body.appendChild(renderLocalBlock());
   // Prominent bottom CTA so "get more models" is obvious without changing tabs.
@@ -2188,18 +2198,23 @@ function renderLocalBlock(){
   connect.textContent="Connect local models";
   connect.addEventListener("click", onConnectLocal);
   head.appendChild(label); head.appendChild(connect); sec.appendChild(head);
+  // Body wrapper (.local-section-body) so the desktop drawer can style the
+  // local block as a settings-style section. Unstyled on the plain web UI
+  // (neutral there).
+  const body=document.createElement("div"); body.className="local-section-body";
   if(localDiscoverMsg){
     const err=document.createElement("div"); err.className="err-note local-err"; err.textContent=localDiscoverMsg;
-    sec.appendChild(err);
+    body.appendChild(err);
   }
   const known=localModels.length?localModels:localModelNames.map(n=>({name:n}));
   if(known.length){
-    known.forEach(m=>sec.appendChild(buildLocalRow(m)));
+    known.forEach(m=>body.appendChild(buildLocalRow(m)));
   } else if(!localDiscoverMsg){
     const hint=document.createElement("div"); hint.className="muted local-hint";
     hint.textContent="Connect to Ollama on this computer (localhost:11434) to use your own models here — full feature parity with server models.";
-    sec.appendChild(hint);
+    body.appendChild(hint);
   }
+  sec.appendChild(body);
   return sec;
 }
 async function onConnectLocal(){

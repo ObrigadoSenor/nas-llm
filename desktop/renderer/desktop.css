@@ -225,16 +225,6 @@
   padding: 1px 12px; color: #8b909a;
 }
 
-/* --- Working changes panel (Phase 5: review/undo) --- */
-.ds-changes-section {
-  margin-bottom: 18px; border: 1px solid #2a2e37; border-radius: 8px; overflow: hidden;
-}
-.ds-changes-head {
-  display: flex; align-items: center; gap: 10px;
-  padding: 8px 12px; background: #1a1d24; border-bottom: 1px solid #2a2e37;
-}
-.ds-changes-name { flex: 1; font-size: 13px; font-weight: 600; color: #e6e6e6; }
-
 /* --- Workspace: linked/cloned + remote badges, chat list (Phase 6) --- */
 .ds-badge-linked { background: #1a2436; color: #8ab4f8; }
 .ds-badge-cloned { background: #1a2330; color: #7fa6c8; }
@@ -443,28 +433,15 @@
 .ds-pr-open:hover { text-decoration: underline; }
 .ds-pr-url { color: #6b707a; font-size: 11px; word-break: break-all; }
 
-/* --- Chat session panel (tabbed, minimalistic) --- */
-.ds-session-card { width: 480px; max-width: 92vw; padding: 16px 18px; }
-.ds-session-head { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 12px; }
-.ds-session-title-wrap { flex: 1; min-width: 0; }
-.ds-session-title {
-  margin: 0; font-size: 15px; font-weight: 600; color: #e6e6e6;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.ds-session-sub {
-  font-size: 11px; color: #6b707a; margin-top: 2px;
-  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.ds-tabs { display: flex; gap: 0; border-bottom: 1px solid #2a2e37; margin-bottom: 14px; }
+/* --- Chat session panel sub-tabs (hosted inside a .ds-settings-section body) --- */
+.ds-tabs { display: flex; gap: 0; border-bottom: 1px solid #2a2e37; }
 .ds-tab {
-  background: transparent; border: 0; border-bottom: 2px solid transparent;
+  background: transparent; border: 0;
   color: #8b909a; padding: 7px 12px 8px; font-size: 13px; cursor: pointer;
-  margin-bottom: -1px; transition: color .12s, border-color .12s;
+  transition: color .12s, box-shadow .12s;
 }
 .ds-tab:hover { color: #c7ccd4; }
-.ds-tab.active { color: #e6e6e6; border-bottom-color: #4c8dff; }
-.ds-tab-panels { min-height: 120px; }
+.ds-tab.active { color: #e6e6e6; box-shadow: inset 0 -2px 0 0 #4c8dff; }
 .ds-tab-panel { display: none; }
 .ds-tab-panel.active { display: block; }
 .ds-session-diff { max-height: 32vh; margin-bottom: 12px; }
@@ -481,7 +458,11 @@
   border-radius: 8px; padding: 8px 10px; font-size: 13px; font-family: inherit;
 }
 .ds-session-actions { display: flex; gap: 8px; justify-content: flex-end; }
-.ds-session-foot { margin-top: 14px; padding-top: 12px; border-top: 1px solid #1a1d24; display: flex; justify-content: flex-end; }
+/* Commit row: message input + action dropdown + Apply button on one line. */
+.ds-session-commit-row { display: flex; gap: 8px; align-items: center; }
+.ds-session-commit-row .ds-session-input { flex: 1; width: auto; margin: 0; }
+/* Secondary actions (Revert, Ship) as quiet links, right-aligned. */
+.ds-session-secondary { display: flex; gap: 14px; justify-content: flex-end; margin-top: 2px; }
 .ds-session-link {
   background: transparent; border: 0; color: #6b707a; padding: 2px 4px;
   font-size: 12px; cursor: pointer; text-decoration: none;
@@ -591,19 +572,18 @@ body.ds-drawer-resizing { user-select: none; cursor: col-resize; }
 .ds-drawer-tabs { display: flex; gap: 0; border-bottom: 1px solid var(--border); padding: 0 6px; overflow-x: auto; scrollbar-width: none; }
 .ds-drawer-tabs::-webkit-scrollbar { display: none; }
 .ds-drawer-tab {
-  background: transparent; border: 0; border-radius: 0; border-bottom: 2px solid transparent;
+  background: transparent; border: 0; border-radius: 0;
   color: var(--muted); padding: 9px 12px 10px; font-size: 13px; cursor: pointer;
-  margin-bottom: -1px; white-space: nowrap; transition: color .12s, border-color .12s;
+  white-space: nowrap; transition: color .12s, box-shadow .12s;
 }
 .ds-drawer-tab:focus { outline: none; }
 .ds-drawer-tab:hover { color: var(--text); }
-.ds-drawer-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+.ds-drawer-tab.active { color: var(--text); box-shadow: inset 0 -2px 0 0 var(--accent); }
 .ds-drawer-body { flex: 1; overflow-y: auto; }
 .ds-drawer-panel { display: none; padding: 16px 18px; }
 .ds-drawer-panel.active { display: block; }
 /* Flatten any hosted .ds-card so it fills its drawer panel (no centered-card sizing). */
 .ds-drawer-panel .ds-card { width: 100%; max-width: none; max-height: none; border: 0; border-radius: 0; padding: 0; box-shadow: none; }
-.ds-drawer-panel .ds-session-card { width: 100%; max-width: none; padding: 0; }
 .ds-drawer-panel .ds-head { margin-bottom: 12px; }
 /* Hosted #modelsModal (moved into the Models panel at boot): neutralize its
    fixed-overlay behavior so it renders inline within the drawer panel. */
@@ -614,13 +594,52 @@ body.ds-drawer-resizing { user-select: none; cursor: col-resize; }
 /* The Models tab's own close affordance is the drawer X; hide the inner #closeModels
    to avoid a confusing second close that only toggles the hosted modal. */
 .ds-drawer-panel > #modelsModal #closeModels { display: none; }
+/* Models tab: present the hosted modal's content as section cards + unified
+   underline tabs so the Models tab matches the other drawer tabs. Scoped to
+   the drawer's hosted #modelsModal so the web UI's standalone modal is unchanged. */
+/* Installed / Get-more-models sub-tabs → underline style (matches .ds-drawer-tab). */
+.ds-drawer-panel > #modelsModal .modal-tabs { border-bottom: 1px solid var(--border); padding: 0; }
+.ds-drawer-panel > #modelsModal .modal-tab {
+  background: transparent; border: 0; border-radius: 0; height: auto;
+  color: var(--muted); padding: 9px 12px 10px; font-size: 13px; cursor: pointer;
+  white-space: nowrap; transition: color .12s, box-shadow .12s;
+}
+.ds-drawer-panel > #modelsModal .modal-tab:hover { color: var(--text); }
+.ds-drawer-panel > #modelsModal .modal-tab.active { color: var(--text); box-shadow: inset 0 -2px 0 0 var(--accent); }
+/* Models-tab section pieces reuse the canonical section shell/head/body rules
+   (grouped with .ds-settings-section* below). Only the bits that differ from
+   the desktop-built sections are set here: the banner is a flat summary card
+   (no head/body split), the groups/local block sit below the banner so they
+   use margin-top, and the group label resets the web UI's uppercase muted
+   label to a plain section title. The local-section also neutralizes the web
+   UI's flex/padding/border from styles.css. */
+.ds-drawer-panel > #modelsModal .model-banner { padding: 10px 14px; background: #1a1d24; margin: 14px 0 0; }
+.ds-drawer-panel > #modelsModal .model-banner.empty { background: transparent; }
+.ds-drawer-panel > #modelsModal .model-group,
+.ds-drawer-panel > #modelsModal .local-section { margin-top: 14px; }
+.ds-drawer-panel > #modelsModal .local-section { display: block; padding: 0; margin-bottom: 0; }
+.ds-drawer-panel > #modelsModal .model-group .model-group-label { margin: 0; font-size: 13px; font-weight: 600; color: #e6e6e6; text-transform: none; letter-spacing: 0; }
+.ds-drawer-panel > #modelsModal .local-label { font-size: 13px; font-weight: 600; color: #e6e6e6; }
+.ds-drawer-panel > #modelsModal .get-more-cta { margin-top: 14px; }
+.ds-drawer-panel > #modelsModal #tabBody > :first-child { margin-top: 0; }
+/* Browse: unify the Recommended/All toggle to underline tabs. The catalog cards
+   (.mcard) already carry borders, so they read as bordered content blocks. */
+.ds-drawer-panel > #modelsModal .browse-seg { border: 0; border-bottom: 1px solid var(--border); border-radius: 0; padding: 0; margin: 14px 0 0; }
+.ds-drawer-panel > #modelsModal .browse-seg .seg-btn {
+  flex: none; background: transparent; border: 0; border-radius: 0; height: auto;
+  padding: 9px 12px 10px; color: var(--muted); font-size: 13px; cursor: pointer;
+  transition: color .12s, box-shadow .12s;
+}
+.ds-drawer-panel > #modelsModal .browse-seg .seg-btn:hover:not(.active) { color: var(--text); }
+.ds-drawer-panel > #modelsModal .browse-seg .seg-btn.active { color: var(--text); box-shadow: inset 0 -2px 0 0 var(--accent); }
+.ds-drawer-panel > #modelsModal .browse-controls { margin-top: 14px; }
+.ds-drawer-panel > #modelsModal .browse-list { margin-top: 14px; }
 
-/* Changes tab view toggle (This chat / All workspaces). Scoped to .ds-changes-seg
-   so it never collides with the www Models browse .seg-btn, which lives elsewhere. */
-.ds-changes-seg { display: flex; gap: 4px; border: 1px solid #2a2e37; border-radius: 8px; padding: 3px; margin-bottom: 14px; }
-.ds-changes-seg .ds-seg-btn { flex: 1; background: transparent; border: none; border-radius: 6px; height: 30px; padding: 0 12px; color: #8b909a; font-size: 13px; cursor: pointer; }
-.ds-changes-seg .ds-seg-btn:hover:not(.active) { background: #1b1f27; color: #e6e6e6; }
-.ds-changes-seg .ds-seg-btn.active { background: #1a2436; color: #8ab4f8; }
+/* Group label for the "Other workspaces" list below the selected session. */
+.ds-changes-group-label {
+  font-size: 11px; color: #6b707a; text-transform: uppercase; letter-spacing: .04em;
+  font-weight: 600; margin: 6px 0 14px;
+}
 
 /* Persistent header changes button (dirty-file count badge). */
 .ds-changes-btn .ds-badge { background: #3b221f; color: #e87060; }
@@ -628,3 +647,55 @@ body.ds-drawer-resizing { user-select: none; cursor: col-resize; }
   .ds-drawer-card { width: 100vw; max-width: 100vw; }
   .ds-drawer-resize { display: none; }
 }
+
+/* === Section card — the single source of truth for the drawer's bordered
+   section look. Every tab's sections reuse these grouped rules: the
+   desktop-built .ds-settings-section (Settings/GitHub/My Work/Changes/session
+   via settingsSection()) and the Models tab's .model-banner/.model-group/
+   .local-section (built by shared www/app.js). Change the shell/head/body
+   here and it propagates to all of them; each section only overrides what
+   differs (margin direction, the banner's flat layout, the group label's
+   font reset — see the scoped rules above). === */
+.ds-settings-section,
+.ds-drawer-panel > #modelsModal .model-banner,
+.ds-drawer-panel > #modelsModal .model-group,
+.ds-drawer-panel > #modelsModal .local-section {
+  border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+}
+.ds-settings-section { margin-bottom: 14px; }
+.ds-settings-section:last-child { margin-bottom: 0; }
+/* Section head — the dark header bar. Shared by the settings head, the
+   model-group label, and the local head. */
+.ds-settings-section-head,
+.ds-drawer-panel > #modelsModal .model-group .model-group-label,
+.ds-drawer-panel > #modelsModal .local-head {
+  padding: 10px 14px; background: #1a1d24; border-bottom: 1px solid var(--border);
+}
+.ds-settings-section-head { display: flex; flex-direction: column; gap: 2px; }
+/* Row-variant head: title-wrap (title + optional subtitle, stacked) on the
+   left, inline action button on the right (GitHub repos + Disconnect, Changes
+   other-workspace + Revert). */
+.ds-settings-section-head.row { flex-direction: row; align-items: center; justify-content: space-between; gap: 10px; }
+.ds-settings-section-head.row .ds-settings-section-title-wrap { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.ds-settings-section-title { font-size: 13px; font-weight: 600; color: #e6e6e6; }
+.ds-settings-section-sub { font-size: 11px; color: #6b707a; line-height: 1.4; }
+/* Section body — the padded content area. Shared by all section variants. */
+.ds-settings-section-body,
+.ds-drawer-panel > #modelsModal .model-group-body,
+.ds-drawer-panel > #modelsModal .local-section-body {
+  display: flex; flex-direction: column; gap: 8px; padding: 12px 14px;
+}
+/* The SSH/Updates sections drop their own .ds-label (the section head titles
+   them); neutralize the first inner .ds-note's top margin so it sits flush. */
+.ds-settings-section-body .ds-note:first-child { margin-top: 0; }
+
+/* Account section: authed row (email + Sign out) vs guest (magic-link sign-in). */
+.ds-account-row { display: flex; align-items: center; gap: 10px; }
+.ds-account-email {
+  flex: 1; min-width: 0; font-size: 13px; color: #e6e6e6; font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* Desktop owns account (email + Sign out) in the Settings tab; hide the
+   sidebar's #who row on desktop. The web UI keeps #who. */
+#who { display: none !important; }
