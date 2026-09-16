@@ -135,6 +135,7 @@ const DS_DRAWER_TABS = [
 let _dsDrawerTab = "changes";        // active top-level tab
 let _dsModelsTabActivating = false;  // guards modelBtn.click() re-entry when the Models tab opens
 let _dsChangesRepo = "";             // repo for the session view (the active chat's repo)
+let _dsSessionSig = "";              // last session reload signature (repo:branch:dirty:ahead) — guards the 5s poll so it only reloads when state actually changes, not every tick
 // GitHub repo list fetched by refreshGithub; shared with the filter input in
 // buildReposOverlay. Module-scoped (not function-local) so a later refreshGithub
 // assignment is visible to the filter handler — otherwise strict mode throws a
@@ -1687,9 +1688,12 @@ async function refreshRailState() {
       if (r2.ok && r2.data) { railState = r2.data; renderComposerStatus(); }
     }
     // Keep the Changes tab's session-view diff fresh while the drawer is open on it
-    // and there is uncommitted/unpushed work — so changes stay visible until pushed.
-    if ($("dsDrawer") && $("dsDrawer").classList.contains("open") && _dsDrawerTab === "changes" && railState && (railState.dirty > 0 || railState.ahead > 0)) {
-      loadSessionPanel(railRepo, (railConv && railConv.repoBranch) || "");
+    // and there is uncommitted/unpushed work. Only reload when the session signature
+    // (repo/branch/dirty/ahead) actually changes — otherwise the 5s poll would clear
+    // and re-render the diff every tick, making the screen blink.
+    if ($("dsDrawer") && $("dsDrawer").classList.contains("open") && _dsDrawerTab === "changes" && railRepo && railState) {
+      const sig = railRepo + ":" + ((railConv && railConv.repoBranch) || "") + ":" + (railState.dirty || 0) + ":" + (railState.ahead || 0);
+      if (sig !== _dsSessionSig) { _dsSessionSig = sig; loadSessionPanel(railRepo, (railConv && railConv.repoBranch) || ""); }
     }
     refreshChangesBadge();
   }
@@ -2835,14 +2839,9 @@ function openSessionPanel(repoName) {
 function openChangesPanel() {
   const panel = $("dsDrawerPanel_changes"); if (!panel) return;
   if (!panel.firstChild) {
-    // Selected-workspace banner (mirrors the Models tab's current-model banner):
-    // a bordered dark card naming the active chat's workspace with a "Selected"
-    // label, so the one in use is pinned at the top.
-    const banner = el("div", "ds-changes-banner"); banner.id = "dsChangesBanner";
-    banner.appendChild(el("div", "ds-changes-banner-title", "No chat selected"));
-    banner.appendChild(el("div", "ds-changes-banner-sub", "Open a workspace chat to review its changes, or browse all workspaces below."));
-    panel.appendChild(banner);
-    // Session card (commit/push/PR/merge for the selected chat).
+    // Session card (commit/push/PR/merge for the selected chat). Its section
+    // head (title + sub) is the single "selected" indicator — no separate
+    // banner, so the active workspace isn't shown twice.
     const sessWrap = el("div"); sessWrap.id = "dsChangesSession";
     panel.appendChild(sessWrap);
     // Other workspaces — a group label + the list, rendered by refreshWorkingChanges.
@@ -2857,33 +2856,16 @@ function openChangesPanel() {
 }
 
 // renderChangesPanel updates the Changes tab from the active chat's rail state:
-// when a repo chat is active, the banner names it "Selected" and the session
-// card renders below; when no repo chat is active, the banner shows an empty
-// state and only the all-workspaces list is shown. The selected workspace is
-// excluded from the "Other workspaces" list so it isn't duplicated.
+// when a repo chat is active, the session card renders at the top (its head is
+// the "selected" indicator); when no repo chat is active, only the all-workspaces
+// list shows. The selected workspace is excluded from the "Other workspaces" list.
 function renderChangesPanel() {
   const repoName = _dsChangesRepo || railRepo || "";
-  const chatTitle = (railConv && railConv.title) || "";
-  const banner = $("dsChangesBanner");
   const sessWrap = $("dsChangesSession");
   if (repoName) {
-    if (banner) {
-      banner.classList.remove("empty");
-      const bt = banner.querySelector(".ds-changes-banner-title");
-      const bs = banner.querySelector(".ds-changes-banner-sub");
-      if (bt) bt.textContent = chatTitle || repoName;
-      if (bs) bs.textContent = "Selected — " + repoName;
-    }
     if (sessWrap) sessWrap.style.display = "";
     renderSessionView();
   } else {
-    if (banner) {
-      banner.classList.add("empty");
-      const bt = banner.querySelector(".ds-changes-banner-title");
-      const bs = banner.querySelector(".ds-changes-banner-sub");
-      if (bt) bt.textContent = "No chat selected";
-      if (bs) bs.textContent = "Open a workspace chat to review its changes, or browse all workspaces below.";
-    }
     if (sessWrap) sessWrap.style.display = "none";
   }
   refreshWorkingChanges();
@@ -2943,17 +2925,25 @@ function buildSessionCard() {
   const pChanges = el("div", "ds-tab-panel active");
   const diffWrap = el("div", "ds-approval-pre-wrap ds-session-diff"); diffWrap.id = "dsSessionDiff";
   pChanges.appendChild(diffWrap);
+  // Commit row: message input + action dropdown (Commit / Commit & push) + Apply.
+  // Replaces the old loose Commit / Commit & push / Revert / Ship buttons with one
+  // tidy control; Revert and Ship live as quiet secondary links below.
+  const commitRow = el("div", "ds-session-commit-row");
   const msgInput = document.createElement("input"); msgInput.id = "dsSessionMsg"; msgInput.type = "text"; msgInput.placeholder = "Commit message"; msgInput.className = "ds-session-input";
-  pChanges.appendChild(msgInput);
-  const commitRow = el("div", "ds-session-actions");
-  const commitBtn = el("button", "ds-btn", "Commit");
-  const pushBtn = el("button", "ds-btn ds-btn-approve", "Commit & push");
-  commitRow.appendChild(commitBtn); commitRow.appendChild(pushBtn);
+  const actionSelect = document.createElement("select"); actionSelect.id = "dsSessionAction"; actionSelect.className = "ds-session-select";
+  actionSelect.appendChild(new Option("Commit", "commit"));
+  actionSelect.appendChild(new Option("Commit & push", "push"));
+  const applyBtn = el("button", "ds-btn", "Apply");
+  commitRow.appendChild(msgInput); commitRow.appendChild(actionSelect); commitRow.appendChild(applyBtn);
   pChanges.appendChild(commitRow);
   const commitOut = el("div", "ds-note"); commitOut.id = "dsSessionCommitOut";
   pChanges.appendChild(commitOut);
-  const revertBtn = el("button", "ds-btn ds-btn-ghost ds-session-link", "Revert all changes");
-  pChanges.appendChild(revertBtn);
+  // Secondary actions as quiet links (Revert, Ship a release).
+  const secondary = el("div", "ds-session-secondary");
+  const revertBtn = el("button", "ds-session-link", "Revert all changes");
+  const shipBtn = el("button", "ds-session-link", "Ship a release…");
+  secondary.appendChild(revertBtn); secondary.appendChild(shipBtn);
+  pChanges.appendChild(secondary);
   const noGitNote = el("div", "ds-note ds-session-nogit"); noGitNote.id = "dsSessionNoGit"; noGitNote.style.display = "none";
   noGitNote.textContent = "This workspace isn't under git, so commit, push, branches, and pull requests aren't available. Enable git to start tracking changes.";
   pChanges.appendChild(noGitNote);
@@ -2962,7 +2952,7 @@ function buildSessionCard() {
   const undoBtn = el("button", "ds-btn ds-btn-ghost ds-session-link", "Undo last write"); undoBtn.id = "dsSessionUndoLast"; undoBtn.style.display = "none";
   pChanges.appendChild(undoBtn);
   panels.appendChild(pChanges);
-  overlay._gitControls = { tabPR, tabMerge, commitBtn, pushBtn, revertBtn, msgInput, noGitNote, enableGitBtn, undoBtn };
+  overlay._gitControls = { tabPR, tabMerge, applyBtn, actionSelect, revertBtn, msgInput, noGitNote, enableGitBtn, undoBtn };
   enableGitBtn.onclick = () => { if (overlay._repo) enableGit({ name: overlay._repo, path: "" }); };
   undoBtn.onclick = () => { if (overlay._repo) undoLastWrite(overlay._repo); };
   // — Pull request —
@@ -3001,10 +2991,6 @@ function buildSessionCard() {
   overlay._agentMerge = { check: agentMergeCheck, out: amOut, timer: null };
   wireAgentMergeToggle(overlay);
   sbody.appendChild(panels);
-  const foot = el("div", "ds-session-foot");
-  const shipBtn = el("button", "ds-btn-ghost ds-session-link", "Ship a release…");
-  foot.appendChild(shipBtn);
-  sbody.appendChild(foot);
   overlay.appendChild(sbody);
   wrap.appendChild(overlay);
   const switchTab = (active, panel) => {
@@ -3026,8 +3012,7 @@ function buildSessionCard() {
     overlay._revert = () => sessionRevert(name, br);
     overlay._ship = () => { closeDrawer(); openShipChanges({ name }); };
   };
-  commitBtn.onclick = () => overlay._commit(false);
-  pushBtn.onclick = () => overlay._commit(true);
+  applyBtn.onclick = () => overlay._commit(actionSelect.value === "push");
   prBtn.onclick = () => overlay._createPR();
   mergeBtn.onclick = () => overlay._mergePR();
   revertBtn.onclick = () => overlay._revert();
@@ -3043,6 +3028,9 @@ async function loadSessionPanel(repoName, branch) {
   const qp = "name=" + encodeURIComponent(repoName) + (branch ? "&branch=" + encodeURIComponent(branch) : "");
   const sr = await sid("repos/state?" + qp);
   const sd = (sr && sr.data) || {};
+  // Record the session signature from the fresh state so the 5s rail poll can
+  // skip a redundant reload when nothing changed (prevents the diff blinking).
+  _dsSessionSig = repoName + ":" + (branch || "") + ":" + (sd.dirty || 0) + ":" + (sd.ahead || 0);
   // Non-git workspace: hide the git-only controls (commit/push/PR/merge/revert),
   // show a "no git" note + an Enable-git button, and skip the diff/PRs loads
   // (those routes return not-enabled for a non-git workspace).
@@ -3056,8 +3044,8 @@ async function loadSessionPanel(repoName, branch) {
       const gc = overlay._gitControls;
       gc.tabPR.style.display = "none";
       gc.tabMerge.style.display = "none";
-      gc.commitBtn.style.display = "none";
-      gc.pushBtn.style.display = "none";
+      gc.applyBtn.style.display = "none";
+      gc.actionSelect.style.display = "none";
       gc.revertBtn.style.display = "none";
       gc.msgInput.style.display = "none";
       gc.noGitNote.style.display = "";
@@ -3073,8 +3061,8 @@ async function loadSessionPanel(repoName, branch) {
     const gc = overlay._gitControls;
     gc.tabPR.style.display = "";
     gc.tabMerge.style.display = "";
-    gc.commitBtn.style.display = "";
-    gc.pushBtn.style.display = "";
+    gc.applyBtn.style.display = "";
+    gc.actionSelect.style.display = "";
     gc.revertBtn.style.display = "";
     gc.msgInput.style.display = "";
     gc.noGitNote.style.display = "none";

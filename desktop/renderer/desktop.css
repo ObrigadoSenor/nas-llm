@@ -442,7 +442,6 @@
 }
 .ds-tab:hover { color: #c7ccd4; }
 .ds-tab.active { color: #e6e6e6; box-shadow: inset 0 -2px 0 0 #4c8dff; }
-.ds-tab-panels { min-height: 120px; }
 .ds-tab-panel { display: none; }
 .ds-tab-panel.active { display: block; }
 .ds-session-diff { max-height: 32vh; margin-bottom: 12px; }
@@ -459,7 +458,11 @@
   border-radius: 8px; padding: 8px 10px; font-size: 13px; font-family: inherit;
 }
 .ds-session-actions { display: flex; gap: 8px; justify-content: flex-end; }
-.ds-session-foot { padding-top: 12px; border-top: 1px solid #1a1d24; display: flex; justify-content: flex-end; }
+/* Commit row: message input + action dropdown + Apply button on one line. */
+.ds-session-commit-row { display: flex; gap: 8px; align-items: center; }
+.ds-session-commit-row .ds-session-input { flex: 1; width: auto; margin: 0; }
+/* Secondary actions (Revert, Ship) as quiet links, right-aligned. */
+.ds-session-secondary { display: flex; gap: 14px; justify-content: flex-end; margin-top: 2px; }
 .ds-session-link {
   background: transparent; border: 0; color: #6b707a; padding: 2px 4px;
   font-size: 12px; cursor: pointer; text-decoration: none;
@@ -643,16 +646,6 @@ body.ds-drawer-resizing { user-select: none; cursor: col-resize; }
 .ds-drawer-panel > #modelsModal .browse-controls { margin-top: 14px; }
 .ds-drawer-panel > #modelsModal .browse-list { margin-top: 14px; }
 
-/* Changes tab: selected-workspace banner (mirrors the Models tab's current-model
-   banner) — a bordered dark card naming the active chat's workspace with a
-   "Selected" label, so the one in use is pinned at the top. */
-.ds-changes-banner {
-  border: 1px solid #2a2e37; border-radius: 10px; background: #1a1d24;
-  padding: 10px 14px; margin-bottom: 14px;
-}
-.ds-changes-banner.empty { background: transparent; }
-.ds-changes-banner-title { font-size: 13px; font-weight: 600; color: #e6e6e6; }
-.ds-changes-banner-sub { font-size: 11px; color: #6b707a; line-height: 1.4; margin-top: 2px; }
 /* Group label for the "Other workspaces" list below the selected session. */
 .ds-changes-group-label {
   font-size: 11px; color: #6b707a; text-transform: uppercase; letter-spacing: .04em;
