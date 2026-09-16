@@ -321,7 +321,7 @@ async fn index_html(State(st): State<AppState>) -> Response {
             if !html.contains("/__sidecar/desktop.js") {
                 html = html.replacen(
                     "</body>",
-                    "<script type=\"module\" src=\"/__sidecar/desktop.js?v=33\"></script>\n</body>",
+                    "<script type=\"module\" src=\"/__sidecar/desktop.js?v=34\"></script>\n</body>",
                     1,
                 );
             }
