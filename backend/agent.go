@@ -1177,10 +1177,12 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 	narrationRetries := 0
 	budgetWarned := false
 	// Chronic format-mismatch tracking: if the model never emits a structured
-	// tool_call across the whole run (every round lands in prose-recovery or the
-	// narration guard), emit a one-time trace hint so an invisible chat-template
-	// break or a mislabeled tool-capable model surfaces as an actionable signal
-	// instead of silently recovering forever.
+	// tool_call AND prose-recovery never executes a call on its behalf (every
+	// round lands in the narration guard), emit a one-time trace hint so an
+	// invisible chat-template break or a mislabeled tool-capable model surfaces
+	// as an actionable signal. A run where prose-recovery did succeed is
+	// suppressed: the model is using tools (in prose form, bridged by the
+	// parser), so the "disable Agent mode" advice would be wrong.
 	proseRecoveries := 0
 	narrationHits := 0
 	structuredToolCalls := 0
@@ -1191,13 +1193,15 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 	// skips the increment. resumeStep is 0 for a fresh run, or the checkpoint's
 	// step index for a resumed run so it continues on the remaining budget.
 	step := resumeStep
-	// emitFormatHint surfaces a chronic format mismatch at the end of a run: if
-	// the model never emitted a structured tool_call (every round landed in
-	// prose-recovery or the narration guard), emit a one-time trace step so an
-	// invisible chat-template break or a mislabeled tool-capable model becomes an
-	// actionable signal instead of silently recovering forever.
+	// emitFormatHint surfaces a chronic format mismatch at the end of a run. It
+	// fires only when the model produced no usable tool call of any kind: zero
+	// structured tool_calls AND zero prose-recovered calls, with at least one
+	// narration-guard hit — the genuine "tool-capable label is wrong / chat
+	// template can't emit calls" dead-end. When prose-recovery succeeded the
+	// parser is bridging the model's prose calls into real executions, so the
+	// run is functional and the broken-template hint is suppressed.
 	emitFormatHint := func() {
-		if structuredToolCalls == 0 && (proseRecoveries > 0 || narrationHits > 0) {
+		if structuredToolCalls == 0 && proseRecoveries == 0 && narrationHits > 0 {
 			emitTool(agentStep{Step: step + 1, Tool: "(format)", Preview: "This model never emitted a structured tool call — its chat template may be broken or it may be mislabeled as tool-capable. Consider a different model or disable Agent mode.", IsError: true})
 		}
 	}
@@ -1509,10 +1513,91 @@ func trimPreview(s string) string {
 	return s
 }
 
+// parseProseToolCallBlob interprets a JSON object (blob) as a tool call a small
+// model wrote in prose, returning the tool name and normalized arguments when
+// the name matches an offered tool. It recognizes the key spellings that show
+// up across local-model chat templates — not just the OpenAI
+// {"name":..,"arguments":..} shape but also {"tool":..,"input":..} and
+// {"function":..,"parameters":..} — plus the nested OpenAI tool_calls shape
+// {"type":"function","function":{"name":..,"arguments":..}}. ok is false for a
+// JSON object that isn't a tool call (e.g. {"key":"value"}) so a caller can
+// leave non-tool JSON alone. extractProseToolCall and stripProseToolCallText
+// both go through here so they agree on what counts as a recovered call.
+func parseProseToolCallBlob(blob string, offered map[string]bool) (name, args string, ok bool) {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal([]byte(blob), &fields) != nil {
+		return "", "", false
+	}
+	// "function" is either a string alias for the tool name ({"function":..,
+	// "parameters":..}) or the nested OpenAI object {"name":..,"arguments":..}.
+	if fn, has := fields["function"]; has {
+		if s := rawString(fn); s != "" {
+			name = s
+		} else {
+			var inner map[string]json.RawMessage
+			if json.Unmarshal(fn, &inner) == nil {
+				name = rawString(firstRaw(inner, "name", "tool"))
+				args = normalizeProseArgs(firstRaw(inner, "arguments", "input", "parameters", "args"))
+			}
+		}
+	}
+	if name == "" {
+		name = rawString(firstRaw(fields, "name", "tool"))
+	}
+	if name == "" || !offered[name] {
+		return "", "", false
+	}
+	if args == "" {
+		args = normalizeProseArgs(firstRaw(fields, "arguments", "input", "parameters", "args"))
+	}
+	return name, args, true
+}
+
+// rawString unmarshals a JSON RawMessage that is expected to be a string and
+// returns it; any other JSON type (object, number, bool, null) yields "".
+func rawString(r json.RawMessage) string {
+	var s string
+	if json.Unmarshal(r, &s) == nil {
+		return s
+	}
+	return ""
+}
+
+// firstRaw returns the value of the first of keys present in fields, or nil.
+func firstRaw(fields map[string]json.RawMessage, keys ...string) json.RawMessage {
+	for _, k := range keys {
+		if v, ok := fields[k]; ok {
+			return v
+		}
+	}
+	return nil
+}
+
+// normalizeProseArgs turns the raw arguments of a recovered prose tool call into
+// the bare-object string the tool executor expects: an object/array is kept
+// as-is, a JSON string (the OpenAI tool_calls shape, where arguments is itself a
+// JSON-encoded string) is unwrapped, and missing/null becomes "{}".
+func normalizeProseArgs(raw json.RawMessage) string {
+	s := strings.TrimSpace(string(raw))
+	if s == "" || s == "null" {
+		return "{}"
+	}
+	var asStr string
+	if json.Unmarshal(raw, &asStr) == nil {
+		t := strings.TrimSpace(asStr)
+		if strings.HasPrefix(t, "{") || strings.HasPrefix(t, "[") {
+			return t
+		}
+		return asStr
+	}
+	return s
+}
+
 // extractProseToolCall scans text for the first JSON object shaped like a tool
-// call ({"name": "...", "arguments": {...}}) whose name is an offered tool, and
-// returns a synthesized oaiToolCall to execute. It recovers tool calls a small
-// model wrote as prose (often in a fenced code block) because it could not emit
+// call ({"name": "...", "arguments": {...}} and the alias shapes documented on
+// parseProseToolCallBlob) whose name is an offered tool, and returns a
+// synthesized oaiToolCall to execute. It recovers tool calls a small model
+// wrote as prose (often in a fenced code block) because it could not emit
 // structured tool_calls deltas — without this the agent loop dead-ends on the
 // narration. offered is the set of tool names actually sent to the model this
 // run (so a call to a filtered-out local tool is not recovered). Only the first
@@ -1526,20 +1611,12 @@ func extractProseToolCall(text string, offered map[string]bool) (oaiToolCall, bo
 		if end < 0 {
 			break
 		}
-		blob := text[i : end+1]
-		var parsed struct {
-			Name      string          `json:"name"`
-			Arguments json.RawMessage `json:"arguments"`
-		}
-		if json.Unmarshal([]byte(blob), &parsed) == nil && offered[parsed.Name] {
-			args := strings.TrimSpace(string(parsed.Arguments))
-			if args == "" {
-				args = "{}"
-			}
+		name, args, ok := parseProseToolCallBlob(text[i:end+1], offered)
+		if ok {
 			var tc oaiToolCall
-			tc.ID = "prose_" + parsed.Name
+			tc.ID = "prose_" + name
 			tc.Type = "function"
-			tc.Function.Name = parsed.Name
+			tc.Function.Name = name
 			tc.Function.Arguments = args
 			return tc, true
 		}
@@ -1564,11 +1641,7 @@ func stripProseToolCallText(text string, offered map[string]bool) string {
 			break
 		}
 		blob := text[i : end+1]
-		var parsed struct {
-			Name      string          `json:"name"`
-			Arguments json.RawMessage `json:"arguments"`
-		}
-		if json.Unmarshal([]byte(blob), &parsed) != nil || !offered[parsed.Name] {
+		if _, _, ok := parseProseToolCallBlob(blob, offered); !ok {
 			i = end
 			continue
 		}

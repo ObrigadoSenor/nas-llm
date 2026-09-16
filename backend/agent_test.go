@@ -1135,3 +1135,156 @@ func TestInjectRepoContext(t *testing.T) {
 		t.Errorf("branchless prompt wrongly claims a worktree: %q", gotMain)
 	}
 }
+
+// TestParseProseToolCallBlob covers the prose tool-call parser's key-alias
+// support: a small model that can't emit structured tool_calls deltas often
+// writes the call as a JSON blob in prose, and different chat templates spell
+// the keys differently. The parser must recognize name/arguments (OpenAI),
+// tool/input (Anthropic-style), function/parameters, and the nested OpenAI
+// tool_calls shape — and leave a non-tool JSON object alone so it is not
+// mistaken for a call.
+func TestParseProseToolCallBlob(t *testing.T) {
+	offered := map[string]bool{"run_command": true, "get_time": true}
+	cases := []struct {
+		name     string
+		blob     string
+		wantName string
+		wantArgs string
+		wantOk   bool
+	}{
+		{
+			name: "openai name/arguments object", blob: `{"name":"run_command","arguments":{"command":"ls"}}`,
+			wantName: "run_command", wantArgs: `{"command":"ls"}`, wantOk: true,
+		},
+		{
+			name: "anthropic tool/input", blob: `{"tool":"run_command","input":{"command":"ls"}}`,
+			wantName: "run_command", wantArgs: `{"command":"ls"}`, wantOk: true,
+		},
+		{
+			name: "function/parameters string alias", blob: `{"function":"run_command","parameters":{"command":"ls"}}`,
+			wantName: "run_command", wantArgs: `{"command":"ls"}`, wantOk: true,
+		},
+		{
+			name: "nested openai tool_calls shape with string arguments", blob: `{"id":"x","type":"function","function":{"name":"get_time","arguments":"{}"}}`,
+			wantName: "get_time", wantArgs: `{}`, wantOk: true,
+		},
+		{
+			name: "nested openai tool_calls shape with object arguments", blob: `{"type":"function","function":{"name":"run_command","arguments":{"command":"go test"}}}`,
+			wantName: "run_command", wantArgs: `{"command":"go test"}`, wantOk: true,
+		},
+		{
+			name: "missing arguments defaults to empty object", blob: `{"name":"get_time"}`,
+			wantName: "get_time", wantArgs: `{}`, wantOk: true,
+		},
+		{
+			name: "non-tool JSON left alone", blob: `{"key":"value"}`, wantOk: false,
+		},
+		{
+			name: "name not in offered set", blob: `{"name":"unknown_tool","arguments":{}}`, wantOk: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			gotName, gotArgs, gotOk := parseProseToolCallBlob(c.blob, offered)
+			if gotOk != c.wantOk {
+				t.Fatalf("ok = %v, want %v (name=%q args=%q)", gotOk, c.wantOk, gotName, gotArgs)
+			}
+			if !c.wantOk {
+				return
+			}
+			if gotName != c.wantName {
+				t.Errorf("name = %q, want %q", gotName, c.wantName)
+			}
+			if gotArgs != c.wantArgs {
+				t.Errorf("args = %q, want %q", gotArgs, c.wantArgs)
+			}
+		})
+	}
+}
+
+// TestAgentProseToolCallRecoveryAliasedKeys verifies the parser recovers a tool
+// call written with Anthropic-style tool/input keys (not just OpenAI
+// name/arguments), runs it, and — because prose-recovery succeeded — the run
+// does NOT emit the (format) "never emitted a structured tool call" diagnostic.
+// The parser bridging the model's prose call into a real execution means Agent
+// mode is functional, so the broken-template hint is suppressed.
+func TestAgentProseToolCallRecoveryAliasedKeys(t *testing.T) {
+	const email = "user@example.com"
+	msgs := []oaiMessage{{Role: "user", Content: jsonString("What time is it?")}}
+	st, err := newStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	defer st.close()
+	srv := &server{cfg: config{contextLength: 8192, maxAgentSteps: 6}, store: st}
+
+	narrated := "Let me check the time.\n```json\n{\"tool\": \"get_time\", \"input\": {}}\n```"
+	mb := &fakeBackend{responses: []oaiMessage{
+		narrationMsg(narrated),      // round 1: narrates the call as tool/input JSON prose
+		finalAnswerMsg("It's 3pm."), // round 2: synthesizes after the real observation
+	}}
+	var steps []agentStep
+	err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
+		func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
+		func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0)
+	if err != nil {
+		t.Fatalf("runAgentLoop: %v", err)
+	}
+	if got := mb.callCount(); got != 2 {
+		t.Fatalf("model calls = %d, want 2 (recovered call ran, then synthesized)", got)
+	}
+	var ranTool *agentStep
+	for i := range steps {
+		if steps[i].Tool == "get_time" {
+			ranTool = &steps[i]
+		}
+	}
+	if ranTool == nil {
+		t.Fatalf("no get_time step; the tool/input prose call should have been recovered. steps = %+v", steps)
+	}
+	if ranTool.IsError {
+		t.Errorf("recovered get_time step errored: %+v", ranTool)
+	}
+	for _, st := range steps {
+		if st.Tool == "(format)" {
+			t.Errorf("(format) diagnostic emitted despite successful prose recovery: %+v", st)
+		}
+	}
+}
+
+// TestAgentFormatHintFiresOnNarrationOnly verifies the (format) diagnostic still
+// surfaces the genuine dead-end: a model that only narrates intentions and never
+// produces a usable (structured or prose-recoverable) tool call. This is the
+// case the hint is meant for — a mislabeled tool-capable model or a broken chat
+// template — so it must not be suppressed by the prose-recovery carve-out.
+func TestAgentFormatHintFiresOnNarrationOnly(t *testing.T) {
+	const email = "user@example.com"
+	msgs := []oaiMessage{{Role: "user", Content: jsonString("Add a comment to foo.go")}}
+	st, err := newStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	defer st.close()
+	srv := &server{cfg: config{contextLength: 8192, maxAgentSteps: 6}, store: st}
+
+	mb := &fakeBackend{responses: []oaiMessage{
+		narrationMsg("I'll edit foo.go to add a comment."), // round 1: no JSON -> re-prompt
+		narrationMsg("I'll change bar.go too."),            // round 2: exhausted -> accept
+	}}
+	var steps []agentStep
+	err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
+		func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
+		func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0)
+	if err != nil {
+		t.Fatalf("runAgentLoop: %v", err)
+	}
+	var format *agentStep
+	for i := range steps {
+		if steps[i].Tool == "(format)" {
+			format = &steps[i]
+		}
+	}
+	if format == nil {
+		t.Errorf("no (format) diagnostic emitted; a narration-only run with no recovery should surface it. steps = %+v", steps)
+	}
+}
