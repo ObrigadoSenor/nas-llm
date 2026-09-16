@@ -606,31 +606,20 @@ body.ds-drawer-resizing { user-select: none; cursor: col-resize; }
 }
 .ds-drawer-panel > #modelsModal .modal-tab:hover { color: var(--text); }
 .ds-drawer-panel > #modelsModal .modal-tab.active { color: var(--text); box-shadow: inset 0 -2px 0 0 var(--accent); }
-/* Current-model banner → a bordered dark summary card (title + description). */
-.ds-drawer-panel > #modelsModal .model-banner {
-  border: 1px solid var(--border); border-radius: 10px; background: #1a1d24;
-  padding: 10px 14px; margin: 14px 0 0;
-}
+/* Models-tab section pieces reuse the canonical section shell/head/body rules
+   (grouped with .ds-settings-section* below). Only the bits that differ from
+   the desktop-built sections are set here: the banner is a flat summary card
+   (no head/body split), the groups/local block sit below the banner so they
+   use margin-top, and the group label resets the web UI's uppercase muted
+   label to a plain section title. The local-section also neutralizes the web
+   UI's flex/padding/border from styles.css. */
+.ds-drawer-panel > #modelsModal .model-banner { padding: 10px 14px; background: #1a1d24; margin: 14px 0 0; }
 .ds-drawer-panel > #modelsModal .model-banner.empty { background: transparent; }
-/* Installed model groups (NAS/Mac) → section cards (head = label, body = rows). */
-.ds-drawer-panel > #modelsModal .model-group {
-  border: 1px solid var(--border); border-radius: 10px; overflow: hidden; margin-top: 14px;
-}
-.ds-drawer-panel > #modelsModal .model-group .model-group-label {
-  margin: 0; padding: 10px 14px; background: #1a1d24; border-bottom: 1px solid var(--border);
-  font-size: 13px; font-weight: 600; color: #e6e6e6; text-transform: none; letter-spacing: 0;
-}
-.ds-drawer-panel > #modelsModal .model-group-body { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; }
-/* Local (this computer) block → section card (row head = label + Connect, body = rows/hint). */
-.ds-drawer-panel > #modelsModal .local-section {
-  display: block; gap: 0;
-  border: 1px solid var(--border); border-radius: 10px; overflow: hidden; margin-top: 14px;
-  padding: 0; background: transparent;
-}
-.ds-drawer-panel > #modelsModal .local-head { padding: 10px 14px; background: #1a1d24; border-bottom: 1px solid var(--border); }
+.ds-drawer-panel > #modelsModal .model-group,
+.ds-drawer-panel > #modelsModal .local-section { margin-top: 14px; }
+.ds-drawer-panel > #modelsModal .local-section { display: block; padding: 0; margin-bottom: 0; }
+.ds-drawer-panel > #modelsModal .model-group .model-group-label { margin: 0; font-size: 13px; font-weight: 600; color: #e6e6e6; text-transform: none; letter-spacing: 0; }
 .ds-drawer-panel > #modelsModal .local-label { font-size: 13px; font-weight: 600; color: #e6e6e6; }
-.ds-drawer-panel > #modelsModal .local-section-body { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; }
-/* Bottom CTA + first section spacing inside the section flow. */
 .ds-drawer-panel > #modelsModal .get-more-cta { margin-top: 14px; }
 .ds-drawer-panel > #modelsModal #tabBody > :first-child { margin-top: 0; }
 /* Browse: unify the Recommended/All toggle to underline tabs. The catalog cards
@@ -659,27 +648,43 @@ body.ds-drawer-resizing { user-select: none; cursor: col-resize; }
   .ds-drawer-resize { display: none; }
 }
 
-/* --- Settings tab: grouped sections --- */
-/* Each concern (Account / Connection / Local models / SSH hosts / Updates) is a
-   bordered card with a header (title + optional subtitle) and a body, replacing
-   the old flat label/row list. */
-.ds-settings-section {
-  border: 1px solid #2a2e37; border-radius: 10px; overflow: hidden;
-  margin-bottom: 14px;
+/* === Section card — the single source of truth for the drawer's bordered
+   section look. Every tab's sections reuse these grouped rules: the
+   desktop-built .ds-settings-section (Settings/GitHub/My Work/Changes/session
+   via settingsSection()) and the Models tab's .model-banner/.model-group/
+   .local-section (built by shared www/app.js). Change the shell/head/body
+   here and it propagates to all of them; each section only overrides what
+   differs (margin direction, the banner's flat layout, the group label's
+   font reset — see the scoped rules above). === */
+.ds-settings-section,
+.ds-drawer-panel > #modelsModal .model-banner,
+.ds-drawer-panel > #modelsModal .model-group,
+.ds-drawer-panel > #modelsModal .local-section {
+  border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
 }
+.ds-settings-section { margin-bottom: 14px; }
 .ds-settings-section:last-child { margin-bottom: 0; }
-.ds-settings-section-head {
-  display: flex; flex-direction: column; gap: 2px;
-  padding: 10px 14px; background: #1a1d24; border-bottom: 1px solid #2a2e37;
+/* Section head — the dark header bar. Shared by the settings head, the
+   model-group label, and the local head. */
+.ds-settings-section-head,
+.ds-drawer-panel > #modelsModal .model-group .model-group-label,
+.ds-drawer-panel > #modelsModal .local-head {
+  padding: 10px 14px; background: #1a1d24; border-bottom: 1px solid var(--border);
 }
+.ds-settings-section-head { display: flex; flex-direction: column; gap: 2px; }
 /* Row-variant head: title-wrap (title + optional subtitle, stacked) on the
-   left, inline action button on the right — mirrors .ds-changes-head's
-   name + action layout on the canonical section shell. */
+   left, inline action button on the right (GitHub repos + Disconnect, Changes
+   other-workspace + Revert). */
 .ds-settings-section-head.row { flex-direction: row; align-items: center; justify-content: space-between; gap: 10px; }
 .ds-settings-section-head.row .ds-settings-section-title-wrap { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .ds-settings-section-title { font-size: 13px; font-weight: 600; color: #e6e6e6; }
 .ds-settings-section-sub { font-size: 11px; color: #6b707a; line-height: 1.4; }
-.ds-settings-section-body { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; }
+/* Section body — the padded content area. Shared by all section variants. */
+.ds-settings-section-body,
+.ds-drawer-panel > #modelsModal .model-group-body,
+.ds-drawer-panel > #modelsModal .local-section-body {
+  display: flex; flex-direction: column; gap: 8px; padding: 12px 14px;
+}
 /* The SSH/Updates sections drop their own .ds-label (the section head titles
    them); neutralize the first inner .ds-note's top margin so it sits flush. */
 .ds-settings-section-body .ds-note:first-child { margin-top: 0; }
