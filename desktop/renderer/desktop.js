@@ -1298,6 +1298,7 @@ let railConv = null;       // that conversation's record (for its own repoBranch
 let railTimer = null;      // the ~5s repos/state poll interval
 let railMaps = { convById: new Map(), repoById: new Map(), repoByFullName: new Map() };
 let railSyncTimer = null;  // debounce for syncBranchRail
+let railSwitchInFlight = false;  // guards eager folder-switch against re-entrancy
 
 // Open a conversation without a full location.reload(): dispatch a CustomEvent
 // that app.js listens for and routes through its openConversation path. Falls
@@ -1494,6 +1495,27 @@ async function refreshRailState() {
   if (r.ok && r.data) {
     railState = r.data;
     renderComposerStatus();
+    // Eager folder-follows-active-chat: switch the repo folder onto this chat's
+    // branch the moment the chat is opened (not only when a tool runs). The
+    // sidecar's repos/create-branch auto-stashes dirty work and pops it on
+    // return, so the folder tracks the active chat's branch. Guarded by
+    // railSwitchInFlight so the 120ms debounce and the 5s poll can't overlap
+    // switches. Skip for non-git (useGit===false) and when the chat has no
+    // repoBranch. After a switch attempt, return this cycle so auto-sync only
+    // runs once the folder is on the right branch.
+    if (!railSwitchInFlight && railConv && railConv.repoBranch && r.data.useGit !== false && r.data.branch && r.data.branch !== railConv.repoBranch) {
+      railSwitchInFlight = true;
+      try {
+        const cb = await sid("repos/create-branch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: railRepo, branch: railConv.repoBranch }) });
+        const cd = (cb && cb.data) || {};
+        if (!cb.ok || !cd.ok) flashDsErr(cd.error || cb.status || "Could not switch the repo folder onto this chat's branch.");
+        const r2 = await sid("repos/state?name=" + encodeURIComponent(railRepo));
+        if (r2.ok && r2.data) { railState = r2.data; renderComposerStatus(); }
+      } finally {
+        railSwitchInFlight = false;
+      }
+      return; // skip auto-sync this pass; folder is now on the right branch
+    }
     // Auto-sync: when the session branch is behind origin and the toggle is on,
     // fast-forward it in the session's own worktree. Git workspaces only, and
     // only when we know the chat's branch (repoBranch) so the pull targets the
@@ -2041,7 +2063,7 @@ async function openChatBranchPicker(convId, repoName, currentBranch) {
     card.appendChild(head);
     const sub = el("div", "ds-note"); sub.id = "dsChatBranchSub";
     card.appendChild(sub);
-    card.appendChild(el("div", "ds-note", "Switching moves the repo folder onto this chat's branch when it's clean. If the folder has uncommitted changes, the chat runs in its own isolated worktree instead, so other chats' branches are never touched."));
+    card.appendChild(el("div", "ds-note", "Switching moves the folder onto this chat's branch; uncommitted edits are auto-stashed and restored when you switch back. node_modules/.env/build caches stay in place."));
     card.appendChild(el("div", "ds-label", "Existing branches"));
     list = el("div", "ds-branch-list"); list.id = "dsChatBranchList";
     card.appendChild(list);
@@ -2051,7 +2073,7 @@ async function openChatBranchPicker(convId, repoName, currentBranch) {
     createBtn = el("button", "ds-btn", "Create & switch"); createBtn.id = "dsChatBranchCreateBtn";
     row.appendChild(newInput); row.appendChild(createBtn);
     card.appendChild(row);
-    card.appendChild(el("div", "ds-note", "A chat that runs in an isolated worktree starts clean — no node_modules, .env, or build caches — so its first run may need an install step."));
+    card.appendChild(el("div", "ds-note", "Switching moves the folder onto this chat's branch; uncommitted edits are auto-stashed and restored when you switch back. node_modules/.env/build caches stay in place."));
     const out = el("div", "ds-note"); out.id = "dsChatBranchOut";
     card.appendChild(out);
     overlay.appendChild(card);
