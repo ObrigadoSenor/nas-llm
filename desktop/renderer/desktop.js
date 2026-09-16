@@ -2820,8 +2820,9 @@ async function shipCommit(r, push) {
 
 // --- Changes tab (desktop-only) ---
 // The Changes tab shows the selected (active) workspace's session at the top —
-// a banner names it "Selected" (like the Models tab's current-model banner) —
-// with its commit/push/PR/merge card below, then every other workspace's working
+// the session card's own section head (title + git-state sub) is the single
+// "selected" indicator, so the active workspace is shown once, not twice — with
+// its commit/push/PR/merge card below, then every other workspace's working
 // changes listed below that. No view-toggle tabs: the one in use is pinned at
 // the top and the rest follow, so there are never tabs inside tabs.
 // openSessionPanel (composer status line) and openWorkingChanges (sidebar ⋯)
@@ -2833,7 +2834,7 @@ function openSessionPanel(repoName) {
   openDrawer("changes");
 }
 
-// openChangesPanel builds the Changes tab's structure once (banner + session +
+// openChangesPanel builds the Changes tab's structure once (session +
 // other-workspaces label + list), then renders it. Called from openDrawer when
 // the Changes tab opens.
 function openChangesPanel() {
