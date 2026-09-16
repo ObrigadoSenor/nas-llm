@@ -1572,7 +1572,17 @@ func (s *server) runGeneration(j *job) error {
 				msgs = cpMsgs
 			}
 		}
-		return s.runAgentLoop(ctx, mb, j.model, j.email, msgs, allow, sys, j.emitChunk, j.emitPhase, j.emitTool, j.emitQuestions, j.emitThought, j.emitClear, j.addUsage, repoID, toolExecRelay, j.isPauseRequested, j.setRoundCancel, resumeStep)
+		// Prose clarifying-question bridge budget: a model that can't emit
+		// structured tool_calls may ask the user in prose instead of calling
+		// ask_user. runAgentLoop bridges such prose to a clarify card, but only
+		// while the recent back-to-back clarify count is under MAX_CLARIFY_ROUNDS
+		// (mirroring the clarify path's own cap) so the agent cannot stall on
+		// endless questions across a conversation.
+		clarifyBudget := s.cfg.maxClarifyRounds - countRecentClarify(conv.Messages)
+		if clarifyBudget < 0 {
+			clarifyBudget = 0
+		}
+		return s.runAgentLoop(ctx, mb, j.model, j.email, msgs, allow, sys, j.emitChunk, j.emitPhase, j.emitTool, j.emitQuestions, j.emitThought, j.emitClear, j.addUsage, repoID, toolExecRelay, j.isPauseRequested, j.setRoundCancel, resumeStep, clarifyBudget)
 	}
 	if j.clarify {
 		// Cap back-to-back clarifying questions at MAX_CLARIFY_ROUNDS: once the

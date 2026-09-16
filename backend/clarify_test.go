@@ -221,3 +221,116 @@ func TestRunGeneration_PlainChatNonToolSkipsAskUser(t *testing.T) {
 		t.Errorf("clarifySnapshot = %+v, want nil for a plain answer", got)
 	}
 }
+
+// TestDetectAgentClarifyQuestion covers the agent-loop prose clarifying-question
+// bridge: a model that can't emit structured tool_calls and asks the user in
+// prose becomes an interactive card (single-select when options extract, else
+// free-text) instead of dead-ending on the narration guard. Contrast with
+// detectClarifyFromContent (plain chat), which only bridges single-select with
+// ≥2 options — the agent bridge additionally handles free-text questions.
+func TestDetectAgentClarifyQuestion(t *testing.T) {
+	cases := []struct {
+		name           string
+		text           string
+		askUserOffered bool
+		wantNil        bool
+		wantType       string // "" = don't check
+		wantText       string // substring check; "" = don't check
+		wantOpts       []clarifyOption
+	}{
+		{
+			name:           "reported bug: intention + free question -> free card",
+			text:           "Sure, I'll commit the changes. What commit message would you like me to use?",
+			askUserOffered: true,
+			wantType:       "free",
+			wantText:       "What commit message",
+		},
+		{
+			name:           "user-directed question, no options -> free card",
+			text:           "Which commit style should I use?",
+			askUserOffered: true,
+			wantType:       "free",
+			wantText:       "Which commit style",
+		},
+		{
+			name:           "inline options before question mark -> single-select",
+			text:           "Which branch: main or dev?",
+			askUserOffered: true,
+			wantType:       "single",
+			wantText:       "Which branch",
+			wantOpts:       []clarifyOption{{Label: "main", Value: "main"}, {Label: "dev", Value: "dev"}},
+		},
+		{
+			name:           "options after question mark -> single-select",
+			text:           "Which language?\n1. Python\n2. Go",
+			askUserOffered: true,
+			wantType:       "single",
+			wantText:       "Which language",
+			wantOpts:       []clarifyOption{{Label: "Python", Value: "Python"}, {Label: "Go", Value: "Go"}},
+		},
+		{
+			name:           "answer + next-step follow-up -> nil",
+			text:           "4. Want me to do another?",
+			askUserOffered: true,
+			wantNil:        true,
+		},
+		{
+			name:           "intention prose, no question -> nil",
+			text:           "I'll edit foo.go to add a comment.",
+			askUserOffered: true,
+			wantNil:        true,
+		},
+		{
+			name:           "direct answer, no question -> nil",
+			text:           "The file foo.go already has a comment.",
+			askUserOffered: true,
+			wantNil:        true,
+		},
+		{
+			name:           "ask_user not offered -> nil even for a clear question",
+			text:           "What commit message would you like?",
+			askUserOffered: false,
+			wantNil:        true,
+		},
+		{
+			name:           "too long -> nil",
+			text:           strings.Repeat("a", 601) + "?",
+			askUserOffered: true,
+			wantNil:        true,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := detectAgentClarifyQuestion(c.text, c.askUserOffered)
+			if c.wantNil {
+				if got != nil {
+					t.Fatalf("detectAgentClarifyQuestion = %+v, want nil", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("detectAgentClarifyQuestion = nil, want a card")
+			}
+			if len(got.Questions) != 1 {
+				t.Fatalf("questions = %d, want 1", len(got.Questions))
+			}
+			gq := got.Questions[0]
+			if c.wantType != "" && gq.Type != c.wantType {
+				t.Errorf("type = %q, want %q", gq.Type, c.wantType)
+			}
+			if c.wantText != "" && !strings.Contains(gq.Text, c.wantText) {
+				t.Errorf("text = %q, want it to contain %q", gq.Text, c.wantText)
+			}
+			if c.wantOpts != nil {
+				if len(gq.Options) != len(c.wantOpts) {
+					t.Fatalf("options = %+v, want %+v", gq.Options, c.wantOpts)
+				}
+				for i, wo := range c.wantOpts {
+					if gq.Options[i] != wo {
+						t.Errorf("option[%d] = %+v, want %+v", i, gq.Options[i], wo)
+					}
+				}
+			}
+		})
+	}
+}

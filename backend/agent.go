@@ -1073,7 +1073,10 @@ func min(a, b int) int {
 // agentSystemNudge is the default system prompt for agent mode. It injects the
 // current date so a stale-cutoff model can reason about "today", and steers the
 // model toward a small number of tool calls before answering — the small-model
-// failure mode is looping on tools, not under-using them.
+// failure mode is looping on tools, not under-using them. It is forceful about
+// emitting structured tool calls (the reliable path) and reserves ask_user for
+// genuinely ambiguous user intent (not codebase facts, not a value the model
+// can pick itself).
 func agentSystemNudge() string {
 	now := time.Now().Format("Monday, 2 January 2006, 15:04 MST")
 	return "You are a capable agent running on a small local server. Today is " + now + ". " +
@@ -1082,17 +1085,18 @@ func agentSystemNudge() string {
 		"do it directly with the tools — do not just describe or quote the changes. Discover codebase " +
 		"facts yourself with tree, list_files, glob, grep, read_file, and git_status — never ask the user " +
 		"about the codebase (which files to touch, where something lives, how it works); look it up. " +
-		"Reserve ask_user for the user's own intent, preferences, or requirements that are genuinely " +
-		"ambiguous and that you cannot discover from the codebase or conversation; if the request is " +
-		"clear enough to act, act. If the task requires editing files or running commands, your FIRST response MUST be a " +
+		"If the task requires editing files or running commands, your FIRST response MUST be a " +
 		"structured tool call (read_file / edit_file / write_file / run_command), not an explanation of what you plan to do — never say \"I will\" " +
-		"or \"Let me\" without immediately emitting the tool call. After the work is done, synthesize a clear final " +
-		"answer for the user. Do not repeat the same tool call with the same arguments. If a tool returns an error, read " +
-		"it and adjust — do not retry blindly. Keep answers concise. End your final answer with a short " +
-		"follow-up question that proposes a logical next step and asks whether the user would like you to take it " +
-		"(for example, \"Shall I run the tests now?\" or \"Want me to update the docs to match?\"). This is ordinary " +
-		"prose in your answer — do not use the ask_user tool for it; reserve ask_user for genuinely ambiguous " +
-		"requests as described above.\n\n" +
+		"or \"Let me\" without immediately emitting the tool call. If you genuinely need information only " +
+		"the user can give — a choice or preference you cannot discover yourself, such as which of two " +
+		"approaches to take — call ask_user; do not write \"I'll do X, what Y?\" as prose, and never ask the " +
+		"user for tool output or to run a command for you. " +
+		"After the work is done, synthesize a clear final answer for the user. Do not repeat the same tool call " +
+		"with the same arguments. If a tool returns an error, read it and adjust — do not retry blindly. Keep " +
+		"answers concise. You may end your final answer with a short follow-up that suggests a logical next step " +
+		"and asks whether the user would like you to take it (for example, \"Shall I run the tests now?\"). This " +
+		"is a next-step suggestion after the work is done — it is ordinary prose in your answer, not an ask_user " +
+		"call, and it is never a way to collect a value the task itself needs (use ask_user for that).\n\n" +
 		"Example loop: to add a comment to main.go, first call read_file to see its contents, then " +
 		"call edit_file with the exact old_string and new_string, then answer concisely. Each step is " +
 		"a structured tool call — never describe the edit in prose."
@@ -1132,7 +1136,7 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 	emitThought func(string), emitClear func(), addUsage func(int, int),
 	repoID string, toolExecRelay func(ctx context.Context, step int, tool, args string) toolOutcome,
 	pauseRequested func() bool, setRoundCancel func(context.CancelFunc),
-	resumeStep int) error {
+	resumeStep int, clarifyBudget int) error {
 	emitPhase("agent")
 	reg := s.toolRegistry(email)
 	tools := make([]oaiTool, 0, len(allow))
@@ -1186,6 +1190,7 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 	proseRecoveries := 0
 	narrationHits := 0
 	structuredToolCalls := 0
+	clarifyRecoveries := 0 // prose clarifying questions bridged to a card this run
 	// step is a manual counter (not the for-loop counter) so a narration
 	// re-prompt round — which re-runs the model without making progress — does
 	// not consume a step of the budget. It increments only at the end of a real
@@ -1201,7 +1206,11 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 	// parser is bridging the model's prose calls into real executions, so the
 	// run is functional and the broken-template hint is suppressed.
 	emitFormatHint := func() {
-		if structuredToolCalls == 0 && proseRecoveries == 0 && narrationHits > 0 {
+		// Suppress when a prose clarifying question was bridged to a card: the
+		// model engaged (it asked the user), so the "never emitted a structured
+		// tool call / disable Agent mode" advice would be wrong. The genuine
+		// dead-end (narration only, no question, no recovery) still surfaces.
+		if structuredToolCalls == 0 && proseRecoveries == 0 && clarifyRecoveries == 0 && narrationHits > 0 {
 			emitTool(agentStep{Step: step + 1, Tool: "(format)", Preview: "This model never emitted a structured tool call — its chat template may be broken or it may be mislabeled as tool-capable. Consider a different model or disable Agent mode.", IsError: true})
 		}
 	}
@@ -1303,6 +1312,32 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 				// the preamble is moved to thinking and the recovered call runs
 				// exactly like a real one.
 			} else {
+				// Prose clarifying-question bridge: a model that can't emit
+				// structured tool_calls (a broken chat template, or a mislabeled
+				// model) often asks the user a question in prose ("Sure, I'll
+				// commit the changes. What commit message would you like?")
+				// instead of calling ask_user. The narration guard below would
+				// re-prompt that as a failed doing-tool ("emit a structured tool
+				// call NOW … git_commit") and dead-end on the (format) "disable
+				// Agent mode" diagnostic. When ask_user is offered and the turn
+				// reads as a question the model needs answered to proceed, surface
+				// it as an interactive clarify card (single-select if options
+				// extract, else free-text) and end the run — the user's answer
+				// re-enters /generate as a new turn. Bounded by clarifyBudget so
+				// the agent cannot stall on endless back-to-back prose questions.
+				if clarifyBudget > 0 {
+					if meta := detectAgentClarifyQuestion(roundText, added["ask_user"]); meta != nil {
+						clarifyRecoveries++
+						if roundText != "" {
+							emitThought(roundText)
+						}
+						emitClear()
+						emitQuestions(*meta)
+						emitPhase("clarifying")
+						roundCancel()
+						return nil
+					}
+				}
 				// Narration guard: a small local model often describes what it
 				// would do ("I'll edit foo.go to...") instead of emitting a
 				// structured tool_call. Without this guard the loop treats that
@@ -1609,7 +1644,10 @@ func extractProseToolCall(text string, offered map[string]bool) (oaiToolCall, bo
 		}
 		end := findJSONEnd(text, i)
 		if end < 0 {
-			break
+			// An unbalanced '{' (e.g. a stray brace in the model's preamble,
+			// "I'll use the { approach") must not stop the scan — a real tool
+			// call blob may follow it. Advance past this '{' and keep looking.
+			continue
 		}
 		name, args, ok := parseProseToolCallBlob(text[i:end+1], offered)
 		if ok {
@@ -1620,7 +1658,12 @@ func extractProseToolCall(text string, offered map[string]bool) (oaiToolCall, bo
 			tc.Function.Arguments = args
 			return tc, true
 		}
-		i = end
+		// Do NOT jump to end. A '{' in the preamble ("the {project} name") can
+		// balance against a '}' INSIDE the real tool-call blob, so text[i:end+1]
+		// is an invalid chunk spanning past the real blob. Skipping to end would
+		// leapfrog the blob entirely — the call is never recovered and its JSON
+		// is streamed to the user as prose. Advance one byte and rescan so the
+		// real blob's '{' is found on a later iteration.
 	}
 	return oaiToolCall{}, false
 }
@@ -1638,11 +1681,15 @@ func stripProseToolCallText(text string, offered map[string]bool) string {
 		}
 		end := findJSONEnd(text, i)
 		if end < 0 {
-			break
+			// An unbalanced '{' in the preamble must not stop the scan; a real
+			// tool-call blob may follow it. (Mirrors extractProseToolCall.)
+			continue
 		}
 		blob := text[i : end+1]
 		if _, _, ok := parseProseToolCallBlob(blob, offered); !ok {
-			i = end
+			// Do NOT jump to end — a spurious '{' can balance against a '}'
+			// inside the real blob (see extractProseToolCall). Advance one byte
+			// so the real blob is still found and stripped on a later iteration.
 			continue
 		}
 		// Found a tool-call blob — strip it, absorbing a fenced code-block
