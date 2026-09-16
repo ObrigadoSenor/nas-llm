@@ -314,7 +314,7 @@ async fn index_html(State(st): State<AppState>) -> Response {
             if !html.contains("/__sidecar/desktop.css") {
                 html = html.replacen(
                     "</head>",
-"<link rel=\"stylesheet\" href=\"/__sidecar/desktop.css?v=26\">\n</head>",
+"<link rel=\"stylesheet\" href=\"/__sidecar/desktop.css?v=27\">\n</head>",
                     1,
                 );
             }

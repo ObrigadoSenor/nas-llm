@@ -591,10 +591,11 @@ body.ds-drawer-resizing { user-select: none; cursor: col-resize; }
 .ds-drawer-tabs { display: flex; gap: 0; border-bottom: 1px solid var(--border); padding: 0 6px; overflow-x: auto; scrollbar-width: none; }
 .ds-drawer-tabs::-webkit-scrollbar { display: none; }
 .ds-drawer-tab {
-  background: transparent; border: 0; border-bottom: 2px solid transparent;
+  background: transparent; border: 0; border-radius: 0; border-bottom: 2px solid transparent;
   color: var(--muted); padding: 9px 12px 10px; font-size: 13px; cursor: pointer;
   margin-bottom: -1px; white-space: nowrap; transition: color .12s, border-color .12s;
 }
+.ds-drawer-tab:focus { outline: none; }
 .ds-drawer-tab:hover { color: var(--text); }
 .ds-drawer-tab.active { color: var(--text); border-bottom-color: var(--accent); }
 .ds-drawer-body { flex: 1; overflow-y: auto; }
