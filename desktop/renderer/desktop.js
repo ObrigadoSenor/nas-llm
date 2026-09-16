@@ -235,14 +235,24 @@ function activateModelsPanel() {
 function openSettings() { openDrawer("settings"); }
 function closeSettings() { closeDrawer(); }
 
-// settingsSection builds one grouped Settings section: a bordered card with a
-// header (title + optional subtitle) and a body div. Returns {sec, body} so
-// buildOverlay appends controls into body while the header labels the group.
-function settingsSection(title, subtitle) {
+// settingsSection builds one grouped section card (the canonical drawer
+// container): a bordered .ds-settings-section with a header (title + optional
+// subtitle, or title-wrap + action button for the row variant) and a padded
+// body. Returns {sec, body} so callers append controls into body. Used by every
+// drawer tab so My Work / Changes / GitHub / Settings share one look.
+function settingsSection(title, subtitle, action) {
   const sec = el("div", "ds-settings-section");
-  const head = el("div", "ds-settings-section-head");
-  head.appendChild(el("div", "ds-settings-section-title", title));
-  if (subtitle) head.appendChild(el("div", "ds-settings-section-sub", subtitle));
+  const head = el("div", "ds-settings-section-head" + (action ? " row" : ""));
+  if (action) {
+    const wrap = el("div", "ds-settings-section-title-wrap");
+    wrap.appendChild(el("div", "ds-settings-section-title", title));
+    if (subtitle) wrap.appendChild(el("div", "ds-settings-section-sub", subtitle));
+    head.appendChild(wrap);
+    head.appendChild(action);
+  } else {
+    head.appendChild(el("div", "ds-settings-section-title", title));
+    if (subtitle) head.appendChild(el("div", "ds-settings-section-sub", subtitle));
+  }
   sec.appendChild(head);
   const body = el("div", "ds-settings-section-body");
   sec.appendChild(body);
@@ -2521,20 +2531,17 @@ function buildReposOverlay() {
   const ghStatus = el("div", "ds-note"); ghStatus.id = "dsGhStatus";
   connect.body.appendChild(ghStatus);
   card.appendChild(connect.sec);
-  // GitHub repo list section (hidden until connected)
-  const list = el("div", "ds-settings-section hidden");
-  list.id = "dsGhList";
-  const lHead = el("div", "ds-settings-section-head row");
-  lHead.appendChild(el("div", "ds-settings-section-title", "Your GitHub repos"));
+  // GitHub repo list section (hidden until connected). Built with the shared
+  // settingsSection() helper so it matches every other drawer tab's sections.
   const discBtn = el("button", "ds-btn ds-btn-ghost ds-btn-sm", "Disconnect");
-  lHead.appendChild(discBtn);
-  list.appendChild(lHead);
-  const lBody = el("div", "ds-settings-section-body");
+  const list = settingsSection("Your GitHub repos", null, discBtn);
+  list.sec.id = "dsGhList";
+  list.sec.classList.add("hidden");
   const searchRow = el("div", "ds-row");
   const searchInput = document.createElement("input");
   searchInput.id = "dsGhSearch"; searchInput.type = "search"; searchInput.placeholder = "Filter repos…";
   searchRow.appendChild(searchInput);
-  lBody.appendChild(searchRow);
+  list.body.appendChild(searchRow);
   searchInput.addEventListener("input", () => {
     const q = searchInput.value.trim().toLowerCase();
     const body = $("dsGhBody"); if (!body) return;
@@ -2544,9 +2551,8 @@ function buildReposOverlay() {
     filtered.forEach(r => body.appendChild(ghRow(r)));
   });
   const ghBody = el("div", null); ghBody.id = "dsGhBody";
-  lBody.appendChild(ghBody);
-  list.appendChild(lBody);
-  card.appendChild(list);
+  list.body.appendChild(ghBody);
+  card.appendChild(list.sec);
   panel.appendChild(card);
   connectBtn.onclick = async () => {
     const token = tokInput.value.trim();
@@ -2580,11 +2586,11 @@ async function refreshWorkingChanges() {
   if (!local.ok || !Array.isArray(local.data)) { body.appendChild(el("div", "ds-note", "Could not load local clones.")); return; }
   if (!local.data.length) { body.appendChild(el("div", "ds-note", "No local clones yet.")); return; }
   for (const r of local.data) {
-    const section = el("div", "ds-changes-section");
-    const head = el("div", "ds-changes-head");
-    head.appendChild(el("div", "ds-changes-name", r.name + " (" + r.branch + ")"));
     const revertBtn = el("button", "ds-btn ds-btn-ghost ds-btn-sm", "Revert");
+    const section = settingsSection(r.name + " (" + r.branch + ")", null, revertBtn);
     revertBtn.onclick = async () => {
+      const ok = await dsConfirm("Revert all working changes?", "This discards all uncommitted edits in " + r.name + " (git checkout -- . && git clean -fd).");
+      if (!ok) return;
       revertBtn.disabled = true; revertBtn.textContent = "Reverting…";
       const res = await sid("repos/revert", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: r.name }) });
       revertBtn.disabled = false; revertBtn.textContent = "Revert";
@@ -2592,11 +2598,9 @@ async function refreshWorkingChanges() {
       if (!d.ok) flashDsErr(d.error || res.status);
       refreshWorkingChanges();
     };
-    head.appendChild(revertBtn);
-    section.appendChild(head);
     const diffWrap = el("div", "ds-approval-pre-wrap");
-    section.appendChild(diffWrap);
-    body.appendChild(section);
+    section.body.appendChild(diffWrap);
+    body.appendChild(section.sec);
     // Fetch the diff for this repo.
     const dr = await sid("repos/diff", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: r.name }) });
     const dd = (dr && dr.data) || {};
@@ -2620,7 +2624,6 @@ async function loadMyWork() {
   if (!body) {
     const panel = $("dsDrawerPanel_mywork"); if (!panel) return;
     const card = el("div", "ds-card ds-card-wide"); card.id = "dsMyWorkOverlay";
-    card.appendChild(el("div", "ds-note", "Every connected workspace: sessions in progress, working-tree state, and open pull requests. Click a workspace's session to open it."));
     body = el("div", null); body.id = "dsMyWorkBody";
     card.appendChild(body);
     panel.appendChild(card);
@@ -2645,16 +2648,12 @@ async function loadMyWork() {
   }
   for (const rp of repos) {
     const fullName = rp.fullName || rp.name || "(unnamed)";
-    const section = el("div", "ds-changes-section");
-    const head = el("div", "ds-changes-head");
-    head.appendChild(el("div", "ds-changes-name", fullName));
     const sessions = sessionsByRepoId.get(rp.id) || [];
-    const sessionsNote = el("span", "ds-note", sessions.length + " session" + (sessions.length === 1 ? "" : "s"));
-    head.appendChild(sessionsNote);
-    section.appendChild(head);
+    const sub = sessions.length + " session" + (sessions.length === 1 ? "" : "s");
+    const section = settingsSection(fullName, sub);
     const detail = el("div", "ds-note");
-    section.appendChild(detail);
-    body.appendChild(section);
+    section.body.appendChild(detail);
+    body.appendChild(section.sec);
     // Live git state + open PRs for this workspace (best-effort, parallel).
     const stateP = sid("repos/state?name=" + encodeURIComponent(fullName)).catch(() => null);
     const prsP = sid("repos/prs?name=" + encodeURIComponent(fullName)).catch(() => null);
@@ -2683,7 +2682,7 @@ async function loadMyWork() {
           prList.appendChild(a);
         });
         if (pd.prs.length > 5) prList.appendChild(document.createTextNode(" +" + (pd.prs.length - 5) + " more"));
-        section.appendChild(prList);
+        section.body.appendChild(prList);
       }
     });
     // List this workspace's sessions (click to open).
@@ -2697,7 +2696,7 @@ async function loadMyWork() {
         list.appendChild(cr);
       });
       if (sessions.length > 6) list.appendChild(el("div", "ds-note", "+" + (sessions.length - 6) + " more sessions"));
-      section.appendChild(list);
+      section.body.appendChild(list);
     }
   }
 }
@@ -2831,7 +2830,6 @@ function openChangesPanel() {
     const sessWrap = el("div"); sessWrap.id = "dsChangesSession";
     panel.appendChild(sessWrap);
     const allWrap = el("div"); allWrap.id = "dsChangesAll"; allWrap.style.display = "none";
-    allWrap.appendChild(el("div", "ds-note", "Uncommitted changes across all local clones. Revert discards all working-tree changes in a repo (git checkout -- . && git clean -fd)."));
     const allBody = el("div"); allBody.id = "dsChangesBody";
     allWrap.appendChild(allBody);
     panel.appendChild(allWrap);
@@ -2881,24 +2879,26 @@ function renderSessionView() {
 function buildSessionCard() {
   if ($("dsSessionOverlay")) return;
   const wrap = $("dsChangesSession"); if (!wrap) return;
-  const overlay = el("div", "ds-card ds-session-card"); overlay.id = "dsSessionOverlay";
-  const head = el("div", "ds-session-head");
-  const titleWrap = el("div", "ds-session-title-wrap");
-  const h2 = el("h2", "ds-session-title", "Session"); h2.id = "dsSessionTitle";
-  titleWrap.appendChild(h2);
-  const sub = el("div", "ds-session-sub"); sub.id = "dsSessionSub";
-  titleWrap.appendChild(sub);
-  head.appendChild(titleWrap);
-  const x = el("button", "ds-x"); x.textContent = "×"; x.title = "Close"; x.setAttribute("aria-label", "Close");
-  x.onclick = () => { stopAgentMerge(overlay); closeDrawer(); };
-  head.appendChild(x);
+  // The session panel is one .ds-settings-section card (matching every other
+  // drawer tab): head carries the chat title + branch/state sub, body holds the
+  // Changes/Pull request/Merge sub-tabs and their panels. The drawer's own X
+  // closes (and stops agent merge), so there's no separate close button here.
+  // Element IDs are unchanged so loadSessionPanel/session*/renderSessionView
+  // keep working; overlay._* refs are hung on the section element.
+  const overlay = el("div", "ds-settings-section"); overlay.id = "dsSessionOverlay";
+  const head = el("div", "ds-settings-section-head");
+  const h2 = el("div", "ds-settings-section-title", "Session"); h2.id = "dsSessionTitle";
+  head.appendChild(h2);
+  const sub = el("div", "ds-settings-section-sub"); sub.id = "dsSessionSub";
+  head.appendChild(sub);
   overlay.appendChild(head);
+  const sbody = el("div", "ds-settings-section-body");
   const tabs = el("div", "ds-tabs");
   const tabChanges = el("button", "ds-tab active", "Changes");
   const tabPR = el("button", "ds-tab", "Pull request");
   const tabMerge = el("button", "ds-tab", "Merge");
   tabs.appendChild(tabChanges); tabs.appendChild(tabPR); tabs.appendChild(tabMerge);
-  overlay.appendChild(tabs);
+  sbody.appendChild(tabs);
   const panels = el("div", "ds-tab-panels");
   // — Changes —
   const pChanges = el("div", "ds-tab-panel active");
@@ -2961,11 +2961,12 @@ function buildSessionCard() {
   panels.appendChild(pMerge);
   overlay._agentMerge = { check: agentMergeCheck, out: amOut, timer: null };
   wireAgentMergeToggle(overlay);
-  overlay.appendChild(panels);
+  sbody.appendChild(panels);
   const foot = el("div", "ds-session-foot");
   const shipBtn = el("button", "ds-btn-ghost ds-session-link", "Ship a release…");
   foot.appendChild(shipBtn);
-  overlay.appendChild(foot);
+  sbody.appendChild(foot);
+  overlay.appendChild(sbody);
   wrap.appendChild(overlay);
   const switchTab = (active, panel) => {
     [tabChanges, tabPR, tabMerge].forEach((t) => t.classList.remove("active"));

@@ -225,18 +225,6 @@
   padding: 1px 12px; color: #8b909a;
 }
 
-/* --- Working changes panel (Phase 5: review/undo) --- */
-/* Working-changes + My Work sections share the .ds-settings-section shell
-   (same border, radius, header bar) so every drawer tab's sections match. */
-.ds-changes-section {
-  margin-bottom: 14px; border: 1px solid #2a2e37; border-radius: 10px; overflow: hidden;
-}
-.ds-changes-head {
-  display: flex; align-items: center; gap: 10px;
-  padding: 10px 14px; background: #1a1d24; border-bottom: 1px solid #2a2e37;
-}
-.ds-changes-name { flex: 1; font-size: 13px; font-weight: 600; color: #e6e6e6; }
-
 /* --- Workspace: linked/cloned + remote badges, chat list (Phase 6) --- */
 .ds-badge-linked { background: #1a2436; color: #8ab4f8; }
 .ds-badge-cloned { background: #1a2330; color: #7fa6c8; }
@@ -445,20 +433,8 @@
 .ds-pr-open:hover { text-decoration: underline; }
 .ds-pr-url { color: #6b707a; font-size: 11px; word-break: break-all; }
 
-/* --- Chat session panel (tabbed, minimalistic) --- */
-.ds-session-card { width: 480px; max-width: 92vw; padding: 16px 18px; }
-.ds-session-head { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 12px; }
-.ds-session-title-wrap { flex: 1; min-width: 0; }
-.ds-session-title {
-  margin: 0; font-size: 15px; font-weight: 600; color: #e6e6e6;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.ds-session-sub {
-  font-size: 11px; color: #6b707a; margin-top: 2px;
-  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.ds-tabs { display: flex; gap: 0; border-bottom: 1px solid #2a2e37; margin-bottom: 14px; }
+/* --- Chat session panel sub-tabs (hosted inside a .ds-settings-section body) --- */
+.ds-tabs { display: flex; gap: 0; border-bottom: 1px solid #2a2e37; }
 .ds-tab {
   background: transparent; border: 0;
   color: #8b909a; padding: 7px 12px 8px; font-size: 13px; cursor: pointer;
@@ -483,7 +459,7 @@
   border-radius: 8px; padding: 8px 10px; font-size: 13px; font-family: inherit;
 }
 .ds-session-actions { display: flex; gap: 8px; justify-content: flex-end; }
-.ds-session-foot { margin-top: 14px; padding-top: 12px; border-top: 1px solid #1a1d24; display: flex; justify-content: flex-end; }
+.ds-session-foot { padding-top: 12px; border-top: 1px solid #1a1d24; display: flex; justify-content: flex-end; }
 .ds-session-link {
   background: transparent; border: 0; color: #6b707a; padding: 2px 4px;
   font-size: 12px; cursor: pointer; text-decoration: none;
@@ -605,7 +581,6 @@ body.ds-drawer-resizing { user-select: none; cursor: col-resize; }
 .ds-drawer-panel.active { display: block; }
 /* Flatten any hosted .ds-card so it fills its drawer panel (no centered-card sizing). */
 .ds-drawer-panel .ds-card { width: 100%; max-width: none; max-height: none; border: 0; border-radius: 0; padding: 0; box-shadow: none; }
-.ds-drawer-panel .ds-session-card { width: 100%; max-width: none; padding: 0; }
 .ds-drawer-panel .ds-head { margin-bottom: 12px; }
 /* Hosted #modelsModal (moved into the Models panel at boot): neutralize its
    fixed-overlay behavior so it renders inline within the drawer panel. */
@@ -644,10 +619,11 @@ body.ds-drawer-resizing { user-select: none; cursor: col-resize; }
   display: flex; flex-direction: column; gap: 2px;
   padding: 10px 14px; background: #1a1d24; border-bottom: 1px solid #2a2e37;
 }
-/* Row-variant head: title + inline action button (e.g. GitHub repos +
-   Disconnect), mirroring .ds-changes-head on the canonical section shell. */
+/* Row-variant head: title-wrap (title + optional subtitle, stacked) on the
+   left, inline action button on the right — mirrors .ds-changes-head's
+   name + action layout on the canonical section shell. */
 .ds-settings-section-head.row { flex-direction: row; align-items: center; justify-content: space-between; gap: 10px; }
-.ds-settings-section-head.row .ds-settings-section-title { flex: 1; min-width: 0; }
+.ds-settings-section-head.row .ds-settings-section-title-wrap { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .ds-settings-section-title { font-size: 13px; font-weight: 600; color: #e6e6e6; }
 .ds-settings-section-sub { font-size: 11px; color: #6b707a; line-height: 1.4; }
 .ds-settings-section-body { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; }
