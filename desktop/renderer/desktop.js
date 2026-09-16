@@ -136,6 +136,11 @@ let _dsDrawerTab = "changes";        // active top-level tab
 let _dsModelsTabActivating = false;  // guards modelBtn.click() re-entry when the Models tab opens
 let _dsChangesView = "session";      // "session" (this chat) | "all" (cross-workspace working changes)
 let _dsChangesRepo = "";             // repo for the session view (the active chat's repo)
+// GitHub repo list fetched by refreshGithub; shared with the filter input in
+// buildReposOverlay. Module-scoped (not function-local) so a later refreshGithub
+// assignment is visible to the filter handler — otherwise strict mode throws a
+// ReferenceError after a successful connect and no repo rows render.
+let ghReposCache = [];
 
 function buildDrawer() {
   if ($("dsDrawer")) return;
@@ -230,16 +235,54 @@ function activateModelsPanel() {
 function openSettings() { openDrawer("settings"); }
 function closeSettings() { closeDrawer(); }
 
+// settingsSection builds one grouped Settings section: a bordered card with a
+// header (title + optional subtitle) and a body div. Returns {sec, body} so
+// buildOverlay appends controls into body while the header labels the group.
+function settingsSection(title, subtitle) {
+  const sec = el("div", "ds-settings-section");
+  const head = el("div", "ds-settings-section-head");
+  head.appendChild(el("div", "ds-settings-section-title", title));
+  if (subtitle) head.appendChild(el("div", "ds-settings-section-sub", subtitle));
+  sec.appendChild(head);
+  const body = el("div", "ds-settings-section-body");
+  sec.appendChild(body);
+  return { sec, body };
+}
+
 function buildOverlay() {
   if ($("desktopSettings")) return;
-  // The settings card lives inside the drawer's Settings panel (built once).
+  // The settings card lives inside the drawer's Settings panel (built once),
+  // grouped into Account / Connection / Local models / SSH hosts / Updates
+  // sections so each concern has a clear header and body. Element IDs are
+  // unchanged from the old flat layout so the handlers below keep working.
   const panel = $("dsDrawerPanel_settings");
   if (!panel) return; // drawer not built yet (boot builds the drawer first)
   const card = el("div", "ds-card");
   card.id = "desktopSettings";
 
-  // Backend URL
-  card.appendChild(el("div", "ds-label", "NAS backend URL"));
+  // --- Account: authed shows email + Sign out; guest shows magic-link sign-in ---
+  const acct = settingsSection("Account");
+  const authedView = el("div", "ds-account-row hidden"); authedView.id = "dsAccountAuthed";
+  const emailEl = el("div", "ds-account-email"); emailEl.id = "dsAccountEmail";
+  const logoutBtn = el("button", "ds-btn ds-btn-ghost", "Sign out");
+  authedView.appendChild(emailEl); authedView.appendChild(logoutBtn);
+  acct.body.appendChild(authedView);
+  const guestView = el("div"); guestView.id = "dsAccountGuest";
+  guestView.appendChild(el("div", "ds-note", "Click “Send link” in the app to get a sign-in email, then paste the link from that email here to sign the desktop app in."));
+  const linkRow = el("div", "ds-row");
+  const linkInput = document.createElement("input");
+  linkInput.id = "dsVerifyUrl"; linkInput.type = "url";
+  linkInput.placeholder = "https://chat.selected.systems/api/auth/verify?token=…";
+  const signInBtn = el("button", "ds-btn", "Sign in");
+  linkRow.appendChild(linkInput); linkRow.appendChild(signInBtn);
+  guestView.appendChild(linkRow);
+  acct.body.appendChild(guestView);
+  const authOut = el("div", "ds-note"); authOut.id = "dsAuthOut";
+  acct.body.appendChild(authOut);
+  card.appendChild(acct.sec);
+
+  // --- Connection: NAS backend URL + Save/Test ---
+  const conn = settingsSection("Connection", "Where the desktop app reaches the NAS backend.");
   const urlRow = el("div", "ds-row");
   const urlInput = document.createElement("input");
   urlInput.id = "dsBackendUrl"; urlInput.type = "url";
@@ -247,34 +290,21 @@ function buildOverlay() {
   const saveBtn = el("button", "ds-btn", "Save");
   const testBtn = el("button", "ds-btn ds-btn-ghost", "Test");
   urlRow.appendChild(urlInput); urlRow.appendChild(saveBtn); urlRow.appendChild(testBtn);
-  card.appendChild(urlRow);
+  conn.body.appendChild(urlRow);
   const testOut = el("div", "ds-note"); testOut.id = "dsTestOut";
-  card.appendChild(testOut);
+  conn.body.appendChild(testOut);
+  card.appendChild(conn.sec);
 
-  // Auth / magic link
-  card.appendChild(el("div", "ds-label", "Sign in (magic link)"));
-  const note = el("div", "ds-note", "Click “Send link” in the app to get a sign-in email, then paste the link from that email here to sign the desktop app in.");
-  card.appendChild(note);
-  const linkRow = el("div", "ds-row");
-  const linkInput = document.createElement("input");
-  linkInput.id = "dsVerifyUrl"; linkInput.type = "url";
-  linkInput.placeholder = "https://chat.selected.systems/api/auth/verify?token=…";
-  const signInBtn = el("button", "ds-btn", "Sign in");
-  const logoutBtn = el("button", "ds-btn ds-btn-ghost", "Sign out");
-  linkRow.appendChild(linkInput); linkRow.appendChild(signInBtn); linkRow.appendChild(logoutBtn);
-  card.appendChild(linkRow);
-  const authOut = el("div", "ds-note"); authOut.id = "dsAuthOut";
-  card.appendChild(authOut);
-
-  // Ollama (local models) — status + Start/Stop, backed by /__sidecar/ollama/*.
-  card.appendChild(el("div", "ds-label", "Ollama (local models)"));
+  // --- Local models: Ollama status + Start/Stop (/__sidecar/ollama/*) ---
+  const ollama = settingsSection("Local models", "Ollama on this computer (localhost:11434).");
   const ollamaOut = el("div", "ds-note");
-  card.appendChild(ollamaOut);
+  ollama.body.appendChild(ollamaOut);
   const ollamaRow = el("div", "ds-row");
   const startOllama = el("button", "ds-btn", "Start Ollama");
   const stopOllama = el("button", "ds-btn ds-btn-ghost", "Stop Ollama");
   ollamaRow.appendChild(startOllama); ollamaRow.appendChild(stopOllama);
-  card.appendChild(ollamaRow);
+  ollama.body.appendChild(ollamaRow);
+  card.appendChild(ollama.sec);
   async function refreshOllama() {
     const r = await sid("ollama/status"); const d = (r && r.data) || {};
     if (d.running) {
@@ -307,8 +337,16 @@ function buildOverlay() {
   };
   refreshOllama();
 
-  addSSHHostsSection(card);
-  addUpdatesSection(card);
+  // --- SSH hosts + Updates: their own leading .ds-label is dropped (the section
+  // head carries the title); the rest appends into the section body. ---
+  const ssh = settingsSection("SSH hosts");
+  addSSHHostsSection(ssh.body);
+  card.appendChild(ssh.sec);
+
+  const upd = settingsSection("Updates", "Check for and install desktop app updates.");
+  addUpdatesSection(upd.body);
+  card.appendChild(upd.sec);
+
   panel.appendChild(card);
 
   saveBtn.onclick = async () => {
@@ -355,8 +393,18 @@ function fillOverlay() {
   if (!state) return;
   const u = $("dsBackendUrl");
   if (u && !u.value) u.value = state.backend_url || "";
+  // Account section: show the authed or guest view from the current state.
+  // The email lives in #dsAccountEmail; #dsAuthOut carries transient status
+  // (Signing in…/Failed:…) only, so clear it when authed.
+  const authed = $("dsAccountAuthed"), guest = $("dsAccountGuest");
+  if (authed && guest) {
+    authed.classList.toggle("hidden", !state.authed);
+    guest.classList.toggle("hidden", !!state.authed);
+  }
+  const emailEl = $("dsAccountEmail");
+  if (emailEl && state.authed) emailEl.textContent = state.email || "?";
   const a = $("dsAuthOut");
-  if (a) a.textContent = state.authed ? ("Signed in as " + (state.email || "?")) : "Not signed in.";
+  if (a) a.textContent = state.authed ? "" : "Not signed in.";
 }
 
 // --- SSH hosts section (allowlist for the agent's ssh_* tools) ---
@@ -365,7 +413,6 @@ function fillOverlay() {
 // are persisted backend-side (per user) via the /api/* reverse proxy, so they're
 // shared across devices. Add/remove updates the agent tool menu live on reload.
 function addSSHHostsSection(card) {
-  card.appendChild(el("div", "ds-label", "SSH hosts"));
   card.appendChild(el("div", "ds-note", "Allowlist of SSH aliases the agent may target. Each resolves via your ~/.ssh/config — no credentials are stored in the app."));
   const list = el("div");
   card.appendChild(list);
@@ -436,7 +483,6 @@ function addSSHHostsSection(card) {
 // Tauri commands in updater.rs over IPC; degrades gracefully when IPC isn't
 // available (e.g. served outside the installed app).
 function addUpdatesSection(card) {
-  card.appendChild(el("div", "ds-label", "Updates"));
   const versionOut = el("div", "ds-note");
   card.appendChild(versionOut);
   const row = el("div", "ds-row");
@@ -2485,7 +2531,6 @@ function buildReposOverlay() {
   searchInput.id = "dsGhSearch"; searchInput.type = "search"; searchInput.placeholder = "Filter repos…";
   searchRow.appendChild(searchInput);
   listWrap.appendChild(searchRow);
-  let ghReposCache = [];
   searchInput.addEventListener("input", () => {
     const q = searchInput.value.trim().toLowerCase();
     const body = $("dsGhBody"); if (!body) return;

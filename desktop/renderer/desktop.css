@@ -458,12 +458,12 @@
 }
 .ds-tabs { display: flex; gap: 0; border-bottom: 1px solid #2a2e37; margin-bottom: 14px; }
 .ds-tab {
-  background: transparent; border: 0; border-bottom: 2px solid transparent;
+  background: transparent; border: 0;
   color: #8b909a; padding: 7px 12px 8px; font-size: 13px; cursor: pointer;
-  margin-bottom: -1px; transition: color .12s, border-color .12s;
+  transition: color .12s, box-shadow .12s;
 }
 .ds-tab:hover { color: #c7ccd4; }
-.ds-tab.active { color: #e6e6e6; border-bottom-color: #4c8dff; }
+.ds-tab.active { color: #e6e6e6; box-shadow: inset 0 -2px 0 0 #4c8dff; }
 .ds-tab-panels { min-height: 120px; }
 .ds-tab-panel { display: none; }
 .ds-tab-panel.active { display: block; }
@@ -591,13 +591,13 @@ body.ds-drawer-resizing { user-select: none; cursor: col-resize; }
 .ds-drawer-tabs { display: flex; gap: 0; border-bottom: 1px solid var(--border); padding: 0 6px; overflow-x: auto; scrollbar-width: none; }
 .ds-drawer-tabs::-webkit-scrollbar { display: none; }
 .ds-drawer-tab {
-  background: transparent; border: 0; border-radius: 0; border-bottom: 2px solid transparent;
+  background: transparent; border: 0; border-radius: 0;
   color: var(--muted); padding: 9px 12px 10px; font-size: 13px; cursor: pointer;
-  margin-bottom: -1px; white-space: nowrap; transition: color .12s, border-color .12s;
+  white-space: nowrap; transition: color .12s, box-shadow .12s;
 }
 .ds-drawer-tab:focus { outline: none; }
 .ds-drawer-tab:hover { color: var(--text); }
-.ds-drawer-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+.ds-drawer-tab.active { color: var(--text); box-shadow: inset 0 -2px 0 0 var(--accent); }
 .ds-drawer-body { flex: 1; overflow-y: auto; }
 .ds-drawer-panel { display: none; padding: 16px 18px; }
 .ds-drawer-panel.active { display: block; }
@@ -628,3 +628,34 @@ body.ds-drawer-resizing { user-select: none; cursor: col-resize; }
   .ds-drawer-card { width: 100vw; max-width: 100vw; }
   .ds-drawer-resize { display: none; }
 }
+
+/* --- Settings tab: grouped sections --- */
+/* Each concern (Account / Connection / Local models / SSH hosts / Updates) is a
+   bordered card with a header (title + optional subtitle) and a body, replacing
+   the old flat label/row list. */
+.ds-settings-section {
+  border: 1px solid #2a2e37; border-radius: 10px; overflow: hidden;
+  margin-bottom: 14px;
+}
+.ds-settings-section:last-child { margin-bottom: 0; }
+.ds-settings-section-head {
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 10px 14px; background: #1a1d24; border-bottom: 1px solid #2a2e37;
+}
+.ds-settings-section-title { font-size: 13px; font-weight: 600; color: #e6e6e6; }
+.ds-settings-section-sub { font-size: 11px; color: #6b707a; line-height: 1.4; }
+.ds-settings-section-body { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; }
+/* The SSH/Updates sections drop their own .ds-label (the section head titles
+   them); neutralize the first inner .ds-note's top margin so it sits flush. */
+.ds-settings-section-body .ds-note:first-child { margin-top: 0; }
+
+/* Account section: authed row (email + Sign out) vs guest (magic-link sign-in). */
+.ds-account-row { display: flex; align-items: center; gap: 10px; }
+.ds-account-email {
+  flex: 1; min-width: 0; font-size: 13px; color: #e6e6e6; font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* Desktop owns account (email + Sign out) in the Settings tab; hide the
+   sidebar's #who row on desktop. The web UI keeps #who. */
+#who { display: none !important; }
