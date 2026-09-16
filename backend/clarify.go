@@ -390,3 +390,149 @@ func filterClarifyOptions(parts []string) []clarifyOption {
 	}
 	return out
 }
+
+// --- Agent-loop prose clarifying-question bridge ----------------------------
+//
+// A model that reports a tools capability but cannot emit structured
+// tool_calls (a broken chat template, or a mislabeled model) sometimes asks
+// the user a clarifying question as plain prose — "Sure, I'll commit the
+// changes. What commit message would you like me to use?" — instead of
+// calling ask_user. runAgentLoop's narration guard would re-prompt that as a
+// failed doing-tool ("emit a structured tool call NOW … git_commit"), the
+// wrong remedy, and then dead-end on the (format) "disable Agent mode"
+// diagnostic. detectAgentClarifyQuestion bridges such prose into the same
+// interactive clarify card ask_user produces, so a genuine question surfaces
+// to the user instead of stalling. It is agent-loop-only: plain chat keeps
+// using detectClarifyFromContent.
+
+// detectAgentClarifyQuestion returns a clarify card (single-select when ≥2
+// options extract, otherwise free-text) when text is primarily a question to
+// the user the model needs answered to proceed, and ask_user is offered this
+// run. Returns nil otherwise — in particular for a substantive answer that
+// merely ends in a follow-up question, for intention prose with no question,
+// and when ask_user is not in the allowlist. Conservative by design: the
+// free-text path requires the turn to read as a user-directed question or to
+// carry first-person intention phrasing (the "I'll do X, what Y?" shape), so a
+// plain answer stays a final answer.
+func detectAgentClarifyQuestion(text string, askUserOffered bool) *clarifyMeta {
+	if !askUserOffered {
+		return nil
+	}
+	content := strings.TrimSpace(text)
+	if content == "" || !strings.Contains(content, "?") {
+		return nil
+	}
+	if len([]rune(content)) > clarifyProseMaxChars {
+		return nil
+	}
+	qEnd := strings.Index(content, "?")
+	question := strings.TrimSpace(clarifyLabelRe.ReplaceAllString(content[:qEnd+1], ""))
+	if question == "" {
+		return nil
+	}
+	rest := strings.TrimSpace(content[qEnd+1:])
+	// Options following the question mark (parenthetical or list), as in plain chat.
+	if opts := detectClarifyOptions(rest); len(opts) >= 2 {
+		return &clarifyMeta{Questions: []clarifyQuestion{{Text: question, Type: "single", Options: opts}}}
+	}
+	// Inline options before the question mark ("Which branch: main or dev?").
+	if q, opts := splitInlineQuestion(question); len(opts) >= 2 {
+		return &clarifyMeta{Questions: []clarifyQuestion{{Text: q, Type: "single", Options: opts}}}
+	}
+	// Free-text card only when the turn is question-dominant: either it carries
+	// first-person intention phrasing (the "I'll do X, what Y?" shape) or it leads
+	// with a user-directed question word. A substantive answer that ends in a
+	// next-step follow-up ("Done. Want me to run the tests?") has neither and
+	// stays a final answer.
+	if looksLikeNarration(content) || looksLikeUserDirectedQuestion(content) {
+		return &clarifyMeta{Questions: []clarifyQuestion{{Text: question, Type: "free"}}}
+	}
+	return nil
+}
+
+// splitInlineQuestion splits a question string of the form "Prompt: A or B"
+// (or "Prompt — A, B" / "Prompt (A, B)") into the question text ("Prompt?")
+// and the inline option labels. Returns (q, nil) when no ≥2 clean options are
+// found, preserving the original question text.
+func splitInlineQuestion(question string) (string, []clarifyOption) {
+	s := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(question), "?"))
+	if s == "" {
+		return question, nil
+	}
+	if opts := detectParenOptions(s); len(opts) >= 2 {
+		if i := strings.Index(s, "("); i >= 0 {
+			return strings.TrimSpace(s[:i]) + "?", opts
+		}
+		return s + "?", opts
+	}
+	seps := []string{": ", " — ", " - "}
+	cut, slen := -1, 0
+	for _, sep := range seps {
+		if idx := strings.LastIndex(s, sep); idx >= 0 && idx > cut {
+			cut, slen = idx, len(sep)
+		}
+	}
+	if cut < 0 {
+		return question, nil
+	}
+	q := strings.TrimSpace(s[:cut])
+	tail := strings.TrimSpace(s[cut+slen:])
+	if q == "" || tail == "" {
+		return question, nil
+	}
+	opts := filterClarifyOptions(splitInlineOptions(tail))
+	if len(opts) < 2 {
+		return question, nil
+	}
+	return q + "?", opts
+}
+
+var (
+	clarifyLeadMarkerRe = regexp.MustCompile(`(?i)^\s*(?:\d+[.)]|[-*•])\s+`)
+	inlineOrSplitRe     = regexp.MustCompile(`(?i)\s+or\s+`)
+)
+
+// splitInlineOptions splits an inline option tail on " or ", commas, slashes,
+// and semicolons into raw label strings for filterClarifyOptions to clean.
+func splitInlineOptions(s string) []string {
+	s = inlineOrSplitRe.ReplaceAllString(s, ",")
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		for _, q := range strings.Split(p, "/") {
+			if q = strings.TrimSpace(q); q != "" {
+				out = append(out, q)
+			}
+		}
+	}
+	return out
+}
+
+// looksLikeUserDirectedQuestion reports whether text leads (after a leading
+// list marker) with a question word directed at the user's intent,
+// preference, or choice — "which", "should I", "would you like", etc. It is the
+// free-text gate for detectAgentClarifyQuestion: a turn that asks the user to
+// choose or supply a value becomes a free card, while a next-step follow-up
+// ("Want me to run the tests?") does not.
+func looksLikeUserDirectedQuestion(text string) bool {
+	t := strings.ToLower(strings.TrimSpace(text))
+	if t == "" {
+		return false
+	}
+	t = clarifyLeadMarkerRe.ReplaceAllString(t, "")
+	leads := []string{
+		"which ", "should i ", "should we ",
+		"would you ", "do you want", "do you prefer", "do you need",
+		"how would you", "how should i", "how do you want",
+		"what would you", "what's your", "what should i",
+		"what do you", "what name", "what value",
+		"what kind", "what type", "which should",
+		"would you prefer", "could you tell me what",
+		"can you tell me what",
+	}
+	for _, l := range leads {
+		if strings.HasPrefix(t, l) {
+			return true
+		}
+	}
+	return false
+}

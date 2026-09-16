@@ -307,7 +307,7 @@ func TestAgentNarrationGuard(t *testing.T) {
 		err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
 			func(string) {}, func(p string) { phases = append(phases, p) },
 			func(st agentStep) { steps = append(steps, st) }, func(clarifyMeta) {},
-			func(s string) { thoughts = append(thoughts, s) }, func() {}, func(int, int) {}, "", nil, nil, nil, 0)
+			func(s string) { thoughts = append(thoughts, s) }, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0)
 		if err != nil {
 			t.Fatalf("runAgentLoop: %v", err)
 		}
@@ -352,7 +352,7 @@ func TestAgentNarrationGuard(t *testing.T) {
 		var steps []agentStep
 		err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
 			func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
-			func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0)
+			func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0)
 		if err != nil {
 			t.Fatalf("runAgentLoop: %v", err)
 		}
@@ -384,7 +384,7 @@ func TestAgentNarrationGuard(t *testing.T) {
 		)
 		err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
 			func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
-			func(clarifyMeta) {}, func(s string) { thoughts = append(thoughts, s) }, func() {}, func(int, int) {}, "", nil, nil, nil, 0)
+			func(clarifyMeta) {}, func(s string) { thoughts = append(thoughts, s) }, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0)
 		if err != nil {
 			t.Fatalf("runAgentLoop: %v", err)
 		}
@@ -439,7 +439,7 @@ func TestAgentProseToolCallRecovery(t *testing.T) {
 		)
 		err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
 			func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
-			func(clarifyMeta) {}, func(s string) { thoughts = append(thoughts, s) }, func() {}, func(int, int) {}, "", nil, nil, nil, 0)
+			func(clarifyMeta) {}, func(s string) { thoughts = append(thoughts, s) }, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0)
 		if err != nil {
 			t.Fatalf("runAgentLoop: %v", err)
 		}
@@ -490,7 +490,7 @@ func TestAgentProseToolCallRecovery(t *testing.T) {
 		var steps []agentStep
 		err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
 			func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
-			func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0)
+			func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0)
 		if err != nil {
 			t.Fatalf("runAgentLoop: %v", err)
 		}
@@ -546,7 +546,7 @@ func TestAgentAwaitingToolResultFallback(t *testing.T) {
 			func(s string) { thoughts = append(thoughts, s) },
 			func() {},
 			func(int, int) {},
-			"", nil, nil, nil, 0)
+			"", nil, nil, nil, 0, 0)
 		if err != nil {
 			t.Fatalf("runAgentLoop: %v", err)
 		}
@@ -605,7 +605,7 @@ func TestAgentAwaitingToolResultFallback(t *testing.T) {
 			func(string) {}, func(string) {},
 			func(st agentStep) { steps = append(steps, st) },
 			func(c clarifyMeta) { questions = append(questions, c) },
-			func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0)
+			func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0)
 		if err != nil {
 			t.Fatalf("runAgentLoop: %v", err)
 		}
@@ -790,6 +790,53 @@ func TestStripProseToolCallText(t *testing.T) {
 	}
 }
 
+// TestExtractProseToolCallSpuriousBrace is the regression test for the
+// "agent can't run commands" bug: when a small model writes a tool call as a
+// JSON blob in prose but its preamble contains a stray '{' (e.g. "I'll set up
+// the {project}…"), the old scanner matched that '{' against a '}' INSIDE the
+// real blob, extracted an invalid chunk, and jumped past the real blob (i = end)
+// — so the call was never recovered and its raw JSON streamed to the user. An
+// unbalanced '{' was worse: findJSONEnd returned -1 and the scan broke entirely.
+// Now the scanner advances one byte on both failures so the real blob is found.
+func TestExtractProseToolCallSpuriousBrace(t *testing.T) {
+	offered := map[string]bool{"run_command": true}
+	blob := `{"name":"run_command","arguments":{"command":"npx create-next-app@latest . --typescript"}}`
+	cases := []struct {
+		name string
+		text string
+	}{
+		{
+			name: "balanced spurious brace in preamble",
+			text: "I'll set up the {project} and run the command.\n\n```json\n" + blob + "\n```",
+		},
+		{
+			name: "unbalanced spurious brace in preamble",
+			text: "I'll use the { approach.\n\n```json\n" + blob + "\n```",
+		},
+		{
+			name: "spurious brace with no matching brace until the blob",
+			text: "Here is the { command to run:\n" + blob,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tc, ok := extractProseToolCall(c.text, offered)
+			if !ok {
+				t.Fatalf("extractProseToolCall did not recover the run_command blob despite a spurious '{' in the preamble")
+			}
+			if tc.Function.Name != "run_command" {
+				t.Errorf("name = %q, want run_command", tc.Function.Name)
+			}
+			// stripProseToolCallText must also strip the blob from the same text
+			// (so the raw JSON never reaches the thinking drawer).
+			stripped := stripProseToolCallText(c.text, offered)
+			if strings.Contains(stripped, `"name":"run_command"`) {
+				t.Errorf("stripProseToolCallText left the tool-call JSON in the thinking text: %q", stripped)
+			}
+		})
+	}
+}
+
 // TestAgentBudgetWarning80Percent verifies the 80%-of-budget warning: with a
 // budget of 5, the loop appends a "Budget notice" system message before the
 // model call that crosses 80% (step 4), and not before. The notice tells the
@@ -819,7 +866,7 @@ func TestAgentBudgetWarning80Percent(t *testing.T) {
 	var steps []agentStep
 	err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
 		func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
-		func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0)
+		func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0)
 	if err != nil {
 		t.Fatalf("runAgentLoop: %v", err)
 	}
@@ -884,7 +931,7 @@ func TestAgentNarrationRetryDoesNotConsumeStep(t *testing.T) {
 	var steps []agentStep
 	err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
 		func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
-		func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0)
+		func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0)
 	if err != nil {
 		t.Fatalf("runAgentLoop: %v", err)
 	}
@@ -976,7 +1023,7 @@ func TestAgentPauseReturnsCheckpoint(t *testing.T) {
 	err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
 		func(string) {}, func(string) {}, func(st agentStep) {},
 		func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {},
-		"", nil, pauseRequested, nil, 0)
+		"", nil, pauseRequested, nil, 0, 0)
 	if !errors.Is(err, errAgentPaused) {
 		t.Fatalf("err = %v, want errAgentPaused", err)
 	}
@@ -1133,5 +1180,250 @@ func TestInjectRepoContext(t *testing.T) {
 	}
 	if strings.Contains(gotMain, "isolated per-branch git worktree") {
 		t.Errorf("branchless prompt wrongly claims a worktree: %q", gotMain)
+	}
+}
+
+// TestParseProseToolCallBlob covers the prose tool-call parser's key-alias
+// support: a small model that can't emit structured tool_calls deltas often
+// writes the call as a JSON blob in prose, and different chat templates spell
+// the keys differently. The parser must recognize name/arguments (OpenAI),
+// tool/input (Anthropic-style), function/parameters, and the nested OpenAI
+// tool_calls shape — and leave a non-tool JSON object alone so it is not
+// mistaken for a call.
+func TestParseProseToolCallBlob(t *testing.T) {
+	offered := map[string]bool{"run_command": true, "get_time": true}
+	cases := []struct {
+		name     string
+		blob     string
+		wantName string
+		wantArgs string
+		wantOk   bool
+	}{
+		{
+			name: "openai name/arguments object", blob: `{"name":"run_command","arguments":{"command":"ls"}}`,
+			wantName: "run_command", wantArgs: `{"command":"ls"}`, wantOk: true,
+		},
+		{
+			name: "anthropic tool/input", blob: `{"tool":"run_command","input":{"command":"ls"}}`,
+			wantName: "run_command", wantArgs: `{"command":"ls"}`, wantOk: true,
+		},
+		{
+			name: "function/parameters string alias", blob: `{"function":"run_command","parameters":{"command":"ls"}}`,
+			wantName: "run_command", wantArgs: `{"command":"ls"}`, wantOk: true,
+		},
+		{
+			name: "nested openai tool_calls shape with string arguments", blob: `{"id":"x","type":"function","function":{"name":"get_time","arguments":"{}"}}`,
+			wantName: "get_time", wantArgs: `{}`, wantOk: true,
+		},
+		{
+			name: "nested openai tool_calls shape with object arguments", blob: `{"type":"function","function":{"name":"run_command","arguments":{"command":"go test"}}}`,
+			wantName: "run_command", wantArgs: `{"command":"go test"}`, wantOk: true,
+		},
+		{
+			name: "missing arguments defaults to empty object", blob: `{"name":"get_time"}`,
+			wantName: "get_time", wantArgs: `{}`, wantOk: true,
+		},
+		{
+			name: "non-tool JSON left alone", blob: `{"key":"value"}`, wantOk: false,
+		},
+		{
+			name: "name not in offered set", blob: `{"name":"unknown_tool","arguments":{}}`, wantOk: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			gotName, gotArgs, gotOk := parseProseToolCallBlob(c.blob, offered)
+			if gotOk != c.wantOk {
+				t.Fatalf("ok = %v, want %v (name=%q args=%q)", gotOk, c.wantOk, gotName, gotArgs)
+			}
+			if !c.wantOk {
+				return
+			}
+			if gotName != c.wantName {
+				t.Errorf("name = %q, want %q", gotName, c.wantName)
+			}
+			if gotArgs != c.wantArgs {
+				t.Errorf("args = %q, want %q", gotArgs, c.wantArgs)
+			}
+		})
+	}
+}
+
+// TestAgentProseToolCallRecoveryAliasedKeys verifies the parser recovers a tool
+// call written with Anthropic-style tool/input keys (not just OpenAI
+// name/arguments), runs it, and — because prose-recovery succeeded — the run
+// does NOT emit the (format) "never emitted a structured tool call" diagnostic.
+// The parser bridging the model's prose call into a real execution means Agent
+// mode is functional, so the broken-template hint is suppressed.
+func TestAgentProseToolCallRecoveryAliasedKeys(t *testing.T) {
+	const email = "user@example.com"
+	msgs := []oaiMessage{{Role: "user", Content: jsonString("What time is it?")}}
+	st, err := newStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	defer st.close()
+	srv := &server{cfg: config{contextLength: 8192, maxAgentSteps: 6}, store: st}
+
+	narrated := "Let me check the time.\n```json\n{\"tool\": \"get_time\", \"input\": {}}\n```"
+	mb := &fakeBackend{responses: []oaiMessage{
+		narrationMsg(narrated),      // round 1: narrates the call as tool/input JSON prose
+		finalAnswerMsg("It's 3pm."), // round 2: synthesizes after the real observation
+	}}
+	var steps []agentStep
+	err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
+		func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
+		func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0)
+	if err != nil {
+		t.Fatalf("runAgentLoop: %v", err)
+	}
+	if got := mb.callCount(); got != 2 {
+		t.Fatalf("model calls = %d, want 2 (recovered call ran, then synthesized)", got)
+	}
+	var ranTool *agentStep
+	for i := range steps {
+		if steps[i].Tool == "get_time" {
+			ranTool = &steps[i]
+		}
+	}
+	if ranTool == nil {
+		t.Fatalf("no get_time step; the tool/input prose call should have been recovered. steps = %+v", steps)
+	}
+	if ranTool.IsError {
+		t.Errorf("recovered get_time step errored: %+v", ranTool)
+	}
+	for _, st := range steps {
+		if st.Tool == "(format)" {
+			t.Errorf("(format) diagnostic emitted despite successful prose recovery: %+v", st)
+		}
+	}
+}
+
+// TestAgentFormatHintFiresOnNarrationOnly verifies the (format) diagnostic still
+// surfaces the genuine dead-end: a model that only narrates intentions and never
+// produces a usable (structured or prose-recoverable) tool call. This is the
+// case the hint is meant for — a mislabeled tool-capable model or a broken chat
+// template — so it must not be suppressed by the prose-recovery carve-out.
+func TestAgentFormatHintFiresOnNarrationOnly(t *testing.T) {
+	const email = "user@example.com"
+	msgs := []oaiMessage{{Role: "user", Content: jsonString("Add a comment to foo.go")}}
+	st, err := newStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	defer st.close()
+	srv := &server{cfg: config{contextLength: 8192, maxAgentSteps: 6}, store: st}
+
+	mb := &fakeBackend{responses: []oaiMessage{
+		narrationMsg("I'll edit foo.go to add a comment."), // round 1: no JSON -> re-prompt
+		narrationMsg("I'll change bar.go too."),            // round 2: exhausted -> accept
+	}}
+	var steps []agentStep
+	err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
+		func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
+		func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0)
+	if err != nil {
+		t.Fatalf("runAgentLoop: %v", err)
+	}
+	var format *agentStep
+	for i := range steps {
+		if steps[i].Tool == "(format)" {
+			format = &steps[i]
+		}
+	}
+	if format == nil {
+		t.Errorf("no (format) diagnostic emitted; a narration-only run with no recovery should surface it. steps = %+v", steps)
+	}
+}
+
+// TestAgentProseClarifyBridge is the regression test for the reported bug: a
+// model that cannot emit structured tool_calls asks the user a clarifying
+// question in prose ("Sure, I'll commit the changes. What commit message would
+// you like me to use?") instead of calling ask_user. Previously the narration
+// guard re-prompted it as a failed doing-tool ("emit a structured tool call NOW
+// … git_commit") and the run dead-ended on the (format) "disable Agent mode"
+// diagnostic. Now the prose clarifying-question bridge surfaces it as an
+// interactive free-text card and ends the run, so a genuine question reaches
+// the user instead of stalling.
+func TestAgentProseClarifyBridge(t *testing.T) {
+	const email = "user@example.com"
+	msgs := []oaiMessage{{Role: "user", Content: jsonString("Commit the changes.")}}
+	st, err := newStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	defer st.close()
+	srv := &server{cfg: config{contextLength: 8192, maxAgentSteps: 6}, store: st}
+
+	narrated := "Sure, I'll commit the changes. What commit message would you like me to use?"
+	mb := &fakeBackend{responses: []oaiMessage{narrationMsg(narrated)}} // round 1: prose question
+	var (
+		steps     []agentStep
+		thoughts  []string
+		phases    []string
+		questions []clarifyMeta
+	)
+	err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"ask_user", "get_time"}, "",
+		func(string) {}, func(p string) { phases = append(phases, p) },
+		func(st agentStep) { steps = append(steps, st) }, func(c clarifyMeta) { questions = append(questions, c) },
+		func(s string) { thoughts = append(thoughts, s) }, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 3)
+	if err != nil {
+		t.Fatalf("runAgentLoop: %v", err)
+	}
+	// The bridge fires on round 1 and ends the run — one model call, no second round.
+	if got := mb.callCount(); got != 1 {
+		t.Fatalf("model calls = %d, want 1 (the bridge fires on round 1 and ends the run)", got)
+	}
+	if len(questions) != 1 || len(questions[0].Questions) != 1 {
+		t.Fatalf("questions = %+v, want one clarify card with one question", questions)
+	}
+	q := questions[0].Questions[0]
+	if q.Type != "free" {
+		t.Errorf("question type = %q, want %q for a no-option prose question", q.Type, "free")
+	}
+	if !strings.Contains(q.Text, "What commit message") {
+		t.Errorf("question text = %q, want the model's prose question", q.Text)
+	}
+	if len(phases) == 0 || phases[len(phases)-1] != "clarifying" {
+		t.Errorf("last phase = %v, want clarifying", phases)
+	}
+	// No trace steps at all — the bridge emits the card, not a (direct)/(format) marker.
+	if len(steps) != 0 {
+		t.Errorf("steps = %+v, want none (the bridge emits a card, not a trace step)", steps)
+	}
+	if len(thoughts) == 0 || !strings.Contains(thoughts[0], "commit the changes") {
+		t.Errorf("thoughts = %v, want the prose moved to thinking", thoughts)
+	}
+}
+
+// TestAgentProseClarifyBridge_BudgetExhausted verifies the budget gate: when the
+// back-to-back clarify budget is 0, the prose clarifying-question bridge is off
+// and a prose question is NOT turned into a card (it falls through to the
+// narration guard / final answer as before). This is the cap that stops the
+// agent stalling on endless questions across a conversation.
+func TestAgentProseClarifyBridge_BudgetExhausted(t *testing.T) {
+	const email = "user@example.com"
+	msgs := []oaiMessage{{Role: "user", Content: jsonString("Commit the changes.")}}
+	st, err := newStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	defer st.close()
+	srv := &server{cfg: config{contextLength: 8192, maxAgentSteps: 6}, store: st}
+
+	narrated := "Sure, I'll commit the changes. What commit message would you like me to use?"
+	mb := &fakeBackend{responses: []oaiMessage{
+		narrationMsg(narrated), // round 1: bridge gated off -> narration guard re-prompts
+		narrationMsg(narrated), // round 2: guard exhausted -> final answer
+	}}
+	var questions []clarifyMeta
+	err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"ask_user", "get_time"}, "",
+		func(string) {}, func(string) {}, func(agentStep) {}, func(c clarifyMeta) { questions = append(questions, c) },
+		func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0)
+	if err != nil {
+		t.Fatalf("runAgentLoop: %v", err)
+	}
+	if len(questions) != 0 {
+		t.Errorf("questions = %+v, want none (clarifyBudget=0 gates the bridge off)", questions)
 	}
 }
