@@ -27,10 +27,11 @@ const attachBtn=$("attachBtn"), fileInput=$("fileInput"), imgPills=$("imgPills")
 const pauseBtn=$("pauseBtn");
 
 // Static button icons (set once; the buttons live inside #app, which is hidden
-// until auth, so there's no flash of unstyled content). Text buttons (New chat,
-// Log out) stay text-only; the rest are icon-only controls.
-$("newChat").insertAdjacentHTML("beforeend", '<span>New chat</span>');
-setIcon($("newFolder"), "folder-plus", 18);
+// until auth, so there's no flash of unstyled content). New chat / New folder
+// are icon-only buttons in the chats header (mirroring the Workspaces +);
+// Log out stays text-only; the rest are icon-only controls.
+setIcon($("newChat"), "plus", 16);
+setIcon($("newFolder"), "folder-plus", 16);
 setIcon($("closeSide"), "close", 18);
 setIcon($("menuBtn"), "menu", 18);
 setIcon($("plusBtn"), "plus", 18);
@@ -2096,6 +2097,41 @@ window.addEventListener("resize",()=>{
   if(w>0) applyContentW(w);
 });
 initContentResize();
+
+// --- Composer height resize ------------------------------------------------
+// .composer sits at the bottom of main. A thin horizontal drag handle is
+// injected at its top edge; dragging it sets --composer-min-h (the textarea's
+// min-height) so the input area can be grown/shrunk. Persisted. Hidden on
+// mobile (CSS). Drag up = taller.
+const COMPOSER_MIN_H=36, COMPOSER_MAX_H=400, COMPOSER_KEY="nas-llm-composer-min-h";
+function applyComposerH(h){ document.documentElement.style.setProperty("--composer-min-h", Math.max(COMPOSER_MIN_H, Math.min(h, COMPOSER_MAX_H))+"px"); }
+function initComposerResize(){
+  const composer=document.querySelector(".composer"); if(!composer) return;
+  if(composer.querySelector(".composer-resize")) return;
+  const handle=document.createElement("div"); handle.className="composer-resize";
+  handle.setAttribute("role","separator"); handle.setAttribute("aria-orientation","horizontal"); handle.title="Drag to resize";
+  composer.appendChild(handle);
+  const saved=parseFloat(localStorage.getItem(COMPOSER_KEY)); if(saved>0) applyComposerH(saved);
+  handle.addEventListener("pointerdown",e=>{
+    e.preventDefault();
+    document.body.classList.add("composer-resizing");
+    const startY=e.clientY;
+    const startH=parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--composer-min-h"))||COMPOSER_MIN_H;
+    const move=ev=>applyComposerH(startH+(startY-ev.clientY));
+    const up=()=>{
+      document.removeEventListener("pointermove",move);
+      document.removeEventListener("pointerup",up);
+      document.removeEventListener("pointercancel",up);
+      document.body.classList.remove("composer-resizing");
+      const h=parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--composer-min-h"));
+      if(h>0) localStorage.setItem(COMPOSER_KEY,String(h));
+    };
+    document.addEventListener("pointermove",move);
+    document.addEventListener("pointerup",up);
+    document.addEventListener("pointercancel",up);
+  });
+}
+initComposerResize();
 
 function openModelsPanel(tab){ $("modelsModal").classList.add("open"); renderModelBanner(); switchTab(tab||"installed"); }
 function closeModelsPanel(){

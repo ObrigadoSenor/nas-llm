@@ -10,8 +10,8 @@
   --code-bg:#0d1117;
   /* 2 static heights: controls + conversation rows */
   --h:36px; --r:48px;
-  /* 4 text sizes */
-  --fs-l:15px; --fs-m:13px; --fs-s:11px; --fs-xs:10px;
+  /* 4 text sizes — kept small (12/14 range) */
+  --fs-l:14px; --fs-m:13px; --fs-s:12px; --fs-xs:11px;
   --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
   /* spacing scale — more air between parts of the page */
   --sp-1:4px; --sp-2:8px; --sp-3:12px; --sp-4:16px; --sp-5:24px; --sp-6:32px;
@@ -69,11 +69,22 @@ body.sidebar-resizing{user-select:none;cursor:col-resize}
 .content-resize{position:absolute;top:0;bottom:0;right:calc((100% - var(--content-max))/2 - 4px);width:8px;cursor:col-resize;background:transparent;touch-action:none;z-index:5}
 .content-resize:hover,.content-resize:active{background:var(--border)}
 body.content-resizing{user-select:none;cursor:col-resize}
-#sideHead{display:flex;align-items:center;gap:var(--sp-2)}
-#newChat{flex:1;display:inline-flex;align-items:center;justify-content:center;gap:var(--sp-2)}
-#newFolder,#closeSide,#menuBtn,#send{display:inline-flex;align-items:center;justify-content:center}
-#newFolder,#closeSide{width:var(--h);padding:0}
-#closeSide{display:none}
+/* Composer height resize handle: a thin horizontal bar at the top edge of the
+   composer. Height is driven by --composer-min-h (set by the drag handler in
+   app.js); falls back to the control height. Hidden on mobile. */
+.composer-resize{position:absolute;top:-4px;left:0;right:0;height:8px;cursor:row-resize;background:transparent;touch-action:none;z-index:5}
+.composer-resize:hover,.composer-resize:active{background:var(--border)}
+body.composer-resizing{user-select:none;cursor:row-resize}
+#sideHead{display:none;align-items:center;gap:var(--sp-2)}
+#closeSide,#menuBtn,#send{display:inline-flex;align-items:center;justify-content:center}
+#closeSide{width:var(--h);padding:0}
+/* Chats section header: a quiet label + icon-only New chat / New folder
+   buttons, mirroring the Workspaces section header. #sideHead is empty on
+   desktop (just the mobile close button) so it's hidden except on mobile. */
+#chatsHead{display:flex;align-items:center;gap:var(--sp-1);padding:var(--sp-2) var(--sp-2) var(--sp-1)}
+.chats-head-title{flex:1;font-size:var(--fs-s);color:var(--muted);text-transform:uppercase;letter-spacing:.04em;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.chats-head-btn{width:26px;height:26px;padding:0;display:inline-flex;align-items:center;justify-content:center;border-radius:6px;color:var(--muted)}
+.chats-head-btn:hover:not(:disabled){color:var(--text);background:var(--hover)}
 #convList{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:var(--sp-2);margin-top:var(--sp-1)}
 .folder{display:flex;flex-direction:column;gap:2px}
 .folder-head{display:flex;align-items:center;gap:var(--sp-1);height:var(--h);padding:0 var(--sp-2);border-radius:6px;user-select:none}
@@ -255,7 +266,7 @@ header h1{font-size:var(--fs-l);font-weight:600;margin:0}
 .clarify-send:hover:not(:disabled){background:var(--soft)}
 .clarify-send:disabled{opacity:.5}
 
-.composer{width:100%;max-width:var(--content-max);margin-inline:auto;padding:var(--sp-3) var(--edge-pad) var(--sp-4)}
+.composer{position:relative;width:100%;max-width:var(--content-max);margin-inline:auto;padding:var(--sp-3) var(--edge-pad) var(--sp-4)}
 /* --- Composer config row (active-mode label + model, above the input) ---
    Modes are folded into the + menu; only the active mode shows here as a quiet
    label. The model selector sits at the right of this row. */
@@ -271,7 +282,7 @@ header h1{font-size:var(--fs-l);font-weight:600;margin:0}
 .pill .pill-x{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;padding:0;color:var(--muted);border-radius:50%}
 .pill .pill-x:hover{color:var(--text);background:var(--hover)}
 .input-wrap{position:relative;flex:1;min-width:0;display:flex;align-items:flex-end}
-#input{flex:1;resize:none;min-height:var(--h);max-height:200px;padding:10px 44px;border-radius:10px;line-height:1.5;background:var(--bg)}
+#input{flex:1;resize:none;min-height:var(--composer-min-h,var(--h));max-height:200px;padding:10px 44px;border-radius:10px;line-height:1.5;background:var(--bg)}
 #input:focus{outline:none;border-color:var(--accent)}
 .plus-btn{position:absolute;left:6px;bottom:8px;width:30px;height:30px;padding:0;display:inline-flex;align-items:center;justify-content:center;border-radius:50%;color:var(--muted)}
 .plus-btn:hover{color:var(--text);background:var(--hover)}
@@ -355,7 +366,9 @@ header h1{font-size:var(--fs-l);font-weight:600;margin:0}
   #sidebar{position:fixed;left:0;top:0;bottom:0;z-index:30;transform:translateX(-100%);transition:transform .18s}
   .sidebar-resize{display:none}
   .content-resize{display:none}
+  .composer-resize{display:none}
   #sidebar.open{transform:none;box-shadow:2px 0 20px rgba(0,0,0,.5)}
+  #sideHead{display:flex}
   #menuBtn{display:inline-flex}
   #closeSide{display:inline-flex}
   #scrim{position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.4)}

@@ -54,11 +54,13 @@
 .ds-row input:focus { outline: none; border-color: #3a4150; }
 
 .ds-btn {
-  background: #2f6fed; color: #fff; border: 0; border-radius: 8px;
+  background: transparent; color: var(--accent); border: 0; border-radius: 8px;
   padding: 8px 12px; font-size: 13px; cursor: pointer; white-space: nowrap;
 }
+.ds-btn:hover:not(:disabled) { background: var(--hover); }
 .ds-btn:disabled { opacity: .5; cursor: default; }
-.ds-btn-ghost { background: transparent; color: #c7ccd4; border: 1px solid #2a2e37; }
+.ds-btn-ghost { color: var(--muted); }
+.ds-btn-ghost:hover:not(:disabled) { background: var(--hover); color: var(--text); }
 
 .ds-note { font-size: 12px; color: #8b909a; margin-top: 8px; min-height: 16px; }
 
@@ -167,10 +169,10 @@
 
 /* --- Approval dialog (Phase 4: write tools) --- */
 .ds-btn-approve {
-  background: #c0392b; color: #fff; border: 0; border-radius: 8px;
+  background: transparent; color: var(--bad); border: 0; border-radius: 8px;
   padding: 8px 14px; font-size: 13px; cursor: pointer; white-space: nowrap; font-weight: 600;
 }
-.ds-btn-approve:hover { background: #a93226; }
+.ds-btn-approve:hover:not(:disabled) { background: color-mix(in srgb,var(--bad) 14%,transparent); }
 .ds-approval-row { justify-content: flex-end; margin-top: 14px; }
 /* Which chat is asking — shown above the tool/repo/branch line so a second
    concurrent chat's approval isn't mistaken for the one you expected. */

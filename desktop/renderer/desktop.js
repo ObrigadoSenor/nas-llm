@@ -3280,19 +3280,11 @@ function buildSidebarRepos() {
   sidebar.insertBefore(wrap, sideHead.nextSibling);
 }
 
-// buildSidebarChatsHeader injects a small "Chats" label above #convList so the
-// sessions-vs-chats split is explicit: workspace-bound chats render as sessions
-// under their workspace above, non-workspace chats render as "Chats" here.
-// Idempotent and best-effort — #convList is owned by app.js, so this only adds
-// a sibling header, never touches #convList itself.
+// buildSidebarChatsHeader is now a no-op: www/index.html owns the "Chats"
+// header (#chatsHead) with the New chat / New folder buttons, so the bridge no
+// longer injects its own label. Kept as a stub because bootDesktop calls it.
 function buildSidebarChatsHeader() {
-  if ($("dsSidebarChatsHead")) return;
-  const convList = document.querySelector("#convList");
-  if (!convList || !convList.parentElement) return;
-  const head = el("div", "ds-sidebar-chats-head");
-  head.id = "dsSidebarChatsHead";
-  head.appendChild(el("div", "ds-sidebar-chats-title", "Chats"));
-  convList.parentElement.insertBefore(head, convList);
+  return;
 }
 
 // --- First-load "connect your repos" wizard --------------------------------
@@ -3347,18 +3339,19 @@ async function maybeShowRepoWizard() {
 // buttons carry their own inline SVGs. My Work shows an attention badge (active
 // sessions + open PRs across workspaces); GitHub shows a connected-state dot.
 const DS_ICONS = {
+  drawer: '<svg class="ds-ic" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></svg>',
   mywork: '<svg class="ds-ic" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6h11"/><path d="M9 12h11"/><path d="M9 18h11"/><path d="m3 6 1.5 1.5L7 5"/><path d="m3 12 1.5 1.5L7 11"/><path d="m3 18 1.5 1.5L7 17"/></svg>',
   changes: '<svg class="ds-ic" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="6" width="6" height="5" rx="1"/><rect x="15" y="13" width="6" height="5" rx="1"/><path d="M9 8.5h3a3 3 0 0 1 3 3V13"/></svg>',
   github:  '<svg class="ds-ic" width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2C6.48 2 2 6.58 2 12.26c0 4.5 2.87 8.32 6.84 9.67.5.1.68-.22.68-.48 0-.24-.01-.88-.01-1.73-2.78.62-3.37-1.37-3.37-1.37-.45-1.18-1.11-1.5-1.11-1.5-.91-.64.07-.62.07-.62 1 .07 1.53 1.06 1.53 1.06.89 1.56 2.34 1.11 2.91.85.09-.66.35-1.11.63-1.37-2.22-.26-4.55-1.14-4.55-5.07 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.71 0 0 .84-.28 2.75 1.05A9.4 9.4 0 0 1 12 6.84c.85 0 1.71.12 2.51.34 1.91-1.33 2.75-1.05 2.75-1.05.55 1.41.2 2.45.1 2.71.64.72 1.03 1.63 1.03 2.75 0 3.94-2.34 4.81-4.57 5.06.36.32.68.94.68 1.9 0 1.37-.01 2.48-.01 2.82 0 .27.18.59.69.48A10.02 10.02 0 0 0 22 12.26C22 6.58 17.52 2 12 2Z"/></svg>',
 };
 function dsIcon(name){ return DS_ICONS[name] || ''; }
 
-// refreshChangesBadge updates the header Changes button's dirty-count badge
-// from the active chat's rail state. Shows ●N dirty, or ↑N ahead when the tree
-// is clean but unpushed; hidden when clean and pushed. Best-effort: no rail
+// refreshChangesBadge updates the single header drawer button's dirty-count
+// badge from the active chat's rail state. Shows ●N dirty, or ↑N ahead when the
+// tree is clean but unpushed; hidden when clean and pushed. Best-effort: no rail
 // state (non-repo chat / login) hides the badge.
 function refreshChangesBadge(){
-  const btn = document.querySelector(".ds-changes-btn"); if(!btn) return;
+  const btn = document.querySelector(".ds-drawer-btn"); if(!btn) return;
   const badge = btn.querySelector(".ds-badge"); if(!badge) return;
   const s = railState || {};
   const dirty = s.dirty || 0, ahead = s.ahead || 0;
@@ -3418,55 +3411,40 @@ function makeGear() {
   return btn;
 }
 
-// The gear must be reachable BEFORE login too — to set the backend URL and to
-// open the paste-link sign-in. When #app is visible (authed), place the gear in
-// the header; when #app is hidden (login view), pin a fixed gear to the viewport
-// so it's always visible. Called on boot and whenever #app's class toggles.
+// makeDrawerBtn is the single top-right header icon. It opens the unified drawer
+// (My Work / Changes / Models / Settings / GitHub), carrying a small dirty-count
+// attention badge so uncommitted work still surfaces at a glance.
+function makeDrawerBtn() {
+  const btn = el("button", "ds-head-btn ds-drawer-btn");
+  btn.title = "Workspace — sessions, changes, models, settings"; btn.setAttribute("aria-label", "Workspace");
+  btn.innerHTML = dsIcon("drawer") + '<span class="ds-badge zero"></span>';
+  btn.onclick = (e) => { e.stopPropagation(); openDrawer(); };
+  return btn;
+}
+
+// One header icon that opens the drawer. It must be reachable BEFORE login too —
+// to set the backend URL and to open the paste-link sign-in. When #app is visible
+// (authed), place it in the header; when #app is hidden (login view), pin a fixed
+// copy to the viewport. Called on boot and whenever #app's class toggles.
 function addSettingsButton() {
   const app = $("app");
   const appVisible = !!app && !app.classList.contains("hidden");
   const header = document.querySelector("#app header");
-  // One right-aligned actions cluster in the header: [My Work] [GitHub] [⚙].
-  // Built once and reused across syncAuthedUI runs; the header's .gap flex-pushes
-  // it to the right. (The model selector used to be the insertion anchor here but
-  // has moved into the composer config row — see www/index.html.)
   let cluster = header ? header.querySelector(".ds-head-actions") : null;
   if (appVisible && header && !cluster) {
     cluster = el("div", "ds-head-actions");
     header.appendChild(cluster);
   }
-  // Gear (settings): header when authed, fixed when on the login view.
-  const headerGear = header ? header.querySelector(".ds-gear") : null;
-  if (appVisible && cluster && !headerGear) cluster.appendChild(makeGear());
-  else if (!appVisible && headerGear) headerGear.remove();
-  let fixed = document.querySelector("body > .ds-gear-fixed");
+  const headerBtn = header ? header.querySelector(".ds-drawer-btn") : null;
+  if (appVisible && cluster && !headerBtn) cluster.appendChild(makeDrawerBtn());
+  else if (!appVisible && headerBtn) headerBtn.remove();
+  let fixed = document.querySelector("body > .ds-drawer-btn.ds-gear-fixed");
   if (!appVisible && !fixed) {
-    fixed = makeGear();
+    fixed = makeDrawerBtn();
     fixed.classList.add("ds-gear-fixed");
     document.body.appendChild(fixed);
   } else if (appVisible && fixed) {
     fixed.remove();
-  }
-  // Changes + My Work + GitHub: header only (require auth + backend).
-  const headerChanges = header ? header.querySelector(".ds-changes-btn") : null;
-  const headerMyWork = header ? header.querySelector(".ds-mywork-btn") : null;
-  const headerRepos = header ? header.querySelector(".ds-repos-btn") : null;
-  if (appVisible && cluster && !headerChanges) cluster.appendChild(makeChangesBtn());
-  else if (!appVisible && headerChanges) headerChanges.remove();
-  if (appVisible && cluster && !headerMyWork) cluster.appendChild(makeMyWorkBtn());
-  else if (!appVisible && headerMyWork) headerMyWork.remove();
-  if (appVisible && cluster && !headerRepos) cluster.appendChild(makeReposBtn());
-  else if (!appVisible && headerRepos) headerRepos.remove();
-  // Enforce visual order: Changes, My Work, GitHub, Gear (appendChild moves existing nodes).
-  if (cluster) {
-    const ch = cluster.querySelector(".ds-changes-btn");
-    const my = cluster.querySelector(".ds-mywork-btn");
-    const gh = cluster.querySelector(".ds-repos-btn");
-    const gear = cluster.querySelector(".ds-gear");
-    if (ch) cluster.appendChild(ch);
-    if (my) cluster.appendChild(my);
-    if (gh) cluster.appendChild(gh);
-    if (gear) cluster.appendChild(gear);
   }
 }
 

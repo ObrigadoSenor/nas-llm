@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="dark">
 <title>nas-llm</title>
 <link rel="stylesheet" href="vendor/highlight-github-dark.min.css">
-<link rel="stylesheet" href="styles.css?v=51">
+<link rel="stylesheet" href="styles.css?v=52">
 <script defer src="vendor/highlight.min.js"></script>
 </head>
 <body>
@@ -26,9 +26,13 @@
 <div id="app" class="hidden">
   <aside id="sidebar">
     <div id="sideHead">
-      <button id="newChat"></button>
-      <button id="newFolder" title="New folder"></button>
       <button id="closeSide" title="Close"></button>
+    </div>
+    <div id="chatsHead">
+      <span class="chats-head-title">Chats</span>
+      <div class="gap"></div>
+      <button id="newChat" class="chats-head-btn" title="New chat" aria-label="New chat"></button>
+      <button id="newFolder" class="chats-head-btn" title="New folder" aria-label="New folder"></button>
     </div>
     <div id="convList"></div>
     <div class="gap"></div>
@@ -114,6 +118,6 @@
   </div>
 </div>
 
-<script type="module" src="app.js?v=56"></script>
+<script type="module" src="app.js?v=57"></script>
 </body>
 </html>
