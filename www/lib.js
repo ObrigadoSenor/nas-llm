@@ -139,16 +139,14 @@ function buildSearchRow(entry) {
   row.className = 'search-row';
   if (entry && entry.skipped) {
     row.classList.add('search-skipped');
-    const ic = document.createElement('span'); ic.className = 'status-ic'; ic.innerHTML = icon('globe', 14);
     const t = document.createElement('span');
     t.textContent = 'Web search on — ' + (entry.reason || 'model answered without searching');
-    row.appendChild(ic); row.appendChild(t);
+    row.appendChild(t);
     return row;
   }
   const head = document.createElement('div'); head.className = 'search-head';
-  const ic = document.createElement('span'); ic.className = 'status-ic'; ic.innerHTML = icon('globe', 14);
   const label = document.createElement('span'); label.textContent = 'Searched the web';
-  head.appendChild(ic); head.appendChild(label);
+  head.appendChild(label);
   if (entry && entry.query) {
     const q = document.createElement('span'); q.className = 'search-query'; q.textContent = entry.query;
     head.appendChild(q);
@@ -233,10 +231,9 @@ export function showSearchPending(container, query) {
   if (existing) existing.remove();
   const row = document.createElement('div');
   row.className = 'search-row search-pending search-head';
-  const ic = document.createElement('span'); ic.className = 'status-ic'; ic.innerHTML = icon('globe', 14);
   const label = document.createElement('span');
   label.textContent = query ? ('Searching: ' + query) : 'Searching the web…';
-  row.appendChild(ic); row.appendChild(label); row.appendChild(thinkingDots());
+  row.appendChild(label); row.appendChild(thinkingDots());
   container.appendChild(row);
 }
 
@@ -255,11 +252,6 @@ export function clearSearchPending(container) {
 // shows the query and numbered source links. An ask_user row shows its preview
 // text only — the interactive question card is rendered separately by the
 // questions event / persisted Clarify, so the row is just a trace entry.
-function stepIcon(tool) {
-  return { web_search: 'globe', ask_user: 'help', get_time: 'clock', calculator: 'gauge',
-    memory_read: 'boxes', memory_write: 'boxes', fetch_page: 'search',
-    ssh_run: 'terminal', ssh_read: 'terminal', ssh_list: 'terminal', ssh_grep: 'search' }[tool] || 'wrench';
-}
 function truncateArgs(s) {
   s = String(s || '').replace(/\s+/g, ' ').trim();
   if (s.length > 80) return s.slice(0, 80) + '…';
@@ -267,7 +259,7 @@ function truncateArgs(s) {
 }
 // --- Warp-style command blocks (run_command/apply_patch/git_commit/git_push/create_pr) ---
 // A command block replaces the flat step row for command-shaped tools: a
-// header (icon + label + command/target in mono + a status chip), a
+// header (label + command/target in mono + a status chip), a
 // scroll-locked output body, and a footer (copy/expand + inline approval).
 // Read-only tools (read_file/grep/glob/list_files/git_status) keep the
 // compact step row so a run doesn't become a wall of blocks. Live blocks are
@@ -309,9 +301,8 @@ export function buildToolBlock(st, { key='', live=false } = {}){
   block.appendChild(rail);
   const main = document.createElement('div'); main.className = 'tool-block-main';
   const head = document.createElement('div'); head.className = 'tool-block-head';
-  const ic = document.createElement('span'); ic.className = 'status-ic'; ic.innerHTML = icon(stepIcon(st && st.tool), 14);
   const label = document.createElement('span'); label.className = 'tool-block-label'; label.textContent = toolLabel(st && st.tool);
-  head.appendChild(ic); head.appendChild(label);
+  head.appendChild(label);
   const target = commandTarget(st && st.tool, st && st.args);
   if(target){
     const cmd = document.createElement('code'); cmd.className = 'tool-block-cmd'; cmd.textContent = truncateArgs(target); cmd.title = target;
@@ -490,9 +481,8 @@ function buildStepRow(st) {
   const row = document.createElement('div');
   row.className = 'step' + (st.isError ? ' err' : '');
   const head = document.createElement('div'); head.className = 'step-head';
-  const ic = document.createElement('span'); ic.className = 'status-ic'; ic.innerHTML = icon(stepIcon(st.tool), 13);
   const name = document.createElement('span'); name.className = 'step-tool'; name.textContent = st.tool || '';
-  head.appendChild(ic); head.appendChild(name);
+  head.appendChild(name);
   // Hide raw args when the step renders a readable query/question payload
   // (search sources / clarify card); otherwise show the one plain key arg.
   const hasNicePayload = !!(st.search || st.clarify);

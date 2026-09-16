@@ -1,6 +1,6 @@
 // nas-llm chat UI — app logic, split out of the old single-file index.html.
 // Imports UI helpers (icons, markdown rendering) from lib.js. No build step.
-import { icon, setIcon, renderMessage, escapeHtml, StreamRenderer, thinkingDots, renderSearchBlock, appendSearchEntry, showSearchPending, clearSearchPending, renderSourceLinks, appendSourceLinks, renderClarifyCard, renderAgentSteps, appendAgentStep, buildThoughtsWrap, renderThoughts, appendThought, setThoughtsSummary, isCommandTool, openBlock, appendBlock, closeBlock, isBlockStep, resetBlocks, installBlocksHook } from './lib.js?v=36';
+import { icon, setIcon, renderMessage, escapeHtml, StreamRenderer, thinkingDots, renderSearchBlock, appendSearchEntry, showSearchPending, clearSearchPending, renderSourceLinks, appendSourceLinks, renderClarifyCard, renderAgentSteps, appendAgentStep, buildThoughtsWrap, renderThoughts, appendThought, setThoughtsSummary, isCommandTool, openBlock, appendBlock, closeBlock, isBlockStep, resetBlocks, installBlocksHook } from './lib.js?v=37';
 
 installBlocksHook();
 // Streamed command output + exit, forwarded by the desktop renderer (the
@@ -27,16 +27,18 @@ const attachBtn=$("attachBtn"), fileInput=$("fileInput"), imgPills=$("imgPills")
 const pauseBtn=$("pauseBtn");
 
 // Static button icons (set once; the buttons live inside #app, which is hidden
-// until auth, so there's no flash of unstyled content).
-setIcon($("newChat"), "new-chat", 16); $("newChat").insertAdjacentHTML("beforeend", '<span>New chat</span>');
-setIcon($("newFolder"), "folder-plus", 18);
+// until auth, so there's no flash of unstyled content). New chat / New folder
+// are icon-only buttons in the chats header (mirroring the Workspaces +);
+// Log out stays text-only; the rest are icon-only controls.
+setIcon($("newChat"), "plus", 16);
+setIcon($("newFolder"), "folder-plus", 16);
 setIcon($("closeSide"), "close", 18);
 setIcon($("menuBtn"), "menu", 18);
 setIcon($("plusBtn"), "plus", 18);
 setIcon($("send"),"send",16); $("send").setAttribute("aria-label","Send");
 setIcon(attachBtn,"paperclip",16);
 setIcon(pauseBtn,"pause",16); pauseBtn.setAttribute("aria-label","Pause");
-setIcon($("logout"), "logout", 15); $("logout").insertAdjacentHTML("beforeend", '<span>Log out</span>');
+$("logout").insertAdjacentHTML("beforeend", '<span>Log out</span>');
 setIcon($("closeModels"), "close", 18);
 setIcon($("closeAgent"), "close", 18);
 
@@ -179,15 +181,15 @@ function enforceToolGating(){
 
 function renderPills(){
   pills.innerHTML="";
-  // Mode extras (web/clarify/agent) are shown in the segmented mode selector
-  // above the input, not as removable pills — skip them here so the two don't
-  // duplicate the same state. Future non-mode extras would still render as pills.
+  // Mode extras (web/clarify/agent) are selected via the + menu / mode label,
+  // not shown as removable pills — skip them here so the two don't duplicate
+  // state. Future non-mode extras would still render as pills.
   const MODE_IDS=["web","clarify","agent"];
   const visible=[...activeExtras].filter(id=>!MODE_IDS.includes(id));
   visible.forEach(id=>{
     const def=EXTRA_DEFS.find(d=>d.id===id); if(!def) return;
     const pill=document.createElement("span"); pill.className="pill";
-    pill.innerHTML=icon(def.icon,13)+'<span>'+escapeHtml(def.label)+'</span>';
+    pill.innerHTML='<span>'+escapeHtml(def.label)+'</span>';
     const x=document.createElement("button"); x.type="button"; x.className="pill-x"; x.setAttribute("aria-label","Remove "+def.label);
     x.innerHTML=icon("close",12);
     x.addEventListener("click",e=>{ e.stopPropagation(); activeExtras.delete(id); saveExtras(); renderExtras(); });
@@ -198,34 +200,39 @@ function renderPills(){
 function renderPlusPopup(){
   plusPopup.innerHTML="";
   const toolsOk=modelSupportsTools(selectedModel); // null=unknown, true, false
-  EXTRA_DEFS.forEach(def=>{
-    const on=activeExtras.has(def.id);
-    const blocked=!!def.needsTools && toolsOk!==true; // also block while unknown (null)
+  const active=activeModeId();
+  // Modes are a single-select group in the + menu: Ask = no extra;
+  // Web/Clarify/Agent = the mutually-exclusive tool extras; Plan = the
+  // conversation's planMode field. One source of truth (activeExtras +
+  // planMode), gated by tool support like the old segmented control.
+  for(const def of MODE_DEFS){
+    const on=def.id===active;
+    const blocked=!!def.needsTools && toolsOk!==true;
     const b=document.createElement("button"); b.type="button"; b.className="plus-item"+(on?" on":"")+(blocked?" disabled":"");
-    b.setAttribute("role","menuitemcheckbox"); b.setAttribute("aria-checked",String(on));
+    b.setAttribute("role","menuitemradio"); b.setAttribute("aria-checked",String(on));
     if(blocked) b.title = toolsOk===false
-      ? selectedModel+" has no tool support — use a tool-capable model (e.g. llama3.1:8b, qwen3:1.7b) for "+def.label+"."
+      ? selectedModel+" has no tool support — use a tool-capable model for "+def.label+"."
       : selectedModel+" — checking tool support…";
     b.disabled=blocked;
-    b.innerHTML=icon(def.icon,16)+'<span>'+escapeHtml(def.label)+'</span>'+(on?icon("check",14):'');
-    b.addEventListener("click",e=>{ e.stopPropagation(); if(blocked) return; if(activeExtras.has(def.id)){ activeExtras.delete(def.id); } else { activeExtras.add(def.id); (def.exclusive||[]).forEach(x=>activeExtras.delete(x)); } saveExtras(); renderExtras(); });
+    b.textContent=def.label;
+    b.addEventListener("click",e=>{ e.stopPropagation(); if(blocked) return; selectMode(def.id); setPlusPopup(false); });
     plusPopup.appendChild(b);
-  });
+  }
   const sep=document.createElement("div"); sep.className="plus-sep";
   const cfg=document.createElement("button"); cfg.type="button"; cfg.className="plus-item plus-cfg";
-  cfg.innerHTML=icon("wrench",16)+'<span>Agent settings…</span>';
+  cfg.textContent="Agent settings…";
   cfg.addEventListener("click",e=>{ e.stopPropagation(); setPlusPopup(false); openAgentPanel(); });
   plusPopup.appendChild(sep); plusPopup.appendChild(cfg);
 }
 function renderExtras(){ renderPills(); renderPlusPopup(); renderModeSeg(); }
 
-// --- Mode selector (segmented control above the input) ---------------------
-// A persistent, visible replacement for the mode toggles that used to live only
-// in the + popup. Ask = no extra; Web/Clarify/Agent = the mutually-exclusive
-// tool extras; Plan = the conversation's planMode field (agent loop researches
-// and plans, then waits for approval). Drives the same primitives as the +
-// menu / slash commands (activeExtras + a planMode PATCH), so there is one
-// source of truth for mode state. Gated by tool support like renderPlusPopup.
+// --- Mode label (quiet text above the input) --------------------------------
+// The segmented mode control was folded into the + menu; only the active mode
+// shows here as a muted label. Clicking it opens the + popup to switch modes.
+// Ask = no extra; Web/Clarify/Agent = the mutually-exclusive tool extras;
+// Plan = the conversation's planMode field. Drives the same primitives as the
+// + menu / slash commands (activeExtras + a planMode PATCH), one source of
+// truth for mode state.
 const MODE_DEFS=[
   { id:"ask", label:"Ask", needsTools:false },
   { id:"web", label:"Web", needsTools:true },
@@ -243,28 +250,11 @@ function activeModeId(){
 }
 function renderModeSeg(){
   const seg=$("modeSeg"); if(!seg) return;
-  const toolsOk=modelSupportsTools(selectedModel); // null=unknown, true, false
   const active=activeModeId();
-  seg.replaceChildren();
-  for(const def of MODE_DEFS){
-    const blocked=!!def.needsTools && toolsOk!==true;
-    const b=document.createElement("button");
-    b.type="button";
-    b.className="mode-seg-btn"+(def.id===active?" active":"")+(blocked?" disabled":"");
-    b.textContent=def.label;
-    b.setAttribute("role","tab");
-    b.setAttribute("aria-selected", String(def.id===active));
-    if(blocked){
-      b.disabled=true;
-      b.title = toolsOk===false
-        ? (selectedModel+" has no tool support — use a tool-capable model for "+def.label+".")
-        : (selectedModel+" — checking tool support…");
-    } else {
-      b.title=def.label+" mode";
-    }
-    b.addEventListener("click",e=>{ e.stopPropagation(); if(blocked) return; selectMode(def.id); });
-    seg.appendChild(b);
-  }
+  const def=MODE_DEFS.find(d=>d.id===active);
+  seg.textContent=def?def.label:"Ask";
+  seg.classList.toggle("on", active!=="ask");
+  seg.title=active==="ask"?"Chat mode — click to change":(def.label+" mode — click to change");
 }
 async function selectMode(id){
   if(id===activeModeId()) return;
@@ -299,7 +289,12 @@ async function selectMode(id){
 }
 function setPlusPopup(open){ plusPopup.classList.toggle("hidden", !open); plusBtn.classList.toggle("on", open); plusBtn.setAttribute("aria-expanded", String(open)); }
 plusBtn.addEventListener("click", e=>{ e.stopPropagation(); setPlusPopup(plusPopup.classList.contains("hidden")); });
-document.addEventListener("click", e=>{ if(plusPopup.classList.contains("hidden")) return; if(!plusPopup.contains(e.target) && !plusBtn.contains(e.target)) setPlusPopup(false); });
+const modeSegEl=$("modeSeg");
+if(modeSegEl){
+  modeSegEl.addEventListener("click", e=>{ e.stopPropagation(); setPlusPopup(plusPopup.classList.contains("hidden")); });
+  modeSegEl.addEventListener("keydown", e=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); e.stopPropagation(); setPlusPopup(plusPopup.classList.contains("hidden")); } });
+}
+document.addEventListener("click", e=>{ if(plusPopup.classList.contains("hidden")) return; if(!plusPopup.contains(e.target) && !plusBtn.contains(e.target) && !(modeSegEl&&modeSegEl.contains(e.target))) setPlusPopup(false); });
 document.addEventListener("keydown", e=>{ if(e.key==="Escape" && !plusPopup.classList.contains("hidden")) setPlusPopup(false); });
 renderExtras();
 
@@ -1715,21 +1710,20 @@ function addCopyMsg(roleRow, text){
   roleRow.appendChild(btn);
 }
 // --- Tool-usage indicator (finalized answers) -----------------------------
-// makeToolBadge builds the small meta-row icon button; toolBadgeFor picks the
-// icon from the persisted tool data. Agent steps → sparkles; pure web search
-// → globe, dimmed when the only entry is a skipped/no-op marker (the old "Web
-// search on — model answered without searching" text). Thinking is rendered
-// inline (collapsed accordion), so it no longer drives the badge. Plain
-// answers and clarify cards get no badge.
-function makeToolBadge(iconName, title){
+// makeToolBadge builds a small meta-row text label; toolBadgeFor picks the
+// label from the persisted tool data. Pure web search → "web", dimmed when
+// the only entry is a skipped/no-op marker. Thinking is rendered inline
+// (collapsed accordion), so it no longer drives the badge. Plain answers and
+// clarify cards get no badge.
+function makeToolBadge(label, title){
   const btn=document.createElement("button"); btn.type="button";
   btn.className="tool-badge"; btn.setAttribute("aria-label", title); btn.title=title;
-  btn.innerHTML=icon(iconName,14);
+  btn.textContent=label;
   return btn;
 }
 function toolBadgeFor({searches}){
   if(searches && searches.length){
-    const b=makeToolBadge("globe","Web search");
+    const b=makeToolBadge("web","Web search");
     if(searches.every(e=>e && e.skipped)) b.classList.add("dim");
     return b;
   }
@@ -2063,6 +2057,82 @@ window.addEventListener("resize",()=>{
 });
 initSidebarResize();
 
+// --- Chat/composer content-width resize ------------------------------------
+// #chat and .composer are centered with max-width:var(--content-max). This
+// injects a thin vertical drag handle at the right edge of that column (inside
+// main), drives the width via --content-max, and persists it. The column is
+// centered in main, so content-max = 2 * (pointer x - center of main). Hidden
+// on mobile (CSS) where the column goes full-width.
+const CONTENT_MIN=420, CONTENT_KEY="nas-llm-content-max";
+function contentMaxW(){ return Math.floor(window.innerWidth*0.9); }
+function applyContentW(w){ document.documentElement.style.setProperty("--content-max", Math.max(CONTENT_MIN, Math.min(w, contentMaxW()))+"px"); }
+function initContentResize(){
+  const mainEl=document.querySelector("main"); if(!mainEl) return;
+  if(mainEl.querySelector(".content-resize")) return;
+  const handle=document.createElement("div"); handle.className="content-resize";
+  handle.setAttribute("role","separator"); handle.setAttribute("aria-orientation","vertical"); handle.title="Drag to resize";
+  mainEl.appendChild(handle);
+  const saved=parseFloat(localStorage.getItem(CONTENT_KEY)); if(saved>0) applyContentW(saved);
+  handle.addEventListener("pointerdown",e=>{
+    e.preventDefault();
+    document.body.classList.add("content-resizing");
+    const center=mainEl.offsetLeft+mainEl.offsetWidth/2;
+    const move=ev=>applyContentW(2*(ev.clientX-center));
+    const up=()=>{
+      document.removeEventListener("pointermove",move);
+      document.removeEventListener("pointerup",up);
+      document.removeEventListener("pointercancel",up);
+      document.body.classList.remove("content-resizing");
+      const w=parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--content-max"));
+      if(w>0) localStorage.setItem(CONTENT_KEY,String(w));
+    };
+    document.addEventListener("pointermove",move);
+    document.addEventListener("pointerup",up);
+    document.addEventListener("pointercancel",up);
+    move(e);
+  });
+}
+window.addEventListener("resize",()=>{
+  const w=parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--content-max"));
+  if(w>0) applyContentW(w);
+});
+initContentResize();
+
+// --- Composer height resize ------------------------------------------------
+// .composer sits at the bottom of main. A thin horizontal drag handle is
+// injected at its top edge; dragging it sets --composer-min-h (the textarea's
+// min-height) so the input area can be grown/shrunk. Persisted. Hidden on
+// mobile (CSS). Drag up = taller.
+const COMPOSER_MIN_H=36, COMPOSER_MAX_H=400, COMPOSER_KEY="nas-llm-composer-min-h";
+function applyComposerH(h){ document.documentElement.style.setProperty("--composer-min-h", Math.max(COMPOSER_MIN_H, Math.min(h, COMPOSER_MAX_H))+"px"); }
+function initComposerResize(){
+  const composer=document.querySelector(".composer"); if(!composer) return;
+  if(composer.querySelector(".composer-resize")) return;
+  const handle=document.createElement("div"); handle.className="composer-resize";
+  handle.setAttribute("role","separator"); handle.setAttribute("aria-orientation","horizontal"); handle.title="Drag to resize";
+  composer.appendChild(handle);
+  const saved=parseFloat(localStorage.getItem(COMPOSER_KEY)); if(saved>0) applyComposerH(saved);
+  handle.addEventListener("pointerdown",e=>{
+    e.preventDefault();
+    document.body.classList.add("composer-resizing");
+    const startY=e.clientY;
+    const startH=parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--composer-min-h"))||COMPOSER_MIN_H;
+    const move=ev=>applyComposerH(startH+(startY-ev.clientY));
+    const up=()=>{
+      document.removeEventListener("pointermove",move);
+      document.removeEventListener("pointerup",up);
+      document.removeEventListener("pointercancel",up);
+      document.body.classList.remove("composer-resizing");
+      const h=parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--composer-min-h"));
+      if(h>0) localStorage.setItem(COMPOSER_KEY,String(h));
+    };
+    document.addEventListener("pointermove",move);
+    document.addEventListener("pointerup",up);
+    document.addEventListener("pointercancel",up);
+  });
+}
+initComposerResize();
+
 function openModelsPanel(tab){ $("modelsModal").classList.add("open"); renderModelBanner(); switchTab(tab||"installed"); }
 function closeModelsPanel(){
   $("modelsModal").classList.remove("open");
@@ -2101,7 +2171,7 @@ async function renderInstalledTab(){
   body.appendChild(renderLocalBlock());
   // Prominent bottom CTA so "get more models" is obvious without changing tabs.
   const cta=document.createElement("button"); cta.type="button"; cta.className="get-more-cta";
-  cta.innerHTML=icon("download",15)+'<span>Get more models</span>';
+  cta.textContent="Get more models";
   cta.addEventListener("click",()=>switchTab("browse"));
   body.appendChild(cta);
   await resumePullIfActive();
@@ -2115,7 +2185,7 @@ function renderLocalBlock(){
   const head=document.createElement("div"); head.className="local-head";
   const label=document.createElement("div"); label.className="local-label"; label.textContent="Local (this computer)";
   const connect=document.createElement("button"); connect.type="button"; connect.className="local-connect";
-  connect.innerHTML=icon("boxes",15)+'<span>Connect local models</span>';
+  connect.textContent="Connect local models";
   connect.addEventListener("click", onConnectLocal);
   head.appendChild(label); head.appendChild(connect); sec.appendChild(head);
   if(localDiscoverMsg){
