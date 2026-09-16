@@ -394,26 +394,25 @@
 }
 
 /* --- Composer status line (below the input, desktop-only) --- */
-/* Small muted text: repo + branch + git state for a repo-bound chat. Click opens
-   the repo session panel. */
+/* Quiet muted text: repo + branch + git state for a repo-bound chat. Click opens
+   the repo session panel. Uses the shared app tokens so it reads as one system. */
 .ds-composer-status {
   margin: 6px 4px 0;
   font-size: 11px;
-  color: #6b707a;
-  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  color: var(--muted);
+  font-family: var(--mono);
   cursor: pointer; user-select: none;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.ds-composer-status:hover { color: #9aa0aa; }
+.ds-composer-status:hover { color: var(--text); }
 .ds-composer-status.hidden { display: none; }
-/* Branch segment of the composer status line: its own click target (opens
-   openChatBranchPicker) distinct from the rest of the line (session panel). */
-.ds-branch-chip { color: #8ab4f8; cursor: pointer; }
-.ds-branch-chip:hover { text-decoration: underline; }
-/* Auto-approve toggle chip on the composer status line (per-chat override). */
-.ds-aa-chip { cursor: pointer; padding: 0 2px; border-radius: 4px; user-select: none; }
-.ds-aa-chip.on { color: #60c890; }
-.ds-aa-chip.off { color: #8b909a; }
+/* Branch segment: its own click target (openChatBranchPicker). */
+.ds-branch-chip { color: var(--muted); cursor: pointer; }
+.ds-branch-chip:hover { color: var(--text); text-decoration: underline; }
+/* Auto-approve / auto-sync: quiet text toggles — accent when on, dim when off. */
+.ds-aa-chip { cursor: pointer; padding: 0 2px; user-select: none; }
+.ds-aa-chip.on { color: var(--accent); }
+.ds-aa-chip.off { color: var(--muted-dim); }
 .ds-aa-chip:hover { text-decoration: underline; }
 
 /* --- Sidebar chat rows: title + branch under it --- */
@@ -524,34 +523,34 @@
 .ds-sidebar-chats-title { flex: 1; }
 
 /* --- Tasks Pill (in-session todo list) --- */
-.ds-tasks-pill { margin: 4px 4px 0; font-size: 12px; color: #8b909a; }
+.ds-tasks-pill { margin: 4px 4px 0; font-size: 12px; color: var(--muted); }
 .ds-tasks-pill.hidden { display: none; }
 .ds-tasks-pill-head {
   display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none;
   padding: 2px 0;
 }
-.ds-tasks-pill-chev { color: #6b707a; }
+.ds-tasks-pill-chev { color: var(--muted-dim); }
 .ds-tasks-pill.expanded .ds-tasks-pill-chev { transform: rotate(90deg); }
-.ds-tasks-pill-title { font-weight: 600; color: #c7ccd4; }
+.ds-tasks-pill-title { font-weight: 600; color: var(--muted); }
 .ds-tasks-pill-body { display: none; margin-top: 4px; }
 .ds-tasks-pill.expanded .ds-tasks-pill-body { display: block; }
 .ds-task-item { display: flex; align-items: flex-start; gap: 8px; padding: 3px 0; }
+/* Minimal marks: just a colored char, no circle background/border. */
 .ds-task-mark {
-  flex: none; width: 16px; height: 16px; border-radius: 50%;
-  font-size: 10px; line-height: 16px; text-align: center;
-  background: #1a1d24; color: #8b909a; border: 1px solid #2a2e37;
+  flex: none; width: 14px; font-size: 11px; line-height: 1.4; text-align: center;
+  color: var(--muted-dim);
 }
-.ds-task-mark.done { background: #15281a; color: #60c890; border-color: #2d5a3a; }
-.ds-task-mark.active { background: #1a2436; color: #8ab4f8; border-color: #2d3f5a; }
+.ds-task-mark.done { color: var(--ok); }
+.ds-task-mark.active { color: var(--accent); }
 .ds-task-text { flex: 1; min-width: 0; word-break: break-word; }
 
 /* --- Plan Pill (plan mode) --- */
 .ds-plan-chip {
-  cursor: pointer; padding: 0 4px; border-radius: 4px; user-select: none;
-  color: #c39bd3; background: #2a2330;
+  cursor: pointer; padding: 0 2px; user-select: none;
+  color: var(--muted);
 }
-.ds-plan-chip.approved { color: #60c890; background: #15281a; }
-.ds-plan-chip:hover { text-decoration: underline; }
+.ds-plan-chip.approved { color: var(--ok); }
+.ds-plan-chip:hover { color: var(--text); text-decoration: underline; }
 .ds-plan-body {
   max-height: 50vh; overflow: auto; white-space: pre-wrap; word-break: break-word;
   background: #0e1014; border: 1px solid #2a2e37; border-radius: 8px;
@@ -559,3 +558,70 @@
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
 .ds-pr-open { color: #8ab4f8; text-decoration: none; font-weight: 600; }
+
+/* --- Unified right-side drawer (My Work / Changes / Models / Settings / GitHub) ---
+   One right-slide-in drawer with a top-level tab strip. Each tab lazily mounts an
+   existing panel's card into a panel div, preserving element IDs/handlers so the
+   panel's own logic keeps working. Reuses the .ds-tab active underline look. */
+.ds-drawer {
+  position: fixed; inset: 0; z-index: 10000;
+  background: rgba(0,0,0,0); visibility: hidden; pointer-events: none;
+  transition: background-color .2s ease, visibility 0s linear .22s;
+}
+.ds-drawer.open { background: rgba(0,0,0,.45); visibility: visible; pointer-events: auto; transition: background-color .2s ease, visibility 0s; }
+.ds-drawer-card {
+  position: fixed; top: 0; right: 0; bottom: 0;
+  width: var(--ds-drawer-w, 480px); max-width: 92vw; height: 100%;
+  background: var(--panel); color: var(--text); border-left: 1px solid var(--border);
+  display: flex; flex-direction: column; overflow: hidden;
+  transform: translateX(100%); transition: transform .22s cubic-bezier(.2,.8,.2,1);
+  box-shadow: -10px 0 32px rgba(0,0,0,.45);
+}
+.ds-drawer.open .ds-drawer-card { transform: none; }
+/* Left-edge resize handle: the drawer slides in from the right, so the left
+   edge is the resize edge. Width is driven by --ds-drawer-w (set by the drag
+   handler in desktop.js); falls back to 480px. Hidden on mobile. */
+.ds-drawer-resize { position: absolute; left: 0; top: 0; bottom: 0; width: 8px; cursor: col-resize; background: transparent; touch-action: none; z-index: 1; }
+.ds-drawer-resize:hover, .ds-drawer-resize:active { background: var(--border); }
+body.ds-drawer-resizing { user-select: none; cursor: col-resize; }
+.ds-drawer-head { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+.ds-drawer-head h2 { margin: 0; font-size: 15px; font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ds-drawer-tabs { display: flex; gap: 0; border-bottom: 1px solid var(--border); padding: 0 6px; overflow-x: auto; scrollbar-width: none; }
+.ds-drawer-tabs::-webkit-scrollbar { display: none; }
+.ds-drawer-tab {
+  background: transparent; border: 0; border-bottom: 2px solid transparent;
+  color: var(--muted); padding: 9px 12px 10px; font-size: 13px; cursor: pointer;
+  margin-bottom: -1px; white-space: nowrap; transition: color .12s, border-color .12s;
+}
+.ds-drawer-tab:hover { color: var(--text); }
+.ds-drawer-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+.ds-drawer-body { flex: 1; overflow-y: auto; }
+.ds-drawer-panel { display: none; padding: 16px 18px; }
+.ds-drawer-panel.active { display: block; }
+/* Flatten any hosted .ds-card so it fills its drawer panel (no centered-card sizing). */
+.ds-drawer-panel .ds-card { width: 100%; max-width: none; max-height: none; border: 0; border-radius: 0; padding: 0; box-shadow: none; }
+.ds-drawer-panel .ds-session-card { width: 100%; max-width: none; padding: 0; }
+.ds-drawer-panel .ds-head { margin-bottom: 12px; }
+/* Hosted #modelsModal (moved into the Models panel at boot): neutralize its
+   fixed-overlay behavior so it renders inline within the drawer panel. */
+.ds-drawer-panel > #modelsModal { position: static !important; inset: auto; visibility: visible; background: transparent; pointer-events: auto; display: block; }
+.ds-drawer-panel > #modelsModal .modal-card { position: static !important; transform: none !important; width: 100%; max-width: none; height: auto; border: 0; border-radius: 0; box-shadow: none; }
+.ds-drawer-panel > #modelsModal .modal-body { max-height: none; padding: 14px 0 0; }
+.ds-drawer-panel > #modelsModal .modal-head { display: none; }
+/* The Models tab's own close affordance is the drawer X; hide the inner #closeModels
+   to avoid a confusing second close that only toggles the hosted modal. */
+.ds-drawer-panel > #modelsModal #closeModels { display: none; }
+
+/* Changes tab view toggle (This chat / All workspaces). Scoped to .ds-changes-seg
+   so it never collides with the www Models browse .seg-btn, which lives elsewhere. */
+.ds-changes-seg { display: flex; gap: 4px; border: 1px solid #2a2e37; border-radius: 8px; padding: 3px; margin-bottom: 14px; }
+.ds-changes-seg .ds-seg-btn { flex: 1; background: transparent; border: none; border-radius: 6px; height: 30px; padding: 0 12px; color: #8b909a; font-size: 13px; cursor: pointer; }
+.ds-changes-seg .ds-seg-btn:hover:not(.active) { background: #1b1f27; color: #e6e6e6; }
+.ds-changes-seg .ds-seg-btn.active { background: #1a2436; color: #8ab4f8; }
+
+/* Persistent header changes button (dirty-file count badge). */
+.ds-changes-btn .ds-badge { background: #3b221f; color: #e87060; }
+@media (max-width: 680px) {
+  .ds-drawer-card { width: 100vw; max-width: 100vw; }
+  .ds-drawer-resize { display: none; }
+}

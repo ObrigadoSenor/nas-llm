@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="dark">
 <title>nas-llm</title>
 <link rel="stylesheet" href="vendor/highlight-github-dark.min.css">
-<link rel="stylesheet" href="styles.css?v=50">
+<link rel="stylesheet" href="styles.css?v=51">
 <script defer src="vendor/highlight.min.js"></script>
 </head>
 <body>
@@ -48,7 +48,7 @@
     <div id="chat"></div>
     <div class="composer">
       <div class="composer-cfg">
-        <div class="seg mode-seg" id="modeSeg" role="tablist" aria-label="Chat mode"></div>
+        <span id="modeSeg" class="mode-label" role="button" tabindex="0" aria-label="Chat mode"></span>
         <div class="gap"></div>
         <div class="model-select">
           <button id="modelBtn" class="model-btn" type="button" aria-haspopup="dialog" aria-expanded="false" title="Model"></button>
@@ -114,6 +114,6 @@
   </div>
 </div>
 
-<script type="module" src="app.js?v=55"></script>
+<script type="module" src="app.js?v=56"></script>
 </body>
 </html>
