@@ -542,28 +542,28 @@
 }
 .ds-pr-open { color: #8ab4f8; text-decoration: none; font-weight: 600; }
 
-/* --- Unified right-side drawer (My Work / Changes / Models / Settings / GitHub) ---
-   One right-slide-in drawer with a top-level tab strip. Each tab lazily mounts an
-   existing panel's card into a panel div, preserving element IDs/handlers so the
-   panel's own logic keeps working. Reuses the .ds-tab active underline look. */
+/* --- Unified right-side panel (My Work / Changes / Models / Settings / GitHub) ---
+   A docked, non-modal panel pinned to the right edge. Unlike the old slide-in
+   drawer it has no backdrop/overlay: it stays open while you interact with the
+   chat, closes only via its × (closeDrawer), and opens via the header drawer
+   button. openDrawer adds .ds-drawer-open to #app, whose padding-right reserves
+   layout space so the panel pushes chat content left (symmetric with the left
+   sidebar). --ds-drawer-w is set on :root by the resize handler. */
 .ds-drawer {
-  position: fixed; inset: 0; z-index: 10000;
-  background: rgba(0,0,0,0); visibility: hidden; pointer-events: none;
-  transition: background-color .2s ease, visibility 0s linear .22s;
-}
-.ds-drawer.open { background: rgba(0,0,0,.45); visibility: visible; pointer-events: auto; transition: background-color .2s ease, visibility 0s; }
-.ds-drawer-card {
-  position: fixed; top: 0; right: 0; bottom: 0;
-  width: var(--ds-drawer-w, 480px); max-width: 92vw; height: 100%;
+  position: fixed; top: 0; right: 0; bottom: 0; z-index: 9500;
+  width: var(--ds-drawer-w, 480px); max-width: 92vw;
+  display: none; flex-direction: column;
   background: var(--panel); color: var(--text); border-left: 1px solid var(--border);
-  display: flex; flex-direction: column; overflow: hidden;
-  transform: translateX(100%); transition: transform .22s cubic-bezier(.2,.8,.2,1);
-  box-shadow: -10px 0 32px rgba(0,0,0,.45);
+  overflow: hidden;
 }
-.ds-drawer.open .ds-drawer-card { transform: none; }
-/* Left-edge resize handle: the drawer slides in from the right, so the left
-   edge is the resize edge. Width is driven by --ds-drawer-w (set by the drag
-   handler in desktop.js); falls back to 480px. Hidden on mobile. */
+.ds-drawer.open { display: flex; }
+.ds-drawer-card {
+  flex: 1; display: flex; flex-direction: column; overflow: hidden;
+  position: relative; height: 100%;
+}
+/* Left-edge resize handle: the panel is docked to the right edge, so the left
+   edge is the resize edge. Width is driven by --ds-drawer-w (set on :root by
+   the drag handler in desktop.js); falls back to 480px. Hidden on mobile. */
 .ds-drawer-resize { position: absolute; left: 0; top: 0; bottom: 0; width: 8px; cursor: col-resize; background: transparent; touch-action: none; z-index: 1; }
 .ds-drawer-resize:hover, .ds-drawer-resize:active { background: var(--border); }
 body.ds-drawer-resizing { user-select: none; cursor: col-resize; }
@@ -644,7 +644,8 @@ body.ds-drawer-resizing { user-select: none; cursor: col-resize; }
 /* Persistent header changes button (dirty-file count badge). */
 .ds-changes-btn .ds-badge { background: #3b221f; color: #e87060; }
 @media (max-width: 680px) {
-  .ds-drawer-card { width: 100vw; max-width: 100vw; }
+  .ds-drawer { width: 100% !important; max-width: 100% !important; }
+  body.ds-drawer-open #app { padding-right: 0; }
   .ds-drawer-resize { display: none; }
 }
 
@@ -699,3 +700,30 @@ body.ds-drawer-resizing { user-select: none; cursor: col-resize; }
 /* Desktop owns account (email + Sign out) in the Settings tab; hide the
    sidebar's #who row on desktop. The web UI keeps #who. */
 #who { display: none !important; }
+
+/* --- Docked right panel: reserve layout space in #app ---------------------- */
+/* When the unified panel is open, pad #app's right edge so the panel pushes
+   chat content left instead of floating over it. The toggle class lives on
+   <body> (not #app) so it doesn't trip #app's MutationObserver. --ds-drawer-w
+   is set on :root by the resize handler; both the panel width and this padding
+   read it. No padding on mobile (the panel goes full-width). */
+body.ds-drawer-open #app { padding-right: var(--ds-drawer-w, 480px); }
+
+/* --- Left-sidebar collapse (desktop) --------------------------------------- */
+/* The left sidebar is a www-owned flex item (#sidebar + .sidebar-resize).
+   Toggling body.ds-sidebar-collapsed hides both so main expands to full width.
+   The class is on <body> (not #app) for the same observer-isolation reason as
+   the right panel. Scoped to >=681px so the mobile slide-over is unaffected. */
+@media (min-width: 681px) {
+  body.ds-sidebar-collapsed #sidebar { display: none !important; }
+  body.ds-sidebar-collapsed .sidebar-resize { display: none !important; }
+}
+/* Show the sidebar's own close affordance on desktop (symmetric with the right
+   panel's ×). app.js's closeSide handler is a mobile slide-over no-op on
+   desktop, so the bridge wires it to collapse the sidebar. */
+#sideHead { display: flex; }
+/* Header sidebar-toggle button (in .ds-head-actions): reuses .ds-head-btn.
+   Hidden on mobile, which uses #menuBtn to slide the sidebar over. */
+@media (max-width: 680px) {
+  .ds-sidebar-btn { display: none; }
+}

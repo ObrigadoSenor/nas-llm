@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::sync::mpsc;
 
@@ -37,8 +38,21 @@ const GH_API: &str = "https://api.github.com";
 const USER_AGENT: &str = "nas-llm-desktop";
 
 // --- keychain token storage ------------------------------------------------
+// The token lives in the macOS Keychain (never on disk in plaintext). A
+// keychain read is a blocking `security` subprocess call that can surface an
+// access prompt, so the resolved token is cached in memory for the process
+// lifetime: the first token_get() reads the keychain once (one prompt per
+// launch) and caches the result; every later call returns from memory without
+// touching the keychain. token_set/token_delete keep the cache in sync.
+// Without this cache, github/status + repos/prs (refreshMyWorkBadge fans out
+// up to 8) + create_pr/merge_pr each re-read the keychain — a burst of those
+// could block every sidecar worker on the prompt and freeze the WebView.
+static TOKEN_CACHE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+fn token_cache() -> &'static Mutex<Option<String>> {
+    TOKEN_CACHE.get_or_init(|| Mutex::new(None))
+}
 
-fn token_get() -> Option<String> {
+fn read_keychain() -> Option<String> {
     keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
         .ok()?
         .get_password()
@@ -46,17 +60,47 @@ fn token_get() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn token_get() -> Option<String> {
+    let cache = token_cache();
+    // Fast path: brief lock, return the cached token.
+    if let Ok(g) = cache.lock() {
+        if let Some(t) = g.as_ref() {
+            return Some(t.clone());
+        }
+    }
+    // Cold path: read the keychain (may block on a prompt), then cache. The
+    // lock is NOT held across the blocking read so other tokio workers can
+    // keep serving requests; a concurrent cold caller may also read once, but
+    // that only happens before the cache is warm (first call per launch).
+    let t = read_keychain();
+    if let Ok(mut g) = cache.lock() {
+        if g.is_none() {
+            *g = t.clone();
+        } else if let Some(existing) = g.as_ref() {
+            return Some(existing.clone());
+        }
+    }
+    t
+}
+
 fn token_set(token: &str) -> Result<(), String> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
         .map_err(|e| format!("keychain open: {e}"))?;
     entry
         .set_password(token)
-        .map_err(|e| format!("keychain set: {e}"))
+        .map_err(|e| format!("keychain set: {e}"))?;
+    if let Ok(mut g) = token_cache().lock() {
+        *g = Some(token.to_string());
+    }
+    Ok(())
 }
 
 fn token_delete() {
     if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
         let _ = entry.delete_credential();
+    }
+    if let Ok(mut g) = token_cache().lock() {
+        *g = None;
     }
 }
 
