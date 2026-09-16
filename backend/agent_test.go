@@ -406,6 +406,46 @@ func TestAgentNarrationGuard(t *testing.T) {
 	})
 }
 
+// TestAgentNarrationNudgeListsOfferedTools verifies the narration/awaiting
+// re-prompt nudge names the tools actually offered this run (built dynamically
+// from the allowlist), so a model that narrates an intent — e.g. "I will create
+// a new pull request for the latest changes" — is steered to the matching tool
+// (create_pr) instead of a fixed example list that omits it. This is the fix for
+// the reported dead-end: a tool-capable model narrated "I will create a new
+// pull request" and the loop emitted the (format) "disable Agent mode"
+// diagnostic, because the old nudge only mentioned apply_patch/run_command/
+// git_commit/git_push and never create_pr. The nudge must also NOT name a tool
+// the model does not have (e.g. create_pr in a non-repo chat where local tools
+// are filtered out), so it never steers the model toward an unusable tool.
+func TestAgentNarrationNudgeListsOfferedTools(t *testing.T) {
+	// create_pr offered → both nudge variants name it (the "create a PR" case).
+	narration := awaitingToolNudge(false, map[string]bool{"create_pr": true, "get_time": true})
+	if !strings.Contains(narration, "create_pr to open a pull request") {
+		t.Errorf("narration nudge missing offered create_pr: %q", narration)
+	}
+	if !strings.Contains(narration, "get_time to get the time") {
+		t.Errorf("narration nudge missing offered get_time: %q", narration)
+	}
+	awaiting := awaitingToolNudge(true, map[string]bool{"create_pr": true, "run_command": true})
+	if !strings.Contains(awaiting, "create_pr to open a pull request") {
+		t.Errorf("awaiting nudge missing offered create_pr: %q", awaiting)
+	}
+	// create_pr NOT offered → the nudge must not name it, so it never steers the
+	// model toward a tool it cannot call (the cause of confusing "unknown tool"
+	// observations in a non-repo chat).
+	without := awaitingToolNudge(false, map[string]bool{"get_time": true})
+	if strings.Contains(without, "create_pr") {
+		t.Errorf("narration nudge named unoffered create_pr: %q", without)
+	}
+	// No offered tools (defensive — the loop returns early when no tool is
+	// offered) → a non-empty fallback, not a list that leaves the nudge
+	// grammatically broken after the colon.
+	empty := awaitingToolNudge(false, map[string]bool{})
+	if strings.TrimSpace(empty) == "" || !strings.Contains(empty, "available tools") {
+		t.Errorf("narration nudge with no offered tools should fall back, got: %q", empty)
+	}
+}
+
 // TestAgentProseToolCallRecovery verifies the prose-recovery path: when a small
 // model writes a tool call as a JSON block in prose (the real-world failure
 // mode behind "the agent explains but never does anything"), the loop parses
