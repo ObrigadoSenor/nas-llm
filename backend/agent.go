@@ -1362,7 +1362,7 @@ func (s *server) runAgentLoop(ctx context.Context, mb modelBackend, model, email
 						emitThought(roundText)
 					}
 					emitClear()
-					messages = append(messages, msg, oaiMessage{Role: "system", Content: jsonString(awaitingToolNudge(awaiting))})
+					messages = append(messages, msg, oaiMessage{Role: "system", Content: jsonString(awaitingToolNudge(awaiting, added))})
 					roundCancel()
 					continue
 				}
@@ -1828,13 +1828,72 @@ func looksLikeAwaitingToolResult(text string) bool {
 // dead-end prose gets wrong — no tool has run yet, so there is no output to
 // provide, and a tool runs only via a structured tool call whose result is
 // returned automatically — and directs the model to emit one now. The
-// narration variant (awaiting == false) keeps the original intention-prose
-// nudge so TestAgentNarrationGuard's behavior is unchanged.
-func awaitingToolNudge(awaiting bool) string {
+// narration variant (awaiting == false) tells a model that described an action
+// to emit the matching tool call instead. Both list the tools actually offered
+// this run (built by agentToolHint from the allowlist), so a model that narrates
+// an intent — e.g. "I will create a new pull request" — is steered to the
+// matching tool (create_pr) rather than a fixed example list that omits it.
+// ask_user is called out in the suffix, so it is not duplicated in the list.
+func awaitingToolNudge(awaiting bool, offered map[string]bool) string {
+	tools := agentToolHint(offered)
 	if awaiting {
-		return "No tool has run yet, so there is no tool output to provide. The user will not paste a tool result or run a command for you — a tool executes only when YOU emit a structured tool call, and its output is returned to you automatically as the observation. Emit a structured tool call now to actually make progress: apply_patch to edit files, run_command to run a command, git_commit/git_push to commit/push, or read_file/grep/glob/list_files/git_status to inspect the codebase. If you genuinely cannot proceed without information only the user can give, call ask_user. Do not ask the user for tool output."
+		return "No tool has run yet, so there is no tool output to provide. The user will not paste a tool result or run a command for you — a tool executes only when YOU emit a structured tool call, and its output is returned to you automatically as the observation. Emit a structured tool call now to actually make progress: " + tools + ". If you genuinely cannot proceed without information only the user can give, call ask_user. Do not ask the user for tool output."
 	}
-	return "You described what you would do but did not call a tool. Do not explain, describe, or narrate a plan — emit a structured tool call NOW to actually do it: apply_patch to edit files, run_command to run a command, git_commit/git_push to commit/push. If you genuinely cannot proceed without information from the user, call ask_user. Do not write another plan."
+	return "You described what you would do but did not call a tool. Do not explain, describe, or narrate a plan — emit a structured tool call NOW to actually do it: " + tools + ". If you genuinely cannot proceed without information from the user, call ask_user. Do not write another plan."
+}
+
+// agentToolHint renders the tool-list portion of the narration/awaiting nudge
+// from the tools actually offered this run (the `added` map), grouped by intent
+// so a narrating small model can map "I will <do X>" to the matching tool. Only
+// categories with at least one offered tool are included, so the nudge never
+// names a tool the model does not have (e.g. create_pr in a non-repo chat, where
+// local tools are filtered out before the loop). ask_user is handled in the
+// nudge's suffix, not here. Order is stable for readability.
+func agentToolHint(offered map[string]bool) string {
+	cats := []struct {
+		hint  string
+		names []string
+	}{
+		{"to inspect the codebase", []string{"read_file", "grep", "glob", "list_files", "tree", "git_status", "git_log"}},
+		{"to edit a file", []string{"edit_file", "write_file"}},
+		{"to apply a multi-file diff", []string{"apply_patch"}},
+		{"to delete or move a path", []string{"delete_path", "move_path"}},
+		{"to run a command", []string{"run_command"}},
+		{"to commit", []string{"git_commit"}},
+		{"to push", []string{"git_push"}},
+		{"to open a pull request", []string{"create_pr"}},
+		{"to merge a pull request", []string{"merge_pr"}},
+		{"to inspect pull requests", []string{"list_prs", "pr_view", "pr_diff", "pr_checks"}},
+		{"to act on a pull request", []string{"pr_comment", "pr_close", "pr_ready", "pr_edit"}},
+		{"to create a repository", []string{"create_repo"}},
+		{"to link a remote", []string{"link_remote"}},
+		{"to search the web", []string{"web_search"}},
+		{"to fetch a web page", []string{"fetch_page"}},
+		{"to get the time", []string{"get_time"}},
+		{"to evaluate arithmetic", []string{"calculator"}},
+		{"to recall a memory note", []string{"memory_read"}},
+		{"to save a memory note", []string{"memory_write"}},
+		{"to update the task list", []string{"todo_write"}},
+		{"to read the task list", []string{"todo_read"}},
+		{"to run a command over SSH", []string{"ssh_run", "ssh_read", "ssh_list", "ssh_grep"}},
+	}
+	var parts []string
+	for _, c := range cats {
+		var have []string
+		for _, n := range c.names {
+			if offered[n] {
+				have = append(have, n)
+			}
+		}
+		if len(have) == 0 {
+			continue
+		}
+		parts = append(parts, strings.Join(have, "/")+" "+c.hint)
+	}
+	if len(parts) == 0 {
+		return "call one of your available tools"
+	}
+	return strings.Join(parts, ", ")
 }
 
 // synthesizeProceedCard builds a clickable "proceed" clarify card from an
