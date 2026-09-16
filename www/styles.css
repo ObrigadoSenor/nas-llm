@@ -347,7 +347,7 @@ header h1{font-size:var(--fs-l);font-weight:600;margin:0}
 .msg-images img{width:140px;height:140px;object-fit:cover;border-radius:8px;display:block;cursor:zoom-in}
 
 /* row action menu */
-.menu{position:fixed;z-index:60;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:4px;min-width:160px;box-shadow:0 6px 24px rgba(0,0,0,.4)}
+.menu{position:fixed;z-index:10010;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:4px;min-width:160px;box-shadow:0 6px 24px rgba(0,0,0,.4)}
 .menu button{display:flex;align-items:center;gap:8px;width:100%;text-align:left;background:transparent;border:none;height:var(--h);padding:0 10px;border-radius:6px;font-size:var(--fs-m);color:var(--text)}
 .menu button:hover{background:var(--hover)}
 .menu button .icon{color:var(--muted)}

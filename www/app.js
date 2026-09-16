@@ -2158,9 +2158,13 @@ async function renderInstalledTab(){
   syncSelectedFromEntries();
   renderModels();                                   // header button + banner in sync
   renderModelBanner();
-  // Grouped selectable rows: NAS, Mac, then Local (this computer).
+  // Grouped selectable rows: NAS, Mac, then Local (this computer). A model
+  // that is both server-hosted and local appears once under Local (matching
+  // buildModelEntries' name dedup), so drop the server duplicate here — the
+  // common case is a Mac host and localhost being the same machine.
+  const localNameSet=new Set(localModelNames);
   const groups={};
-  for(const m of list){ const h=m.host||"nas"; (groups[h]=groups[h]||[]).push(m); }
+  for(const m of list){ if(localNameSet.has(m.name)) continue; const h=m.host||"nas"; (groups[h]=groups[h]||[]).push(m); }
   const none=!((groups.nas&&groups.nas.length)||(groups.mac&&groups.mac.length)||localModelNames.length);
   if(none) body.appendChild(mutedNote("No models installed yet. Get more models to download one."));
   for(const h of ["nas","mac"]){
