@@ -145,8 +145,7 @@ let ghReposCache = [];
 function buildDrawer() {
   if ($("dsDrawer")) return;
   const overlay = el("div", "ds-drawer"); overlay.id = "dsDrawer";
-  overlay.setAttribute("role", "dialog"); overlay.setAttribute("aria-modal", "true");
-  overlay.setAttribute("aria-label", "Workspace");
+  overlay.setAttribute("role", "region"); overlay.setAttribute("aria-label", "Workspace");
   const card = el("div", "ds-drawer-card");
   const head = el("div", "ds-drawer-head");
   const h2 = el("h2", null, "My Work"); h2.id = "dsDrawerTitle";
@@ -170,12 +169,10 @@ function buildDrawer() {
   });
   card.appendChild(body);
   overlay.appendChild(card);
+  // The drawer is a docked, non-modal panel: it lives at the document level so
+  // it's reachable on the login view too (where #app is hidden), and openDrawer
+  // reserves space in #app so it pushes chat content left instead of overlaying.
   document.body.appendChild(overlay);
-  overlay.addEventListener("click", (e) => { if (e.target === overlay) closeDrawer(); });
-  // Esc closes the drawer (and the hosted Models modal, if open). Added once.
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && $("dsDrawer") && $("dsDrawer").classList.contains("open")) closeDrawer();
-  });
 }
 
 function switchDrawerTab(tab) {
@@ -196,6 +193,14 @@ function openDrawer(tab) {
   tab = tab || _dsDrawerTab || "changes";
   switchDrawerTab(tab);
   $("dsDrawer").classList.add("open");
+  // Reserve space so the docked panel pushes chat content left (symmetric
+  // with the left sidebar) instead of overlaying it. The class goes on
+  // <body>, NOT #app: #app has a MutationObserver (syncAuthedUI) that would
+  // re-run refreshLocal/refreshMyWorkBadge/refreshGithubDot on every toggle,
+  // and those keychain/network reads can stall the sidecar. --ds-drawer-w is
+  // set on :root by the resize handler.
+  document.body.classList.add("ds-drawer-open");
+  try { localStorage.setItem("nas-llm-ds-drawer-open", tab); } catch {}
   if (tab === "mywork") loadMyWork();
   else if (tab === "changes") openChangesPanel();
   else if (tab === "models") activateModelsPanel();
@@ -204,6 +209,8 @@ function openDrawer(tab) {
 
 function closeDrawer() {
   const d = $("dsDrawer"); if (d) d.classList.remove("open");
+  document.body.classList.remove("ds-drawer-open");
+  try { localStorage.removeItem("nas-llm-ds-drawer-open"); } catch {}
   const sess = $("dsSessionOverlay"); if (sess) stopAgentMerge(sess);
   // Hide the hosted Models modal so its .open state doesn't linger off-screen.
   $("modelsModal")?.classList.remove("open");
@@ -3418,7 +3425,12 @@ async function maybeShowRepoWizard() {
 // buttons carry their own inline SVGs. My Work shows an attention badge (active
 // sessions + open PRs across workspaces); GitHub shows a connected-state dot.
 const DS_ICONS = {
-  drawer: '<svg class="ds-ic" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></svg>',
+  // The two panel toggles use mirrored glyphs: a rounded square with a vertical
+  // divider. The left-panel (sidebar) icon has the divider on the left third
+  // (narrow pane on the left); the right-panel icon has it on the right third
+  // (narrow pane on the right) — so each button reads as the side it controls.
+  drawer: '<svg class="ds-ic" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="15" y1="3" x2="15" y2="21"/></svg>',
+  sidebar: '<svg class="ds-ic" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>',
   mywork: '<svg class="ds-ic" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6h11"/><path d="M9 12h11"/><path d="M9 18h11"/><path d="m3 6 1.5 1.5L7 5"/><path d="m3 12 1.5 1.5L7 11"/><path d="m3 18 1.5 1.5L7 17"/></svg>',
   changes: '<svg class="ds-ic" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="6" width="6" height="5" rx="1"/><rect x="15" y="13" width="6" height="5" rx="1"/><path d="M9 8.5h3a3 3 0 0 1 3 3V13"/></svg>',
   github:  '<svg class="ds-ic" width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2C6.48 2 2 6.58 2 12.26c0 4.5 2.87 8.32 6.84 9.67.5.1.68-.22.68-.48 0-.24-.01-.88-.01-1.73-2.78.62-3.37-1.37-3.37-1.37-.45-1.18-1.11-1.5-1.11-1.5-.91-.64.07-.62.07-.62 1 .07 1.53 1.06 1.53 1.06.89 1.56 2.34 1.11 2.91.85.09-.66.35-1.11.63-1.37-2.22-.26-4.55-1.14-4.55-5.07 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.71 0 0 .84-.28 2.75 1.05A9.4 9.4 0 0 1 12 6.84c.85 0 1.71.12 2.51.34 1.91-1.33 2.75-1.05 2.75-1.05.55 1.41.2 2.45.1 2.71.64.72 1.03 1.63 1.03 2.75 0 3.94-2.34 4.81-4.57 5.06.36.32.68.94.68 1.9 0 1.37-.01 2.48-.01 2.82 0 .27.18.59.69.48A10.02 10.02 0 0 0 22 12.26C22 6.58 17.52 2 12 2Z"/></svg>',
@@ -3501,22 +3513,64 @@ function makeDrawerBtn() {
   return btn;
 }
 
-// One header icon that opens the drawer. It must be reachable BEFORE login too —
-// to set the backend URL and to open the paste-link sign-in. When #app is visible
-// (authed), place it in the header; when #app is hidden (login view), pin a fixed
-// copy to the viewport. Called on boot and whenever #app's class toggles.
+// makeSidebarToggleBtn is the header button that shows/hides the left sidebar
+// on desktop. The sidebar is a www-owned flex item; toggling #app's
+// ds-sidebar-collapsed class hides it (and its resize gutter) so main expands
+// to full width. Mobile keeps the #menuBtn slide-over and hides this button.
+function makeSidebarToggleBtn() {
+  const btn = el("button", "ds-head-btn ds-sidebar-btn");
+  btn.title = "Toggle sidebar"; btn.setAttribute("aria-label", "Toggle sidebar");
+  btn.innerHTML = dsIcon("sidebar");
+  btn.onclick = (e) => { e.stopPropagation(); toggleSidebar(); };
+  return btn;
+}
+const DS_SIDEBAR_KEY = "nas-llm-ds-sidebar-collapsed";
+function setSidebarCollapsed(on) {
+  // Class on <body> (not #app) so toggling it doesn't trip #app's
+  // MutationObserver (syncAuthedUI), which would re-run sidebar/badge refreshes.
+  document.body.classList.toggle("ds-sidebar-collapsed", !!on);
+  try { localStorage.setItem(DS_SIDEBAR_KEY, on ? "1" : "0"); } catch {}
+}
+function toggleSidebar() {
+  setSidebarCollapsed(!document.body.classList.contains("ds-sidebar-collapsed"));
+}
+// Wire the sidebar's own close button (#closeSide, from www/index.html) to
+// collapse the sidebar on desktop. app.js already wires it for the mobile
+// slide-over (a no-op on desktop), so both listeners coexist.
+function wireSidebarToggle() {
+  const cs = document.getElementById("closeSide");
+  if (cs && !cs._dsWired) { cs._dsWired = true; cs.addEventListener("click", () => setSidebarCollapsed(true)); }
+}
+
+// Header panel toggles: the left-panel (sidebar) button sits on the far LEFT
+// of the header (mirroring the side it controls), and the right-panel (drawer)
+// button sits on the far RIGHT in the .ds-head-actions cluster. The drawer
+// button must also be reachable BEFORE login (to set the backend URL / open the
+// paste-link sign-in), so when #app is hidden a fixed copy is pinned to the
+// viewport. Called on boot and whenever #app's class toggles.
 function addSettingsButton() {
   const app = $("app");
   const appVisible = !!app && !app.classList.contains("hidden");
   const header = document.querySelector("#app header");
+  // Right side: drawer (right-panel) button in the actions cluster.
   let cluster = header ? header.querySelector(".ds-head-actions") : null;
   if (appVisible && header && !cluster) {
     cluster = el("div", "ds-head-actions");
     header.appendChild(cluster);
   }
-  const headerBtn = header ? header.querySelector(".ds-drawer-btn") : null;
-  if (appVisible && cluster && !headerBtn) cluster.appendChild(makeDrawerBtn());
-  else if (!appVisible && headerBtn) headerBtn.remove();
+  if (appVisible && cluster) {
+    if (!cluster.querySelector(".ds-drawer-btn")) cluster.appendChild(makeDrawerBtn());
+  } else if (!appVisible && header) {
+    header.querySelector(".ds-drawer-btn")?.remove();
+  }
+  // Left side: sidebar (left-panel) toggle as the header's first child, so it
+  // sits on the far left (desktop hides #menuBtn, so this is the leftmost
+  // control). Mobile hides .ds-sidebar-btn and keeps #menuBtn's slide-over.
+  if (appVisible && header) {
+    if (!header.querySelector(".ds-sidebar-btn")) header.insertBefore(makeSidebarToggleBtn(), header.firstChild);
+  } else if (header) {
+    header.querySelector(".ds-sidebar-btn")?.remove();
+  }
   let fixed = document.querySelector("body > .ds-drawer-btn.ds-gear-fixed");
   if (!appVisible && !fixed) {
     fixed = makeDrawerBtn();
@@ -3591,14 +3645,21 @@ async function bootDesktop() {
     _mb._dsIntercept = true;
     _mb.addEventListener("click", () => { if (!_dsModelsTabActivating) openDrawer("models"); });
   }
-  // syncAuthedUI places the header actions cluster (Changes / My Work / GitHub / gear)
-  // and — once #app is actually visible (authed) — builds the sidebar Repos
-  // section, populates it, and (only the first time, with zero repos
-  // connected) shows the connect wizard. Also seeds the header state badges.
+  // syncAuthedUI places the header actions cluster (drawer + sidebar toggle) and,
+  // once #app is actually visible (authed), restores the docked panel's last open
+  // tab + the left-sidebar collapse state, builds the sidebar Repos section,
+  // populates it, and (only the first time, with zero repos connected) shows the
+  // connect wizard. Also seeds the header state badges.
+  let _dsDrawerRestored = false;
   const syncAuthedUI = () => {
     addSettingsButton();
     const app = $("app");
     if (app && !app.classList.contains("hidden")) {
+      try { document.body.classList.toggle("ds-sidebar-collapsed", localStorage.getItem(DS_SIDEBAR_KEY) === "1"); } catch {}
+      if (!_dsDrawerRestored) {
+        _dsDrawerRestored = true;
+        try { const _ot = localStorage.getItem("nas-llm-ds-drawer-open"); if (_ot) openDrawer(_ot); } catch {}
+      }
       buildSidebarRepos();
       buildSidebarChatsHeader();
       refreshLocal();
@@ -3612,6 +3673,7 @@ async function bootDesktop() {
   };
   syncAuthedUI();
   hookLogin();
+  wireSidebarToggle();
   // Re-run gear + sidebar-repos placement when the auth view toggles (#app
   // hidden ⇄ shown) — the initial auth check in app.js resolves after this
   // boot script runs, so #app may still be hidden the first time above.
@@ -3654,30 +3716,31 @@ async function bootDesktop() {
 }
 
 // --- Unified drawer horizontal resize ---------------------------------------
-// The desktop unified drawer (.ds-drawer-card) defaults to 480px. This injects
-// a left-edge grab handle, drives width via --ds-drawer-w, and persists it. The
-// drawer is pinned to the right edge, so width = viewport width - left-edge x.
-// No-op on mobile where the card goes full-width.
+// The docked right panel (.ds-drawer) defaults to 480px. This injects a
+// left-edge grab handle, drives width via --ds-drawer-w (set on :root so both
+// the panel and #app's reserved padding read it), and persists it. The panel
+// is pinned to the right edge, so width = viewport width - left-edge x. No-op
+// on mobile where the panel goes full-width.
 const DS_DRAWER_MIN=360, DS_DRAWER_KEY="nas-llm-ds-drawer-w";
-function dsDrawerMaxW(){ return Math.floor(window.innerWidth*0.92); }
-function applyDsDrawerW(card,w){ card.style.setProperty("--ds-drawer-w", Math.max(DS_DRAWER_MIN, Math.min(w, dsDrawerMaxW()))+"px"); }
+function dsDrawerMaxW(){ return Math.min(Math.floor(window.innerWidth*0.92), Math.floor(window.innerWidth-360)); }
+function applyDsDrawerW(w){ document.documentElement.style.setProperty("--ds-drawer-w", Math.max(DS_DRAWER_MIN, Math.min(w, dsDrawerMaxW()))+"px"); }
 function initDsDrawerResize(){
-  document.querySelectorAll(".ds-drawer-card").forEach(card=>{
-    if(card.querySelector(".ds-drawer-resize")) return;
+  document.querySelectorAll(".ds-drawer").forEach(panel=>{
+    if(panel.querySelector(".ds-drawer-resize")) return;
     const handle=document.createElement("div"); handle.className="ds-drawer-resize";
     handle.setAttribute("role","separator"); handle.setAttribute("aria-orientation","vertical"); handle.title="Drag to resize";
-    card.prepend(handle);
-    const saved=parseFloat(localStorage.getItem(DS_DRAWER_KEY)); if(saved>0) applyDsDrawerW(card,saved);
+    panel.prepend(handle);
+    const saved=parseFloat(localStorage.getItem(DS_DRAWER_KEY)); if(saved>0) applyDsDrawerW(saved);
     handle.addEventListener("pointerdown",e=>{
       e.preventDefault();
       document.body.classList.add("ds-drawer-resizing");
-      const move=ev=>applyDsDrawerW(card, window.innerWidth-ev.clientX);
+      const move=ev=>applyDsDrawerW(window.innerWidth-ev.clientX);
       const up=()=>{
         document.removeEventListener("pointermove",move);
         document.removeEventListener("pointerup",up);
         document.removeEventListener("pointercancel",up);
         document.body.classList.remove("ds-drawer-resizing");
-        const w=parseFloat(getComputedStyle(card).getPropertyValue("--ds-drawer-w"));
+        const w=parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--ds-drawer-w"));
         if(w>0) localStorage.setItem(DS_DRAWER_KEY,String(w));
       };
       document.addEventListener("pointermove",move);
@@ -3688,10 +3751,8 @@ function initDsDrawerResize(){
   });
 }
 window.addEventListener("resize",()=>{
-  document.querySelectorAll(".ds-drawer-card").forEach(card=>{
-    const w=parseFloat(getComputedStyle(card).getPropertyValue("--ds-drawer-w"));
-    if(w>0) applyDsDrawerW(card,w);
-  });
+  const w=parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--ds-drawer-w"));
+  if(w>0) applyDsDrawerW(w);
 });
 
 // The injected <script> is placed after app.js, so #app/#login already exist.
