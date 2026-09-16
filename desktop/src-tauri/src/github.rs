@@ -514,163 +514,216 @@ fn resolve_repo(data_dir: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
-// --- Per-(repo, branch) worktrees (real branch isolation per chat) --------
+// --- Folder-follows-active-chat: one checkout shared by chats on a repo -----
 //
-// Two chats on different branches of the same repo used to share one
-// checkout, so `repos_branch`/`repos_checkout` (git switch) on one chat would
-// silently move another chat's tree too. Git guarantees a branch is checked
-// out in at most one worktree, so giving each (repo, branch) pair its own
-// worktree under <data_dir>/worktrees/<repo>/<branch> makes that isolation
-// real instead of cosmetic. The main tree (the repo's original clone/linked
-// folder) is reused whenever it already has the requested branch checked
-// out — `git worktree add` would refuse a second checkout of that branch
-// anyway, and reusing it is the correct answer, not a fallback.
-//
-// Known tradeoff, surfaced in the UI rather than worked around here: a fresh
-// worktree has no untracked or ignored files, so node_modules, .env and build
-// caches are absent until the agent (re-)creates them. Do not try to copy
-// those files in — that would defeat the point of an isolated tree (an
-// untracked file dropped in a worktree by another process could silently
-// leak state between chats).
+// A repo has one working tree (its clone/linked folder). The folder always
+// tracks the active chat's branch: switching to a chat/branch runs
+// ensure_folder_on_branch, which auto-stashes any dirty work-in-progress
+// (keyed per branch) so a switch never carries another chat's uncommitted
+// edits, then switches the folder and pops the target branch's parked stash.
+// No git worktrees are created — node_modules, .env, and build caches persist
+// across switches because ignored files are never stashed.
 
-fn worktrees_dir(data_dir: &Path) -> PathBuf {
-    data_dir.join("worktrees")
-}
-
-// git_worktree_list parses `git worktree list --porcelain` (run against any
-// worktree of a repo — git resolves the whole set from any member) into
-// (path, branch) pairs. branch is None for a detached or bare entry.
-async fn git_worktree_list(path: &Path) -> Vec<(PathBuf, Option<String>)> {
+// git_stash_push runs `git stash push -u -m <msg>` in <path>. `-u` stashes
+// tracked + untracked-but-not-ignored work-in-progress while LEAVING ignored
+// files (node_modules, .env, build caches) in the working tree, so there is no
+// reinstall on return. Returns Ok(()) on success (including "No local changes
+// to save", which exits 0) or Err with the git error text.
+async fn git_stash_push(path: &Path, msg: &str) -> Result<(), String> {
     let out = tokio::process::Command::new("git")
         .arg("-C").arg(path)
-        .arg("worktree").arg("list").arg("--porcelain")
+        .arg("stash").arg("push").arg("-u").arg("-m").arg(msg)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output().await
+        .map_err(|e| format!("git stash push: {e}"))?;
+    if !out.status.success() {
+        let m = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if m.is_empty() { "git stash push failed".to_string() } else { m });
+    }
+    Ok(())
+}
+
+// git_stash_list_tagged returns the stash subjects tagged with the nasllm:
+// prefix — i.e. the per-branch stashes created by ensure_folder_on_branch.
+// Each `git stash list` line is "stash@{N}: On <branch>: <subject>"; the
+// subject is the trailing segment after the last ": " (branch names cannot
+// contain ": " so the split is unambiguous). Stash ownership is by message
+// tag (nasllm:<branch>), so a stash survives sidecar restart and stash-stack
+// shifts. Used by the ensure_folder_on_branch test to verify stash state.
+#[allow(dead_code)]
+async fn git_stash_list_tagged(path: &Path) -> Vec<String> {
+    let out = tokio::process::Command::new("git")
+        .arg("-C").arg(path)
+        .arg("stash").arg("list")
         .output().await;
     let mut result = Vec::new();
     let Ok(o) = out else { return result };
     if !o.status.success() {
         return result;
     }
-    let mut cur_path: Option<PathBuf> = None;
-    let mut cur_branch: Option<String> = None;
     for line in String::from_utf8_lossy(&o.stdout).lines() {
-        if line.is_empty() {
-            if let Some(p) = cur_path.take() {
-                result.push((p, cur_branch.take()));
+        if let Some(subject) = line.rsplit_once(": ").map(|(_, s)| s) {
+            if subject.starts_with("nasllm:") {
+                result.push(subject.to_string());
             }
-            continue;
         }
-        if let Some(p) = line.strip_prefix("worktree ") {
-            cur_path = Some(PathBuf::from(p));
-        } else if let Some(b) = line.strip_prefix("branch ") {
-            cur_branch = Some(b.trim_start_matches("refs/heads/").to_string());
-        }
-    }
-    if let Some(p) = cur_path.take() {
-        result.push((p, cur_branch.take()));
     }
     result
 }
 
-// git_worktree_prune clears stale worktree registrations (e.g. a worktree dir
-// that was deleted by hand) so a lookup below never returns a dead path.
-async fn git_worktree_prune(path: &Path) {
-    let _ = tokio::process::Command::new("git")
+// git_stash_pop_tagged pops the stash whose subject equals <tag> (e.g.
+// "nasllm:<branch>"), located via `git stash list`. If no matching stash
+// exists, this is a no-op (Ok). On a clean pop the stash is dropped by git. On
+// a pop conflict (non-zero exit) the stash is KEPT (git does not drop it) and
+// the conflict text is returned as Err so the caller can surface a warning —
+// edits are never silently lost. The user can then `git stash pop` manually
+// after resolving.
+async fn git_stash_pop_tagged(path: &Path, tag: &str) -> Result<(), String> {
+    let list = tokio::process::Command::new("git")
         .arg("-C").arg(path)
-        .arg("worktree").arg("prune")
-        .output().await;
-}
-
-// ensure_worktree resolves `branch` for `repo_name` (whose main tree is
-// `main`) to a single checkout, creating a worktree on demand. Returns
-// (path, created). Cases, in order:
-//  1. `branch` is what the main tree (or some other existing worktree)
-//     already has checked out -> reuse it. `git worktree list` reports the
-//     main tree as an entry too, so this and case 2 share one lookup.
-//  2. A worktree for `branch` already exists -> reuse it (after a prune, so a
-//     hand-deleted worktree dir doesn't shadow a fresh `add`).
-//  3. `branch` exists as a local ref -> `git worktree add <dest> <branch>`.
-//  4. `branch` exists only on origin -> tracking checkout via
-//     `git worktree add -b <branch> <dest> origin/<branch>`.
-//  5. `branch` does not exist anywhere: if `create`, branch off the repo's
-//     default branch; otherwise this is an error. Resolving a branch never
-//     invents one unless the caller (the dedicated worktree route) asked for
-//     that explicitly — repos_exec and the session-panel routes always pass
-//     create=false, since a chat's branch should already exist by the time
-//     they run.
-async fn ensure_worktree(
-    data_dir: &Path,
-    repo_name: &str,
-    main: &Path,
-    branch: &str,
-    create: bool,
-) -> Result<(PathBuf, bool), String> {
-    let branch = branch.trim();
-    if branch.is_empty() {
-        return Ok((main.to_path_buf(), false));
+        .arg("stash").arg("list")
+        .output().await
+        .map_err(|e| format!("git stash list: {e}"))?;
+    if !list.status.success() {
+        return Ok(()); // no stashes / git error → no-op
     }
-    git_worktree_prune(main).await;
-    for (p, b) in git_worktree_list(main).await {
-        if b.as_deref() == Some(branch) && p.is_dir() {
-            return Ok((p, false));
+    // Find the stash@{N} ref whose trailing subject matches <tag>.
+    let mut target: Option<String> = None;
+    for line in String::from_utf8_lossy(&list.stdout).lines() {
+        if let Some(subject) = line.rsplit_once(": ").map(|(_, s)| s) {
+            if subject == tag {
+                // The line starts with "stash@{N}:"; take everything before the
+                // first ':' as the ref. Args are passed directly (no shell), so
+                // the braces in stash@{N} are safe.
+                if let Some(ref_str) = line.split(':').next() {
+                    target = Some(ref_str.trim().to_string());
+                    break;
+                }
+            }
         }
     }
-    let dest = worktrees_dir(data_dir).join(safe_name(repo_name)).join(safe_name(branch));
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("worktree dir: {e}"))?;
+    let Some(ref_str) = target else { return Ok(()) };
+
+    let pop = tokio::process::Command::new("git")
+        .arg("-C").arg(path)
+        .arg("stash").arg("pop").arg(&ref_str)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output().await
+        .map_err(|e| format!("git stash pop: {e}"))?;
+    if pop.status.success() {
+        return Ok(());
     }
-    let out = if git_has_ref(main, &format!("refs/heads/{branch}")).await {
+    // Conflict: git keeps the stash. Surface the conflict text as a warning.
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&pop.stdout),
+        String::from_utf8_lossy(&pop.stderr)
+    );
+    let msg = combined.trim().to_string();
+    Err(if msg.is_empty() {
+        format!("stash pop conflict for {tag}; stash kept — resolve and `git stash pop` manually")
+    } else {
+        format!("{msg}\n(stash {ref_str} kept — resolve and `git stash pop` manually)")
+    })
+}
+
+// ensure_folder_on_branch switches the repo's single checkout (the folder at
+// `main`) onto `branch`, auto-stashing any dirty work-in-progress keyed per
+// branch so a switch never carries another chat's uncommitted edits. One
+// checkout is shared by all chats on a repo; there are no git worktrees.
+//
+// Steps (skipped for non-git workspaces or an empty branch, which return main
+// unchanged):
+//  1. Already on `branch` → pop any stash parked for it, return main.
+//  2. Dirty folder → `git stash push -u -m "nasllm:<current_branch>"`. `-u`
+//     stashes tracked + untracked-non-ignored WIP but leaves ignored files
+//     (node_modules, .env, build caches) in place — no reinstall on return.
+//  3. Switch: `git switch <branch>` if the ref exists, else `git switch -c
+//     <branch> <base>` (base defaults to the repo's default branch).
+//  4. Pop the stash tagged `nasllm:<branch>` if one exists. On pop conflict
+//     the stash is KEPT and the conflict text is returned as Err so the caller
+//     surfaces a warning — edits are never silently lost.
+//  5. Update the registry branch so the sidebar reflects the switch. (The
+//     caller re-pushes repo context to the backend, which needs AppState.)
+//
+// Returns Ok(main) on a clean switch (or no-op), Err(msg) on a stash/switch
+// failure or a pop conflict (the folder is switched either way; the stash is
+// kept for manual `git stash pop`).
+async fn ensure_folder_on_branch(
+    data_dir: &Path,
+    main: &Path,
+    repo_name: &str,
+    branch: &str,
+    base: &str,
+) -> Result<PathBuf, String> {
+    let branch = branch.trim();
+    if branch.is_empty() || !repo_use_git(data_dir, repo_name) {
+        return Ok(main.to_path_buf());
+    }
+    let current = git_branch(main).await;
+    let tag = format!("nasllm:{branch}");
+
+    // Already on the target branch: restore its parked stash (if any) and done.
+    if current == branch {
+        git_stash_pop_tagged(main, &tag).await?;
+        return Ok(main.to_path_buf());
+    }
+
+    // Dirty folder: stash WIP keyed by the CURRENT branch so it is restored
+    // when we switch back. `-u` stashes tracked + untracked-non-ignored files
+    // but leaves ignored files (node_modules, .env, build caches) in place.
+    if git_dirty_count(main).await > 0 {
+        git_stash_push(main, &format!("nasllm:{current}")).await?;
+    }
+
+    // Switch onto the target branch (create from base if it doesn't exist yet).
+    let has_local = git_has_ref(main, &format!("refs/heads/{branch}")).await;
+    let resolved_base = if base.trim().is_empty() {
+        git_default_branch(main).await
+    } else {
+        base.trim().to_string()
+    };
+    let out = if has_local {
         tokio::process::Command::new("git")
             .arg("-C").arg(main)
-            .arg("worktree").arg("add").arg(&dest).arg(branch)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output().await
-    } else if git_has_ref(main, &format!("refs/remotes/origin/{branch}")).await {
-        tokio::process::Command::new("git")
-            .arg("-C").arg(main)
-            .arg("worktree").arg("add").arg("-b").arg(branch).arg(&dest).arg(format!("origin/{branch}"))
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output().await
-    } else if create {
-        let base = git_default_branch(main).await;
-        tokio::process::Command::new("git")
-            .arg("-C").arg(main)
-            .arg("worktree").arg("add").arg("-b").arg(branch).arg(&dest).arg(&base)
+            .arg("switch").arg(branch)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output().await
     } else {
-        return Err(format!("branch '{branch}' does not exist locally or on origin"));
+        tokio::process::Command::new("git")
+            .arg("-C").arg(main)
+            .arg("switch").arg("-c").arg(branch).arg(&resolved_base)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output().await
     };
     match out {
-        Ok(o) if o.status.success() => Ok((dest, true)),
+        Ok(o) if o.status.success() => {}
         Ok(o) => {
-            let msg = String::from_utf8_lossy(&o.stderr).trim().to_string();
-            Err(if msg.is_empty() { "git worktree add failed".to_string() } else { msg })
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            let msg = combined.trim().to_string();
+            return Err(if msg.is_empty() { "git switch failed".to_string() } else { msg });
         }
-        Err(e) => Err(format!("git worktree add: {e}")),
+        Err(e) => return Err(format!("git switch: {e}")),
     }
-}
 
-// resolve_repo_branch is the shared entry point for branch-aware routes
-// (contract 3): resolves `name` to its main tree, then — if `branch` is
-// non-empty — to that branch's worktree. An empty branch (older clients, or
-// a conversation with no repo_branch) returns exactly what resolve_repo
-// returned before this feature existed, so nothing breaks for them. Never
-// creates a branch (create=false); that is the dedicated worktree route's job.
-async fn resolve_repo_branch(data_dir: &Path, name: &str, branch: &str) -> Result<PathBuf, (StatusCode, String)> {
-    let main = match resolve_repo(data_dir, name) {
-        Some(p) => p,
-        None => return Err((StatusCode::NOT_FOUND, "not found locally".to_string())),
-    };
-    if branch.trim().is_empty() {
-        return Ok(main);
+    // Pop the stash parked for the target branch (if any). On conflict the
+    // stash is kept and the conflict text is returned as Err — the folder is
+    // switched but the user must resolve the stash manually.
+    git_stash_pop_tagged(main, &tag).await?;
+
+    // Update the registry branch so the sidebar reflects the switch.
+    if let Some(rec) = load_registry(data_dir).into_iter().find(|r| r.full_name == repo_name) {
+        upsert_registry(data_dir, &RepoRecord { branch: branch.to_string(), ..rec });
     }
-    ensure_worktree(data_dir, name, &main, branch, false)
-        .await
-        .map(|(p, _created)| p)
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e))
+    Ok(main.to_path_buf())
 }
 
 // --- git helpers: remote, ahead/behind, commit, push ----------------------
@@ -1007,28 +1060,6 @@ fn github_full_name(remote: &str) -> Option<String> {
     None
 }
 
-// slugify turns a chat title into a branch-safe slug: lowercase, non-[a-z0-9]
-// replaced with `-`, leading/trailing `-` trimmed, fallback "chat", capped at
-// ~40 chars. The result is ASCII-only so byte slicing for the cap is safe.
-fn slugify(s: &str) -> String {
-    let mut slug: String = s
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    slug = slug.trim_matches('-').to_string();
-    if slug.is_empty() {
-        return "chat".to_string();
-    }
-    if slug.len() > 40 {
-        slug = slug[..40].trim_end_matches('-').to_string();
-        if slug.is_empty() {
-            slug = "chat".to_string();
-        }
-    }
-    slug
-}
-
 // today_ymd returns the current UTC date as YYYY-MM-DD, computed from the Unix
 // epoch without a calendar dependency (Howard Hinnant's civil_from_days).
 fn today_ymd() -> String {
@@ -1122,9 +1153,10 @@ struct CloneBody {
 #[derive(Deserialize)]
 struct NameBody {
     name: String,
-    // Optional per-chat branch (contract 3). Empty/absent preserves the
-    // pre-worktree behaviour exactly: act on the repo's shared main tree.
+    // Optional per-chat branch, accepted for shape compat but ignored: the
+    // folder always tracks the active chat's branch (ensure_folder_on_branch).
     #[serde(default)]
+    #[allow(dead_code)]
     branch: String,
 }
 
@@ -1323,20 +1355,12 @@ async fn repos_clone(State(st): State<AppState>, Json(body): Json<CloneBody>) ->
 async fn repos_refresh(State(st): State<AppState>, Json(body): Json<NameBody>) -> Response {
     let name = body.name.trim().to_string();
     if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
-    // Branch-aware: when a per-chat branch is carried, pull inside that branch's
-    // worktree (so a session auto-sync fast-forwards its own isolated tree, not
-    // the repo's shared main checkout). Empty branch preserves the original
-    // main-tree pull behaviour.
-    let dest = if body.branch.trim().is_empty() {
-        match resolve_repo(&st.data_dir, &name) {
-            Some(p) => p,
-            None => return json_err("not found locally", StatusCode::NOT_FOUND),
-        }
-    } else {
-        match resolve_repo_branch(&st.data_dir, &name, &body.branch).await {
-            Ok(p) => p,
-            Err((status, e)) => return json_err(&e, status),
-        }
+    // Always pull the folder (one checkout shared by chats on a repo; the
+    // folder tracks the active chat's branch). The branch field is accepted
+    // for shape compat but ignored.
+    let dest = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_err("not found locally", StatusCode::NOT_FOUND),
     };
     // The token is only used to scrub captured output; pull uses the repo's
     // configured origin (a cloned repo's origin carries the token; a linked
@@ -1504,9 +1528,9 @@ async fn repos_checkout(State(st): State<AppState>, Json(body): Json<CheckoutBod
 async fn repos_diff(State(st): State<AppState>, Json(body): Json<NameBody>) -> Response {
     let name = body.name.trim().to_string();
     if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
-    let dest = match resolve_repo_branch(&st.data_dir, &name, &body.branch).await {
-        Ok(p) => p,
-        Err((status, e)) => return json_err(&e, status),
+    let dest = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_err("not found locally", StatusCode::NOT_FOUND),
     };
     let out = tokio::process::Command::new("git")
         .arg("-C").arg(&dest)
@@ -1529,9 +1553,9 @@ async fn repos_diff(State(st): State<AppState>, Json(body): Json<NameBody>) -> R
 async fn repos_revert(State(st): State<AppState>, Json(body): Json<NameBody>) -> Response {
     let name = body.name.trim().to_string();
     if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
-    let dest = match resolve_repo_branch(&st.data_dir, &name, &body.branch).await {
-        Ok(p) => p,
-        Err((status, e)) => return json_err(&e, status),
+    let dest = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_err("not found locally", StatusCode::NOT_FOUND),
     };
     let _ = tokio::process::Command::new("git")
         .arg("-C").arg(&dest)
@@ -1615,22 +1639,16 @@ async fn repos_exec(State(st): State<AppState>, Json(body): Json<ExecBody>) -> R
             ..Default::default()
         }),
     };
-    // branch (contract 3): resolve to that chat's worktree so its tool calls
-    // never land in another chat's checkout. Never auto-creates the branch
-    // (create=false) — by the time a toolExec call carries a branch, the
-    // renderer has already ensured the worktree exists via /repos/worktree.
-    let dest = if body.branch.trim().is_empty() {
-        main
-    } else {
-        match ensure_worktree(&st.data_dir, &repo_name, &main, &body.branch, false).await {
-            Ok((p, _created)) => p,
-            Err(e) => return json_ok(&ExecResult {
-                observation: format!("Branch worktree unavailable: {e}"),
-                preview: "worktree error".into(),
-                is_error: true,
-                ..Default::default()
-            }),
-        }
+    // branch: switch the folder onto the chat's branch (auto-stash/pop). An
+    // empty branch (older clients, branchless chat) uses the folder as-is.
+    let dest = match ensure_folder_on_branch(&st.data_dir, &main, &repo_name, &body.branch, "").await {
+        Ok(p) => p,
+        Err(e) => return json_ok(&ExecResult {
+            observation: format!("Branch switch unavailable: {e}"),
+            preview: "branch switch error".into(),
+            is_error: true,
+            ..Default::default()
+        }),
     };
     let root = match std::fs::canonicalize(&dest) {
         Ok(r) => r,
@@ -1694,13 +1712,9 @@ async fn repos_exec_stream(State(st): State<AppState>, Json(body): Json<ExecBody
         Some(p) => p,
         None => return sse_error(&format!("Repository {repo_name} is not available locally.")),
     };
-    let dest = if body.branch.trim().is_empty() {
-        main
-    } else {
-        match ensure_worktree(&st.data_dir, &repo_name, &main, &body.branch, false).await {
-            Ok((p, _created)) => p,
-            Err(e) => return sse_error(&format!("Branch worktree unavailable: {e}")),
-        }
+    let dest = match ensure_folder_on_branch(&st.data_dir, &main, &repo_name, &body.branch, "").await {
+        Ok(p) => p,
+        Err(e) => return sse_error(&format!("Branch switch unavailable: {e}")),
     };
     let root = match std::fs::canonicalize(&dest) {
         Ok(r) => r,
@@ -4449,9 +4463,9 @@ async fn repos_scan_local(Json(body): Json<ScanBody>) -> Response {
 async fn repos_changelog(State(st): State<AppState>, Json(body): Json<NameBody>) -> Response {
     let name = body.name.trim().to_string();
     if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
-    let dest = match resolve_repo_branch(&st.data_dir, &name, &body.branch).await {
-        Ok(p) => p,
-        Err((status, e)) => return json_err(&e, status),
+    let dest = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_err("not found locally", StatusCode::NOT_FOUND),
     };
     let remote = git_remote_url(&dest).await;
     let branch = git_branch(&dest).await;
@@ -4492,6 +4506,7 @@ struct ShipBody {
     #[serde(default)]
     push: bool,
     #[serde(default)]
+    #[allow(dead_code)]
     branch: String,
 }
 
@@ -4503,9 +4518,9 @@ struct ShipBody {
 async fn repos_ship(State(st): State<AppState>, Json(body): Json<ShipBody>) -> Response {
     let name = body.repo.trim().to_string();
     if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
-    let dest = match resolve_repo_branch(&st.data_dir, &name, &body.branch).await {
-        Ok(p) => p,
-        Err((status, e)) => return json_err(&e, status),
+    let dest = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_err("not found locally", StatusCode::NOT_FOUND),
     };
     let version = body.version.trim().to_string();
     if version.is_empty() {
@@ -4948,75 +4963,6 @@ async fn pr_detail(client: &reqwest::Client, root: &Path, number: u64) -> Result
 }
 
 #[derive(Deserialize)]
-struct BranchBody {
-    name: String,
-    title: String,
-}
-
-// repos_branch creates (or reuses) an `agent/<slug>` branch for a chat title.
-// Idempotent: if the branch already exists, switches to it instead of creating.
-// On a dirty-tree checkout failure, returns the git error in {error} (no force
-// or stash). After a successful switch, updates the registry and re-pushes repo
-// context to the backend with the new branch (best-effort).
-async fn repos_branch(State(st): State<AppState>, Json(body): Json<BranchBody>) -> Response {
-    let name = body.name.trim().to_string();
-    if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
-    let title = body.title.trim().to_string();
-    let dest = match resolve_repo(&st.data_dir, &name) {
-        Some(p) => p,
-        None => return json_err("not found locally", StatusCode::NOT_FOUND),
-    };
-    let slug = slugify(&title);
-    let branch = format!("agent/{}", slug);
-    let ref_name = format!("refs/heads/{}", branch);
-    let token = token_get().unwrap_or_default();
-    let out = if git_has_ref(&dest, &ref_name).await {
-        tokio::process::Command::new("git")
-            .arg("-C").arg(&dest)
-            .arg("switch").arg(&branch)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .await
-    } else {
-        tokio::process::Command::new("git")
-            .arg("-C").arg(&dest)
-            .arg("switch").arg("-c").arg(&branch)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .await
-    };
-    match out {
-        Ok(o) if o.status.success() => {
-            // Update the registry so the sidebar reflects the new branch.
-            let mut repos = load_registry(&st.data_dir);
-            if let Some(r) = repos.iter_mut().find(|r| r.full_name == name) {
-                r.branch = branch.clone();
-                save_registry(&st.data_dir, &repos);
-            }
-            // Re-push repo context with the new branch (best-effort).
-            let head = git_head(&dest).await;
-            let tree = top_level_tree(&dest);
-            let _ = push_repo_context(&st, &name, &dest, &branch, &head, &tree).await;
-            json_ok(&serde_json::json!({ "ok": true, "branch": branch }))
-        }
-        Ok(o) => {
-            let combined = format!(
-                "{}\n{}",
-                String::from_utf8_lossy(&o.stdout),
-                String::from_utf8_lossy(&o.stderr)
-            );
-            let msg = scrub(combined.trim().to_string(), &token);
-            json_ok(&serde_json::json!({ "ok": false, "branch": branch, "error": msg }))
-        }
-        Err(e) => {
-            json_ok(&serde_json::json!({ "ok": false, "branch": branch, "error": format!("git switch: {e}") }))
-        }
-    }
-}
-
-#[derive(Deserialize)]
 struct CreateBranchBody {
     name: String,
     branch: String,
@@ -5025,27 +4971,17 @@ struct CreateBranchBody {
 }
 
 // repos_create_branch starts a chat on its own branch cut from the repo's
-// default branch (or `base`), WITHOUT provisioning a git worktree upfront.
-// This is the per-chat branch model: a new chat is just a branch from main.
+// default branch (or `base`). This is the per-chat branch model: a new chat is
+// just a branch from main. The repo folder is always switched onto the chat's
+// branch — dirty work-in-progress is auto-stashed per branch and restored on
+// return; ignored files (node_modules, .env, build caches) stay in place. No
+// git worktrees are created: one checkout is shared by all chats on a repo.
 //
-// Two cases, keyed on whether the repo folder has uncommitted changes:
-//  - Clean folder: `git switch -c <branch> <base>` (or `git switch <branch>`
-//    if the branch already exists) moves the folder onto the chat's branch so
-//    its tool calls run there directly — no worktree is ever created for it.
-//  - Dirty folder: the working tree is never moved (switching would carry
-//    another chat's / the user's uncommitted edits onto the new branch). For
-//    a new branch we `git branch <branch> <base>` (create the ref only, no
-//    checkout); for an existing branch we do nothing. In both sub-cases the
-//    chat's tool calls lazily provision an isolated worktree via repos_exec
-//    (ensure_worktree, create=false), which keeps concurrent chats on
-//    different branches from treading on each other.
-//
-// Returns {ok, branch, isolated, error}. `isolated` is true when the folder
-// was left on a different branch and the chat will run in a lazy worktree.
-// Idempotent: if the folder is already on `branch`, returns ok immediately.
-// The registry is updated and repo context re-pushed only when the folder is
-// actually switched (isolated=false), since the folder's branch is unchanged
-// otherwise.
+// Returns {ok, branch, isolated, error}. `isolated` is always false now (kept
+// for shape compat with the renderer): the folder IS the chat's checkout.
+// Idempotent: if the folder is already on `branch`, the helper pops its parked
+// stash (if any) and returns ok. The registry branch is updated inside the
+// helper; repo context is re-pushed here on a successful switch.
 async fn repos_create_branch(State(st): State<AppState>, Json(body): Json<CreateBranchBody>) -> Response {
     let name = body.name.trim().to_string();
     if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
@@ -5057,77 +4993,16 @@ async fn repos_create_branch(State(st): State<AppState>, Json(body): Json<Create
         Some(p) => p,
         None => return json_ok(&serde_json::json!({ "ok": false, "branch": branch, "isolated": false, "error": "not found locally" })),
     };
-    let token = token_get().unwrap_or_default();
-    let current = git_branch(&main).await;
-    if current == branch {
-        return json_ok(&serde_json::json!({ "ok": true, "branch": branch, "isolated": false, "error": null }));
-    }
-    let dirty = git_dirty_count(&main).await;
-    let has_local = git_has_ref(&main, &format!("refs/heads/{branch}")).await;
-    let base = if body.base.trim().is_empty() {
-        git_default_branch(&main).await
-    } else {
-        body.base.trim().to_string()
-    };
-
-    // Dirty folder: never move the working tree. Create the ref only (new
-    // branch) so repos_exec can lazily check it out into an isolated worktree;
-    // for an existing branch, leave the folder as-is (the lazy worktree handles
-    // it). No registry/context update — the folder's branch is unchanged.
-    if dirty > 0 {
-        if !has_local {
-            let out = tokio::process::Command::new("git")
-                .arg("-C").arg(&main)
-                .arg("branch").arg(&branch).arg(&base)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .output().await;
-            return match out {
-                Ok(o) if o.status.success() => json_ok(&serde_json::json!({ "ok": true, "branch": branch, "isolated": true, "error": null })),
-                Ok(o) => {
-                    let msg = scrub(String::from_utf8_lossy(&o.stderr).trim().to_string(), &token);
-                    let emsg = if msg.is_empty() { "git branch failed".to_string() } else { msg };
-                    json_ok(&serde_json::json!({ "ok": false, "branch": branch, "isolated": false, "error": emsg }))
-                }
-                Err(e) => json_ok(&serde_json::json!({ "ok": false, "branch": branch, "isolated": false, "error": format!("git branch: {e}") })),
-            };
-        }
-        return json_ok(&serde_json::json!({ "ok": true, "branch": branch, "isolated": true, "error": null }));
-    }
-
-    // Clean folder: switch onto the chat's branch (create from base if new).
-    let out = if has_local {
-        tokio::process::Command::new("git")
-            .arg("-C").arg(&main)
-            .arg("switch").arg(&branch)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output().await
-    } else {
-        tokio::process::Command::new("git")
-            .arg("-C").arg(&main)
-            .arg("switch").arg("-c").arg(&branch).arg(&base)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output().await
-    };
-    match out {
-        Ok(o) if o.status.success() => {
+    match ensure_folder_on_branch(&st.data_dir, &main, &name, &branch, &body.base).await {
+        Ok(main) => {
+            // Re-push repo context with the new branch (best-effort). The
+            // registry branch is already updated inside the helper.
             let head = git_head(&main).await;
             let tree = top_level_tree(&main);
-            if let Some(rec) = load_registry(&st.data_dir).into_iter().find(|r| r.full_name == name) {
-                upsert_registry(&st.data_dir, &RepoRecord { branch: branch.clone(), ..rec });
-            }
             let _ = push_repo_context(&st, &name, &main, &branch, &head, &tree).await;
             json_ok(&serde_json::json!({ "ok": true, "branch": branch, "isolated": false, "error": null }))
         }
-        Ok(o) => {
-            let combined = format!("{}\n{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
-            let msg = scrub(combined.trim().to_string(), &token);
-            let emsg = if msg.is_empty() { "git switch failed".to_string() } else { msg };
-            json_ok(&serde_json::json!({ "ok": false, "branch": branch, "isolated": false, "error": emsg }))
-        }
-        Err(e) => json_ok(&serde_json::json!({ "ok": false, "branch": branch, "isolated": false, "error": format!("git switch: {e}") })),
+        Err(e) => json_ok(&serde_json::json!({ "ok": false, "branch": branch, "isolated": false, "error": e })),
     }
 }
 
@@ -5135,6 +5010,7 @@ async fn repos_create_branch(State(st): State<AppState>, Json(body): Json<Create
 struct StateQuery {
     name: String,
     #[serde(default)]
+    #[allow(dead_code)]
     branch: String,
 }
 
@@ -5156,9 +5032,12 @@ async fn repos_state(State(st): State<AppState>, Query(q): Query<StateQuery>) ->
             "useGit": false,
         }));
     }
-    let dest = match resolve_repo_branch(&st.data_dir, &name, &q.branch).await {
-        Ok(p) => p,
-        Err((status, e)) => return json_err(&e, status),
+    // Report the folder's live branch/dirty/ahead/behind. The branch query
+    // param is accepted for shape compat but ignored (the folder tracks the
+    // active chat's branch).
+    let dest = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_err("not found locally", StatusCode::NOT_FOUND),
     };
     let branch = git_branch(&dest).await;
     let dirty = git_dirty_count(&dest).await;
@@ -5190,6 +5069,7 @@ struct CommitBody {
     #[serde(default)]
     push: bool,
     #[serde(default)]
+    #[allow(dead_code)]
     branch: String,
 }
 
@@ -5199,9 +5079,9 @@ struct CommitBody {
 async fn repos_commit(State(st): State<AppState>, Json(body): Json<CommitBody>) -> Response {
     let name = body.repo.trim().to_string();
     if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
-    let dest = match resolve_repo_branch(&st.data_dir, &name, &body.branch).await {
-        Ok(p) => p,
-        Err((status, e)) => return json_err(&e, status),
+    let dest = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_err("not found locally", StatusCode::NOT_FOUND),
     };
     let message = body.message.trim().to_string();
     if message.is_empty() {
@@ -5260,6 +5140,7 @@ struct CreatePrBody {
     #[serde(default)]
     base: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     branch: String,
 }
 
@@ -5270,9 +5151,9 @@ struct CreatePrBody {
 async fn repos_create_pr(State(st): State<AppState>, Json(body): Json<CreatePrBody>) -> Response {
     let name = body.repo.trim().to_string();
     if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
-    let dest = match resolve_repo_branch(&st.data_dir, &name, &body.branch).await {
-        Ok(p) => p,
-        Err((status, e)) => return json_err(&e, status),
+    let dest = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_err("not found locally", StatusCode::NOT_FOUND),
     };
     let title = body.title.trim().to_string();
     if title.is_empty() {
@@ -5300,9 +5181,9 @@ async fn repos_create_pr(State(st): State<AppState>, Json(body): Json<CreatePrBo
 async fn repos_prs(State(st): State<AppState>, Query(q): Query<StateQuery>) -> Response {
     let name = q.name.trim().to_string();
     if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
-    let dest = match resolve_repo_branch(&st.data_dir, &name, &q.branch).await {
-        Ok(p) => p,
-        Err((status, e)) => return json_err(&e, status),
+    let dest = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_err("not found locally", StatusCode::NOT_FOUND),
     };
     match list_prs_for_repo(&st.client, &dest).await {
         Ok(prs) => json_ok(&serde_json::json!({ "ok": true, "prs": prs })),
@@ -5317,6 +5198,7 @@ struct MergePrBody {
     #[serde(default)]
     method: String,
     #[serde(default)]
+    #[allow(dead_code)]
     branch: String,
 }
 
@@ -5327,9 +5209,9 @@ struct MergePrBody {
 async fn repos_merge_pr(State(st): State<AppState>, Json(body): Json<MergePrBody>) -> Response {
     let name = body.repo.trim().to_string();
     if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
-    let dest = match resolve_repo_branch(&st.data_dir, &name, &body.branch).await {
-        Ok(p) => p,
-        Err((status, e)) => return json_err(&e, status),
+    let dest = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_err("not found locally", StatusCode::NOT_FOUND),
     };
     if body.number == 0 {
         return json_ok(&serde_json::json!({ "ok": false, "sha": null, "error": "number is required" }));
@@ -5337,48 +5219,6 @@ async fn repos_merge_pr(State(st): State<AppState>, Json(body): Json<MergePrBody
     match merge_pr_for_repo(&st.client, &dest, body.number, body.method.as_str()).await {
         Ok(sha) => json_ok(&serde_json::json!({ "ok": true, "sha": sha })),
         Err(e) => json_ok(&serde_json::json!({ "ok": false, "sha": null, "error": e })),
-    }
-}
-
-#[derive(Deserialize)]
-struct WorktreeBody {
-    name: String,
-    branch: String,
-    #[serde(default)]
-    create: bool,
-}
-
-// repos_worktree ensures a (repo, branch) worktree exists (contract 3). The
-// renderer calls this when a chat is re-pointed at a branch, before any
-// toolExec/session-panel call carries that branch — those calls resolve with
-// create=false, so by the time they arrive the worktree this route created
-// (or reused) is already there.
-async fn repos_worktree(State(st): State<AppState>, Json(body): Json<WorktreeBody>) -> Response {
-    let name = body.name.trim().to_string();
-    if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
-    let branch = body.branch.trim().to_string();
-    if branch.is_empty() {
-        return json_ok(&serde_json::json!({
-            "ok": false, "branch": "", "path": null, "created": false, "error": "branch is required",
-        }));
-    }
-    let main = match resolve_repo(&st.data_dir, &name) {
-        Some(p) => p,
-        None => return json_ok(&serde_json::json!({
-            "ok": false, "branch": branch, "path": null, "created": false, "error": "not found locally",
-        })),
-    };
-    match ensure_worktree(&st.data_dir, &name, &main, &branch, body.create).await {
-        Ok((path, created)) => json_ok(&serde_json::json!({
-            "ok": true,
-            "branch": branch,
-            "path": path.display().to_string(),
-            "created": created,
-            "error": null,
-        })),
-        Err(e) => json_ok(&serde_json::json!({
-            "ok": false, "branch": branch, "path": null, "created": false, "error": e,
-        })),
     }
 }
 
@@ -5689,7 +5529,6 @@ pub fn router(state: AppState) -> Router {
         .route("/__sidecar/repos/changelog", post(repos_changelog))
         .route("/__sidecar/repos/ship", post(repos_ship))
         .route("/__sidecar/repos/set-folder", post(repos_set_folder))
-        .route("/__sidecar/repos/branch", post(repos_branch))
         .route("/__sidecar/repos/create-branch", post(repos_create_branch))
         .route("/__sidecar/repos/state", get(repos_state))
         .route("/__sidecar/repos/branches", post(repos_branches))
@@ -5698,7 +5537,6 @@ pub fn router(state: AppState) -> Router {
         .route("/__sidecar/repos/create-pr", post(repos_create_pr))
         .route("/__sidecar/repos/prs", get(repos_prs))
         .route("/__sidecar/repos/merge-pr", post(repos_merge_pr))
-        .route("/__sidecar/repos/worktree", post(repos_worktree))
         .with_state(state)
 }
 
@@ -6249,6 +6087,78 @@ mod tests {
         let s = String::from_utf8_lossy(&body);
         assert!(s.contains("\"ok\":false"), "got: {s}");
         assert!(s.contains("workspace is not git-enabled"), "got: {s}");
+    }
+
+    #[tokio::test]
+    async fn ensure_folder_on_branch_stashes_and_restores() {
+        let dir = init_test_repo().await;
+        let root = dir.path();
+        let data = tempfile::tempdir().unwrap();
+        let data_dir = data.path();
+
+        // Register the repo so repo_use_git returns true and the helper can
+        // update the registry.
+        let branch_a = git_branch(root).await; // initial branch (main or master)
+        upsert_registry(data_dir, &RepoRecord {
+            full_name: "test/stash".into(),
+            path: root.display().to_string(),
+            remote: None,
+            branch: branch_a.clone(),
+            folder_id: None,
+            linked: true,
+            use_git: true,
+            name: Some("test/stash".into()),
+        });
+
+        // Commit a .gitignore listing node_modules so the ignored file stays
+        // ignored on every branch (a tracked .gitignore survives switches; an
+        // untracked one would be stashed by -u, un-ignoring node_modules on the
+        // other branch and making the switch-back dirty).
+        std::fs::write(root.join(".gitignore"), "node_modules\n").unwrap();
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(root).arg("add").arg(".gitignore")
+            .output().await.unwrap();
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(root).arg("commit").arg("-q").arg("-m").arg("gitignore")
+            .output().await.unwrap();
+
+        // Dirty branch A: a tracked edit to f.txt + an ignored node_modules/x.txt.
+        std::fs::write(root.join("f.txt"), "a\nb\nDIRTY\n").unwrap();
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        std::fs::write(root.join("node_modules/x.txt"), "ignored\n").unwrap();
+        assert!(git_dirty_count(root).await > 0, "A should be dirty");
+
+        // Switch to branch B via the helper. A's tracked edit is stashed (tagged
+        // nasllm:<A>); the ignored node_modules/x.txt stays in place.
+        let branch_b = "agent/b-chat";
+        let r = ensure_folder_on_branch(data_dir, root, "test/stash", branch_b, "").await;
+        assert!(r.is_ok(), "switch to B failed: {:?}", r.err());
+        assert_eq!(git_branch(root).await, branch_b);
+        // B is clean of A's tracked edit.
+        assert_eq!(std::fs::read_to_string(root.join("f.txt")).unwrap(), "a\nb\n");
+        // The ignored file persists (not stashed by -u).
+        assert!(root.join("node_modules/x.txt").exists(), "ignored file was stashed");
+        // B should be clean (node_modules is ignored by the committed .gitignore).
+        assert_eq!(git_dirty_count(root).await, 0, "B should be clean");
+        // A's stash is parked under the nasllm:<A> tag.
+        let tagged = git_stash_list_tagged(root).await;
+        assert!(tagged.iter().any(|s| s == &format!("nasllm:{branch_a}")), "A's stash not found: {tagged:?}");
+
+        // Switch back to A. The helper pops the stash tagged nasllm:<A>,
+        // restoring A's tracked edit.
+        let r = ensure_folder_on_branch(data_dir, root, "test/stash", &branch_a, "").await;
+        assert!(r.is_ok(), "switch back to A failed: {:?}", r.err());
+        assert_eq!(git_branch(root).await, branch_a);
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "a\nb\nDIRTY\n",
+            "A's tracked edit should be restored by the stash pop"
+        );
+        // The ignored file still persists.
+        assert!(root.join("node_modules/x.txt").exists(), "ignored file should still persist");
+        // The stash was consumed by the clean pop.
+        let tagged = git_stash_list_tagged(root).await;
+        assert!(!tagged.iter().any(|s| s == &format!("nasllm:{branch_a}")), "A's stash should be popped: {tagged:?}");
     }
 }
 
