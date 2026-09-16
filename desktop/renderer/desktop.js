@@ -2822,9 +2822,9 @@ function openSessionPanel(repoName) {
 function openChangesPanel() {
   const panel = $("dsDrawerPanel_changes"); if (!panel) return;
   if (!panel.firstChild) {
-    const seg = el("div", "ds-changes-seg");
-    const bSess = el("button", "ds-seg-btn active", "This chat");
-    const bAll = el("button", "ds-seg-btn", "All workspaces");
+    const seg = el("div", "ds-tabs"); seg.id = "dsChangesViewTabs";
+    const bSess = el("button", "ds-tab active", "This chat");
+    const bAll = el("button", "ds-tab", "All workspaces");
     seg.appendChild(bSess); seg.appendChild(bAll);
     panel.appendChild(seg);
     const sessWrap = el("div"); sessWrap.id = "dsChangesSession";
@@ -2836,7 +2836,7 @@ function openChangesPanel() {
     bSess.onclick = () => { _dsChangesView = "session"; bSess.classList.add("active"); bAll.classList.remove("active"); sessWrap.style.display = ""; allWrap.style.display = "none"; renderSessionView(); };
     bAll.onclick = () => { _dsChangesView = "all"; bAll.classList.add("active"); bSess.classList.remove("active"); sessWrap.style.display = "none"; allWrap.style.display = ""; refreshWorkingChanges(); };
   }
-  const seg = panel.querySelector(".ds-changes-seg");
+  const seg = $("dsChangesViewTabs");
   const bSess = seg && seg.children[0], bAll = seg && seg.children[1];
   const sessWrap = $("dsChangesSession"), allWrap = $("dsChangesAll");
   if (_dsChangesView === "all") {

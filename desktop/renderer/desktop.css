@@ -591,13 +591,63 @@ body.ds-drawer-resizing { user-select: none; cursor: col-resize; }
 /* The Models tab's own close affordance is the drawer X; hide the inner #closeModels
    to avoid a confusing second close that only toggles the hosted modal. */
 .ds-drawer-panel > #modelsModal #closeModels { display: none; }
+/* Models tab: present the hosted modal's content as section cards + unified
+   underline tabs so the Models tab matches the other drawer tabs. Scoped to
+   the drawer's hosted #modelsModal so the web UI's standalone modal is unchanged. */
+/* Installed / Get-more-models sub-tabs → underline style (matches .ds-drawer-tab). */
+.ds-drawer-panel > #modelsModal .modal-tabs { border-bottom: 1px solid var(--border); padding: 0; }
+.ds-drawer-panel > #modelsModal .modal-tab {
+  background: transparent; border: 0; border-radius: 0; height: auto;
+  color: var(--muted); padding: 9px 12px 10px; font-size: 13px; cursor: pointer;
+  white-space: nowrap; transition: color .12s, box-shadow .12s;
+}
+.ds-drawer-panel > #modelsModal .modal-tab:hover { color: var(--text); }
+.ds-drawer-panel > #modelsModal .modal-tab.active { color: var(--text); box-shadow: inset 0 -2px 0 0 var(--accent); }
+/* Current-model banner → a bordered dark summary card (title + description). */
+.ds-drawer-panel > #modelsModal .model-banner {
+  border: 1px solid var(--border); border-radius: 10px; background: #1a1d24;
+  padding: 10px 14px; margin: 14px 0 0;
+}
+.ds-drawer-panel > #modelsModal .model-banner.empty { background: transparent; }
+/* Installed model groups (NAS/Mac) → section cards (head = label, body = rows). */
+.ds-drawer-panel > #modelsModal .model-group {
+  border: 1px solid var(--border); border-radius: 10px; overflow: hidden; margin-top: 14px;
+}
+.ds-drawer-panel > #modelsModal .model-group .model-group-label {
+  margin: 0; padding: 10px 14px; background: #1a1d24; border-bottom: 1px solid var(--border);
+  font-size: 13px; font-weight: 600; color: #e6e6e6; text-transform: none; letter-spacing: 0;
+}
+.ds-drawer-panel > #modelsModal .model-group-body { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; }
+/* Local (this computer) block → section card (row head = label + Connect, body = rows/hint). */
+.ds-drawer-panel > #modelsModal .local-section {
+  display: block; gap: 0;
+  border: 1px solid var(--border); border-radius: 10px; overflow: hidden; margin-top: 14px;
+  padding: 0; background: transparent;
+}
+.ds-drawer-panel > #modelsModal .local-head { padding: 10px 14px; background: #1a1d24; border-bottom: 1px solid var(--border); }
+.ds-drawer-panel > #modelsModal .local-label { font-size: 13px; font-weight: 600; color: #e6e6e6; }
+.ds-drawer-panel > #modelsModal .local-section-body { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; }
+/* Bottom CTA + first section spacing inside the section flow. */
+.ds-drawer-panel > #modelsModal .get-more-cta { margin-top: 14px; }
+.ds-drawer-panel > #modelsModal #tabBody > :first-child { margin-top: 0; }
+/* Browse: unify the Recommended/All toggle to underline tabs. The catalog cards
+   (.mcard) already carry borders, so they read as bordered content blocks. */
+.ds-drawer-panel > #modelsModal .browse-seg { border: 0; border-bottom: 1px solid var(--border); border-radius: 0; padding: 0; margin: 14px 0 0; }
+.ds-drawer-panel > #modelsModal .browse-seg .seg-btn {
+  flex: none; background: transparent; border: 0; border-radius: 0; height: auto;
+  padding: 9px 12px 10px; color: var(--muted); font-size: 13px; cursor: pointer;
+  transition: color .12s, box-shadow .12s;
+}
+.ds-drawer-panel > #modelsModal .browse-seg .seg-btn:hover:not(.active) { color: var(--text); }
+.ds-drawer-panel > #modelsModal .browse-seg .seg-btn.active { color: var(--text); box-shadow: inset 0 -2px 0 0 var(--accent); }
+.ds-drawer-panel > #modelsModal .browse-controls { margin-top: 14px; }
+.ds-drawer-panel > #modelsModal .browse-list { margin-top: 14px; }
 
-/* Changes tab view toggle (This chat / All workspaces). Scoped to .ds-changes-seg
-   so it never collides with the www Models browse .seg-btn, which lives elsewhere. */
-.ds-changes-seg { display: flex; gap: 4px; border: 1px solid #2a2e37; border-radius: 8px; padding: 3px; margin-bottom: 14px; }
-.ds-changes-seg .ds-seg-btn { flex: 1; background: transparent; border: none; border-radius: 6px; height: 30px; padding: 0 12px; color: #8b909a; font-size: 13px; cursor: pointer; }
-.ds-changes-seg .ds-seg-btn:hover:not(.active) { background: #1b1f27; color: #e6e6e6; }
-.ds-changes-seg .ds-seg-btn.active { background: #1a2436; color: #8ab4f8; }
+/* Changes tab view toggle (This chat / All workspaces) uses the shared .ds-tabs /
+   .ds-tab underline style (same as the session sub-tabs and Models sub-tabs), so
+   every tab strip in the drawer matches. It's a direct child of the Changes panel,
+   so it gets a bottom margin; the nested session sub-tabs sit in a section body. */
+#dsDrawerPanel_changes > .ds-tabs { margin-bottom: 14px; }
 
 /* Persistent header changes button (dirty-file count badge). */
 .ds-changes-btn .ds-badge { background: #3b221f; color: #e87060; }
