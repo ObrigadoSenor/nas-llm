@@ -2501,36 +2501,40 @@ function flashDsOk(msg) {
 
 function buildReposOverlay() {
   if ($("dsReposOverlay")) return;
-  // The GitHub card lives inside the drawer's GitHub panel (built once).
+  // The GitHub card lives inside the drawer's GitHub panel (built once). The
+  // connect and repo-list groups are each a .ds-settings-section so the GitHub
+  // tab reads the same as the Settings tab's grouped sections. Element IDs are
+  // preserved so refreshGithub and the search filter keep working.
   const panel = $("dsDrawerPanel_github");
   if (!panel) return; // drawer not built yet (boot builds the drawer first)
   const card = el("div", "ds-card ds-card-wide");
   card.id = "dsReposOverlay";
-  // GitHub connect
-  const connectWrap = el("div", null); connectWrap.id = "dsGhConnect";
-  connectWrap.appendChild(el("div", "ds-label", "GitHub"));
-  connectWrap.appendChild(el("div", "ds-note", "Paste a Personal Access Token (with repo read). It is stored in the macOS Keychain, never on disk or sent to the NAS."));
+  // GitHub connect section
+  const connect = settingsSection("GitHub", "Connect with a Personal Access Token (repo read). Stored in the macOS Keychain — never on disk or sent to the NAS.");
+  connect.sec.id = "dsGhConnect";
   const tokRow = el("div", "ds-row");
   const tokInput = document.createElement("input");
   tokInput.id = "dsGhToken"; tokInput.type = "password"; tokInput.placeholder = "ghp_…";
   const connectBtn = el("button", "ds-btn", "Connect");
   tokRow.appendChild(tokInput); tokRow.appendChild(connectBtn);
-  connectWrap.appendChild(tokRow);
+  connect.body.appendChild(tokRow);
   const ghStatus = el("div", "ds-note"); ghStatus.id = "dsGhStatus";
-  connectWrap.appendChild(ghStatus);
-  card.appendChild(connectWrap);
-  // GitHub repo list
-  const listWrap = el("div", "hidden"); listWrap.id = "dsGhList";
-  const ghHead = el("div", "ds-label", "Your GitHub repos");
+  connect.body.appendChild(ghStatus);
+  card.appendChild(connect.sec);
+  // GitHub repo list section (hidden until connected)
+  const list = el("div", "ds-settings-section hidden");
+  list.id = "dsGhList";
+  const lHead = el("div", "ds-settings-section-head row");
+  lHead.appendChild(el("div", "ds-settings-section-title", "Your GitHub repos"));
   const discBtn = el("button", "ds-btn ds-btn-ghost ds-btn-sm", "Disconnect");
-  ghHead.appendChild(discBtn);
-  listWrap.appendChild(ghHead);
-  // Search filter
+  lHead.appendChild(discBtn);
+  list.appendChild(lHead);
+  const lBody = el("div", "ds-settings-section-body");
   const searchRow = el("div", "ds-row");
   const searchInput = document.createElement("input");
   searchInput.id = "dsGhSearch"; searchInput.type = "search"; searchInput.placeholder = "Filter repos…";
   searchRow.appendChild(searchInput);
-  listWrap.appendChild(searchRow);
+  lBody.appendChild(searchRow);
   searchInput.addEventListener("input", () => {
     const q = searchInput.value.trim().toLowerCase();
     const body = $("dsGhBody"); if (!body) return;
@@ -2540,8 +2544,9 @@ function buildReposOverlay() {
     filtered.forEach(r => body.appendChild(ghRow(r)));
   });
   const ghBody = el("div", null); ghBody.id = "dsGhBody";
-  listWrap.appendChild(ghBody);
-  card.appendChild(listWrap);
+  lBody.appendChild(ghBody);
+  list.appendChild(lBody);
+  card.appendChild(list);
   panel.appendChild(card);
   connectBtn.onclick = async () => {
     const token = tokInput.value.trim();

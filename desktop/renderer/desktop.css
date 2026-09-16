@@ -226,12 +226,14 @@
 }
 
 /* --- Working changes panel (Phase 5: review/undo) --- */
+/* Working-changes + My Work sections share the .ds-settings-section shell
+   (same border, radius, header bar) so every drawer tab's sections match. */
 .ds-changes-section {
-  margin-bottom: 18px; border: 1px solid #2a2e37; border-radius: 8px; overflow: hidden;
+  margin-bottom: 14px; border: 1px solid #2a2e37; border-radius: 10px; overflow: hidden;
 }
 .ds-changes-head {
   display: flex; align-items: center; gap: 10px;
-  padding: 8px 12px; background: #1a1d24; border-bottom: 1px solid #2a2e37;
+  padding: 10px 14px; background: #1a1d24; border-bottom: 1px solid #2a2e37;
 }
 .ds-changes-name { flex: 1; font-size: 13px; font-weight: 600; color: #e6e6e6; }
 
@@ -642,6 +644,10 @@ body.ds-drawer-resizing { user-select: none; cursor: col-resize; }
   display: flex; flex-direction: column; gap: 2px;
   padding: 10px 14px; background: #1a1d24; border-bottom: 1px solid #2a2e37;
 }
+/* Row-variant head: title + inline action button (e.g. GitHub repos +
+   Disconnect), mirroring .ds-changes-head on the canonical section shell. */
+.ds-settings-section-head.row { flex-direction: row; align-items: center; justify-content: space-between; gap: 10px; }
+.ds-settings-section-head.row .ds-settings-section-title { flex: 1; min-width: 0; }
 .ds-settings-section-title { font-size: 13px; font-weight: 600; color: #e6e6e6; }
 .ds-settings-section-sub { font-size: 11px; color: #6b707a; line-height: 1.4; }
 .ds-settings-section-body { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; }
