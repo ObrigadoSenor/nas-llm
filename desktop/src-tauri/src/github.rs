@@ -2513,12 +2513,13 @@ fn is_ignored(rel: &str, files: &HashSet<String>, dirs: &HashSet<String>) -> boo
 }
 
 async fn exec_read_file(root: &Path, args: &str) -> ExecResult {
-    let p = match serde_json::from_str::<serde_json::Value>(args) {
-        Ok(v) => v.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string(),
+    let v = match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(v) => v,
         Err(_) => return ExecResult { observation: "Invalid args for read_file.".into(), preview: "bad args".into(), is_error: true,
             ..Default::default()
         },
     };
+    let p = v.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
     if p.is_empty() {
         return ExecResult { observation: "No path provided.".into(), preview: "no path".into(), is_error: true,
             ..Default::default()
@@ -2541,10 +2542,38 @@ async fn exec_read_file(root: &Path, args: &str) -> ExecResult {
             ..Default::default()
         };
     }
-    match std::fs::read_to_string(&path) {
-        Ok(content) => ExecResult { observation: cap(&content), preview: format!("read {} ({} bytes)", p, content.len()), is_error: false, ..Default::default() },
-        Err(e) => ExecResult { observation: format!("Could not read {p}: {e}"), preview: format!("read error: {p}"), is_error: true, ..Default::default() },
-    }
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => return ExecResult { observation: format!("Could not read {p}: {e}"), preview: format!("read error: {p}"), is_error: true, ..Default::default() },
+    };
+    // Optional line range: start/end are 1-indexed, inclusive. When both are
+    // present, return only the requested lines (with line-number prefixes so
+    // the model can reference them). This lets the agent read a slice of a
+    // large file instead of getting a silently truncated whole-file observation.
+    let start = v.get("start").and_then(|s| s.as_u64()).map(|s| s as usize);
+    let end = v.get("end").and_then(|e| e.as_u64()).map(|e| e as usize);
+    let (observation, preview) = if let (Some(start), Some(end)) = (start, end) {
+        if start == 0 || end < start {
+            return ExecResult {
+                observation: format!("Invalid line range: start={start}, end={end}. Lines are 1-indexed and end must be >= start."),
+                preview: "bad range".into(),
+                is_error: true,
+                ..Default::default()
+            };
+        }
+        let lines: Vec<&str> = content.lines().collect();
+        let total = lines.len();
+        let lo = (start - 1).min(total);
+        let hi = end.min(total);
+        let mut out = String::new();
+        for i in lo..hi {
+            out.push_str(&format!("{}| {}\n", i + 1, lines[i]));
+        }
+        (cap(&out), format!("read {p} lines {}-{} of {}", lo + 1, hi, total))
+    } else {
+        (cap(&content), format!("read {p} ({} bytes)", content.len()))
+    };
+    ExecResult { observation, preview, is_error: false, ..Default::default() }
 }
 
 async fn exec_list_files(root: &Path, args: &str) -> ExecResult {
