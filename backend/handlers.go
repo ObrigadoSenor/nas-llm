@@ -461,6 +461,10 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		// emit OpenAI tool_calls. The backend trusts it only for local
 		// (browser-relay) models; server models are re-checked via /api/show.
 		SupportsTools bool `json:"supportsTools"`
+		// AgentTier is the frontend's capability tier for a local (relay) model
+		// ("strong"/"medium"/"weak"). Empty → medium. The backend trusts it only
+		// for local models; server models are re-resolved from the catalog.
+		AgentTier string `json:"agentTier"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, "invalid request", http.StatusBadRequest)
@@ -505,6 +509,7 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	j := newJob(convID, email, body.Model, body.WebSearch, body.Clarify, body.Agent)
 	j.local = body.Local
 	j.supportsTools = body.SupportsTools
+	j.feTier = parseAgentTier(body.AgentTier)
 	j.hub = s.hub
 	// needsBrowser marks a job as connection-bound: local (browser-relay)
 	// inference relays through the browser by definition, and a repo-bound or
@@ -606,6 +611,7 @@ func (s *server) handleResume(w http.ResponseWriter, r *http.Request) {
 	j := newJob(convID, email, cp.Model, false, false, true) // agent=true, resume
 	j.local = cp.Local
 	j.supportsTools = cp.SupportsTools
+	j.feTier = cp.Tier
 	j.hub = s.hub
 	j.resuming = true
 	j.resumeNote = body.Note

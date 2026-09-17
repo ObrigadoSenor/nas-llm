@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1283,4 +1284,87 @@ func (s *server) supportsTools(model string, local, feSaysTools bool) bool {
 		return slicesContains(e.Capabilities, "tools")
 	}
 	return true
+}
+
+// --- Agent capability tier (scales guardrails by model strength) -----------
+
+// agentTier classifies a model's ability to drive the multi-step agent loop
+// reliably. The tier scales the harness's guardrails: strong models (≥7B
+// tool-capable) get a lean prompt and skip the narration/prose-recovery
+// guardrails (they emit structured tool calls reliably); weak models (<3B
+// tool-capable or completion-only) keep the full small-model safety net;
+// medium (3–7B tool-capable, or the default for unknown models) matches the
+// pre-tier behavior so nothing changes for models the backend can't classify.
+type agentTier string
+
+const (
+	tierWeak   agentTier = "weak"
+	tierMedium agentTier = "medium"
+	tierStrong agentTier = "strong"
+)
+
+// parseAgentTier maps a frontend-supplied tier string to an agentTier. Empty
+// or unrecognized → tierMedium (the safe default that matches pre-tier
+// behavior, so a frontend that doesn't send a tier is unchanged).
+func parseAgentTier(s string) agentTier {
+	switch agentTier(strings.ToLower(strings.TrimSpace(s))) {
+	case tierStrong:
+		return tierStrong
+	case tierWeak:
+		return tierWeak
+	default:
+		return tierMedium
+	}
+}
+
+// parseParamsGB parses a model's Params string (e.g. "1.7B", "7.6B", "14B")
+// into a float of billions. Returns 0 on parse failure.
+func parseParamsGB(s string) float64 {
+	s = strings.TrimSuffix(s, "B")
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+// resolveAgentTier determines the capability tier for a model, paralleling
+// supportsTools' resolution path.
+//
+//   - Local (browser-relay) models: the backend cannot introspect the
+//     visitor's Ollama, so it trusts the frontend-supplied tier (feTier),
+//     defaulting to medium when absent.
+//   - Server models: derive from the curated catalog's Params/Capabilities.
+//     Fall back to /api/show, then to medium (never weak, so a capable model
+//     the backend can't classify isn't over-guarded).
+func (s *server) resolveAgentTier(model string, local bool, feTier agentTier) agentTier {
+	if local {
+		if feTier == "" {
+			return tierMedium
+		}
+		return feTier
+	}
+	if e := catalogEntryByName(model); e != nil {
+		if !slicesContains(e.Capabilities, "tools") {
+			return tierWeak
+		}
+		params := parseParamsGB(e.Params)
+		switch {
+		case params >= 7:
+			return tierStrong
+		case params >= 3:
+			return tierMedium
+		default:
+			return tierWeak
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if caps, ok := s.showCapabilities(ctx, model); ok {
+		if slicesContains(caps, "tools") {
+			return tierMedium
+		}
+		return tierWeak
+	}
+	return tierMedium
 }

@@ -219,6 +219,7 @@ CREATE TABLE IF NOT EXISTS agent_checkpoints (
 	model TEXT NOT NULL,
 	local INTEGER NOT NULL DEFAULT 0,
 	supports_tools INTEGER NOT NULL DEFAULT 0,
+	tier TEXT NOT NULL DEFAULT '',
 	created_at INTEGER NOT NULL,
 	UNIQUE(email, conversation_id)
 );
@@ -424,6 +425,17 @@ func migrate(db *sql.DB) error {
 	}
 	if !repoCols["name"] {
 		if _, err := db.Exec(`ALTER TABLE repos ADD COLUMN name TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	// agent_checkpoints: tier (capability tier for resume). No-op for fresh
+	// installs (the schema above already includes it).
+	cpCols, err := tableColumns(db, "agent_checkpoints")
+	if err != nil {
+		return err
+	}
+	if !cpCols["tier"] {
+		if _, err := db.Exec(`ALTER TABLE agent_checkpoints ADD COLUMN tier TEXT NOT NULL DEFAULT ''`); err != nil {
 			return err
 		}
 	}
@@ -921,6 +933,7 @@ type agentCheckpoint struct {
 	Model         string
 	Local         bool
 	SupportsTools bool
+	Tier          agentTier
 	CreatedAt     int64
 }
 
@@ -938,12 +951,12 @@ func (s *store) saveCheckpoint(cp agentCheckpoint) error {
 	if cp.SupportsTools {
 		st = 1
 	}
-	_, err = s.db.Exec(`INSERT INTO agent_checkpoints(conversation_id, email, job_id, step, transcript, model, local, supports_tools, created_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+	_, err = s.db.Exec(`INSERT INTO agent_checkpoints(conversation_id, email, job_id, step, transcript, model, local, supports_tools, tier, created_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(email, conversation_id) DO UPDATE SET job_id=excluded.job_id, step=excluded.step,
 			transcript=excluded.transcript, model=excluded.model, local=excluded.local,
-			supports_tools=excluded.supports_tools, created_at=excluded.created_at`,
-		cp.ConvID, cp.Email, cp.JobID, cp.Step, string(transcript), cp.Model, local, st, cp.CreatedAt)
+			supports_tools=excluded.supports_tools, tier=excluded.tier, created_at=excluded.created_at`,
+		cp.ConvID, cp.Email, cp.JobID, cp.Step, string(transcript), cp.Model, local, st, string(cp.Tier), cp.CreatedAt)
 	return err
 }
 
@@ -953,9 +966,10 @@ func (s *store) loadCheckpoint(email, convID string) (*agentCheckpoint, error) {
 	var cp agentCheckpoint
 	var transcriptJSON string
 	var local, st int
-	err := s.db.QueryRow(`SELECT job_id, conversation_id, email, step, transcript, model, local, supports_tools, created_at
+	var tier string
+	err := s.db.QueryRow(`SELECT job_id, conversation_id, email, step, transcript, model, local, supports_tools, tier, created_at
 		FROM agent_checkpoints WHERE email = ? AND conversation_id = ?`, email, convID).
-		Scan(&cp.JobID, &cp.ConvID, &cp.Email, &cp.Step, &transcriptJSON, &cp.Model, &local, &st, &cp.CreatedAt)
+		Scan(&cp.JobID, &cp.ConvID, &cp.Email, &cp.Step, &transcriptJSON, &cp.Model, &local, &st, &tier, &cp.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -967,6 +981,7 @@ func (s *store) loadCheckpoint(email, convID string) (*agentCheckpoint, error) {
 	}
 	cp.Local = local != 0
 	cp.SupportsTools = st != 0
+	cp.Tier = agentTier(tier)
 	return &cp, nil
 }
 

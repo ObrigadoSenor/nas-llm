@@ -307,7 +307,7 @@ func TestAgentNarrationGuard(t *testing.T) {
 		err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
 			func(string) {}, func(p string) { phases = append(phases, p) },
 			func(st agentStep) { steps = append(steps, st) }, func(clarifyMeta) {},
-			func(s string) { thoughts = append(thoughts, s) }, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0)
+			func(s string) { thoughts = append(thoughts, s) }, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0, tierWeak)
 		if err != nil {
 			t.Fatalf("runAgentLoop: %v", err)
 		}
@@ -352,7 +352,7 @@ func TestAgentNarrationGuard(t *testing.T) {
 		var steps []agentStep
 		err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
 			func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
-			func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0)
+			func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0, tierWeak)
 		if err != nil {
 			t.Fatalf("runAgentLoop: %v", err)
 		}
@@ -384,7 +384,7 @@ func TestAgentNarrationGuard(t *testing.T) {
 		)
 		err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
 			func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
-			func(clarifyMeta) {}, func(s string) { thoughts = append(thoughts, s) }, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0)
+			func(clarifyMeta) {}, func(s string) { thoughts = append(thoughts, s) }, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0, tierWeak)
 		if err != nil {
 			t.Fatalf("runAgentLoop: %v", err)
 		}
@@ -479,7 +479,7 @@ func TestAgentProseToolCallRecovery(t *testing.T) {
 		)
 		err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
 			func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
-			func(clarifyMeta) {}, func(s string) { thoughts = append(thoughts, s) }, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0)
+			func(clarifyMeta) {}, func(s string) { thoughts = append(thoughts, s) }, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0, tierWeak)
 		if err != nil {
 			t.Fatalf("runAgentLoop: %v", err)
 		}
@@ -530,7 +530,7 @@ func TestAgentProseToolCallRecovery(t *testing.T) {
 		var steps []agentStep
 		err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
 			func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
-			func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0)
+			func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0, tierWeak)
 		if err != nil {
 			t.Fatalf("runAgentLoop: %v", err)
 		}
@@ -586,7 +586,7 @@ func TestAgentAwaitingToolResultFallback(t *testing.T) {
 			func(s string) { thoughts = append(thoughts, s) },
 			func() {},
 			func(int, int) {},
-			"", nil, nil, nil, 0, 0)
+			"", nil, nil, nil, 0, 0, tierWeak)
 		if err != nil {
 			t.Fatalf("runAgentLoop: %v", err)
 		}
@@ -645,7 +645,7 @@ func TestAgentAwaitingToolResultFallback(t *testing.T) {
 			func(string) {}, func(string) {},
 			func(st agentStep) { steps = append(steps, st) },
 			func(c clarifyMeta) { questions = append(questions, c) },
-			func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0)
+			func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0, tierWeak)
 		if err != nil {
 			t.Fatalf("runAgentLoop: %v", err)
 		}
@@ -906,7 +906,7 @@ func TestAgentBudgetWarning80Percent(t *testing.T) {
 	var steps []agentStep
 	err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
 		func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
-		func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0)
+		func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0, tierWeak)
 	if err != nil {
 		t.Fatalf("runAgentLoop: %v", err)
 	}
@@ -971,7 +971,7 @@ func TestAgentNarrationRetryDoesNotConsumeStep(t *testing.T) {
 	var steps []agentStep
 	err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
 		func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
-		func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0)
+		func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0, tierWeak)
 	if err != nil {
 		t.Fatalf("runAgentLoop: %v", err)
 	}
@@ -1063,7 +1063,7 @@ func TestAgentPauseReturnsCheckpoint(t *testing.T) {
 	err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
 		func(string) {}, func(string) {}, func(st agentStep) {},
 		func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {},
-		"", nil, pauseRequested, nil, 0, 0)
+		"", nil, pauseRequested, nil, 0, 0, tierWeak)
 	if !errors.Is(err, errAgentPaused) {
 		t.Fatalf("err = %v, want errAgentPaused", err)
 	}
@@ -1313,7 +1313,7 @@ func TestAgentProseToolCallRecoveryAliasedKeys(t *testing.T) {
 	var steps []agentStep
 	err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
 		func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
-		func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0)
+		func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0, tierWeak)
 	if err != nil {
 		t.Fatalf("runAgentLoop: %v", err)
 	}
@@ -1361,7 +1361,7 @@ func TestAgentFormatHintFiresOnNarrationOnly(t *testing.T) {
 	var steps []agentStep
 	err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
 		func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
-		func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0)
+		func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0, tierWeak)
 	if err != nil {
 		t.Fatalf("runAgentLoop: %v", err)
 	}
@@ -1406,7 +1406,7 @@ func TestAgentProseClarifyBridge(t *testing.T) {
 	err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"ask_user", "get_time"}, "",
 		func(string) {}, func(p string) { phases = append(phases, p) },
 		func(st agentStep) { steps = append(steps, st) }, func(c clarifyMeta) { questions = append(questions, c) },
-		func(s string) { thoughts = append(thoughts, s) }, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 3)
+		func(s string) { thoughts = append(thoughts, s) }, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 3, tierWeak)
 	if err != nil {
 		t.Fatalf("runAgentLoop: %v", err)
 	}
@@ -1459,11 +1459,259 @@ func TestAgentProseClarifyBridge_BudgetExhausted(t *testing.T) {
 	var questions []clarifyMeta
 	err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"ask_user", "get_time"}, "",
 		func(string) {}, func(string) {}, func(agentStep) {}, func(c clarifyMeta) { questions = append(questions, c) },
-		func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0)
+		func(string) {}, func() {}, func(int, int) {}, "", nil, nil, nil, 0, 0, tierWeak)
 	if err != nil {
 		t.Fatalf("runAgentLoop: %v", err)
 	}
 	if len(questions) != 0 {
 		t.Errorf("questions = %+v, want none (clarifyBudget=0 gates the bridge off)", questions)
+	}
+}
+
+// TestParseAgentTier verifies the frontend tier string is mapped correctly,
+// with empty/unrecognized → medium (the safe default that matches pre-tier
+// behavior).
+func TestParseAgentTier(t *testing.T) {
+	cases := []struct {
+		in   string
+		want agentTier
+	}{
+		{"strong", tierStrong},
+		{"STRONG", tierStrong},
+		{"  strong  ", tierStrong},
+		{"medium", tierMedium},
+		{"weak", tierWeak},
+		{"", tierMedium},
+		{"unknown", tierMedium},
+	}
+	for _, c := range cases {
+		if got := parseAgentTier(c.in); got != c.want {
+			t.Errorf("parseAgentTier(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestParseParamsGB verifies the Params string parser handles the formats used
+// in the curated catalog.
+func TestParseParamsGB(t *testing.T) {
+	cases := []struct {
+		in   string
+		want float64
+	}{
+		{"1B", 1},
+		{"1.7B", 1.7},
+		{"3B", 3},
+		{"3.8B", 3.8},
+		{"7.6B", 7.6},
+		{"14B", 14},
+		{"", 0},
+		{"xyz", 0},
+	}
+	for _, c := range cases {
+		if got := parseParamsGB(c.in); got != c.want {
+			t.Errorf("parseParamsGB(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+// TestResolveAgentTier verifies the tier resolver derives the right tier from
+// the curated catalog's Params/Capabilities for server models, and trusts the
+// frontend tier for local models.
+func TestResolveAgentTier(t *testing.T) {
+	st, err := newStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	defer st.close()
+	srv := &server{cfg: config{contextLength: 8192}, store: st}
+
+	// Local models: trust feTier, default medium when empty.
+	if got := srv.resolveAgentTier("local:1b", true, ""); got != tierMedium {
+		t.Errorf("local empty feTier: got %q, want medium", got)
+	}
+	if got := srv.resolveAgentTier("local:1b", true, tierStrong); got != tierStrong {
+		t.Errorf("local strong feTier: got %q, want strong", got)
+	}
+
+	// Server models: derive from the curated catalog.
+	catalogCases := []struct {
+		model string
+		want  agentTier
+	}{
+		{"qwen3:1.7b", tierWeak},         // tools-capable, 1.7B
+		{"qwen2.5:3b", tierMedium},       // tools-capable, 3B
+		{"qwen2.5-coder:3b", tierMedium}, // tools-capable, 3B
+		{"llama3.1:8b", tierStrong},      // tools-capable, 8B
+		{"qwen3:8b", tierStrong},         // tools-capable, 8B
+		{"qwen2.5:14b", tierStrong},      // tools-capable, 14B
+		{"llama3.2:3b", tierWeak},        // completion-only (no tools capability)
+		{"llama3.2:1b", tierWeak},        // completion-only
+	}
+	for _, c := range catalogCases {
+		if got := srv.resolveAgentTier(c.model, false, ""); got != c.want {
+			t.Errorf("resolveAgentTier(%q, false, \"\") = %q, want %q", c.model, got, c.want)
+		}
+	}
+}
+
+// TestAgentStrongTierSkipsNarrationGuard verifies that a strong-tier model
+// that narrates ("I'll edit foo.go…") is NOT re-prompted by the narration
+// guard — the narration is accepted as a genuine direct answer. Weak models
+// get the re-prompt (TestAgentNarrationGuard covers that path).
+func TestAgentStrongTierSkipsNarrationGuard(t *testing.T) {
+	const email = "user@example.com"
+	msgs := []oaiMessage{{Role: "user", Content: jsonString("Add a comment to foo.go")}}
+	st, err := newStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	defer st.close()
+	srv := &server{cfg: config{contextLength: 8192, maxAgentSteps: 6}, store: st}
+
+	mb := &fakeBackend{responses: []oaiMessage{
+		narrationMsg("I'll edit foo.go to add a comment."),
+	}}
+	var steps []agentStep
+	err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
+		func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
+		func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {},
+		"", nil, nil, nil, 0, 0, tierStrong)
+	if err != nil {
+		t.Fatalf("runAgentLoop: %v", err)
+	}
+	// Only 1 call: the narration was accepted as the final answer (no re-prompt).
+	if got := mb.callCount(); got != 1 {
+		t.Fatalf("model calls = %d, want 1 (strong tier accepts narration directly)", got)
+	}
+	// A (direct) step should be emitted (the model answered directly).
+	var direct bool
+	for _, s := range steps {
+		if s.Tool == "(direct)" {
+			direct = true
+		}
+		if s.Tool == "(format)" {
+			t.Errorf("(format) diagnostic emitted for strong tier; it should be skipped: %+v", s)
+		}
+	}
+	if !direct {
+		t.Errorf("no (direct) step; strong tier should accept the narration as a direct answer: steps = %+v", steps)
+	}
+}
+
+// TestAgentStrongTierBudgetDoubled verifies that a strong-tier run gets a
+// doubled step budget. With maxAgentSteps=5 and tierStrong, the effective
+// budget is 10 — so 6 tool-call rounds complete without hitting the budget
+// (under the original budget of 5, the 6th round would be forced to answer).
+func TestAgentStrongTierBudgetDoubled(t *testing.T) {
+	const email = "user@example.com"
+	msgs := []oaiMessage{{Role: "user", Content: jsonString("keep checking the time")}}
+	st, err := newStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	defer st.close()
+	srv := &server{cfg: config{contextLength: 8192, maxAgentSteps: 5}, store: st}
+
+	script := []oaiMessage{
+		toolCallMsg("c1", "get_time", "{}"),
+		toolCallMsg("c2", "get_time", "{}"),
+		toolCallMsg("c3", "get_time", "{}"),
+		toolCallMsg("c4", "get_time", "{}"),
+		toolCallMsg("c5", "get_time", "{}"),
+		toolCallMsg("c6", "get_time", "{}"),
+		finalAnswerMsg("done"),
+	}
+	mb := &fakeBackend{responses: script}
+	var steps []agentStep
+	err = srv.runAgentLoop(context.Background(), mb, "test-model", email, msgs, []string{"get_time"}, "",
+		func(string) {}, func(string) {}, func(st agentStep) { steps = append(steps, st) },
+		func(clarifyMeta) {}, func(string) {}, func() {}, func(int, int) {},
+		"", nil, nil, nil, 0, 0, tierStrong)
+	if err != nil {
+		t.Fatalf("runAgentLoop: %v", err)
+	}
+	// 7 calls: 6 tool calls + 1 final answer. Under tierWeak (budget=5),
+	// only 5 tool calls would run before the budget forces an answer (6 calls).
+	if got := mb.callCount(); got != 7 {
+		t.Fatalf("model calls = %d, want 7 (6 tool calls + 1 answer with doubled budget)", got)
+	}
+	for _, s := range steps {
+		if s.Tool == "(budget)" {
+			t.Errorf("(budget) step emitted; the model should have answered before the doubled budget: %+v", s)
+		}
+	}
+}
+
+// TestInjectRepoContextAgentsMdNudge verifies that the repo-context prompt
+// tells the agent to read AGENTS.md first when it is in the top-level tree, and
+// omits the nudge when it is not. This is the coding-vertical hardening that
+// makes the agent follow the project's own conventions without a database or
+// sidecar change — the agent uses its existing read_file tool.
+func TestInjectRepoContextAgentsMdNudge(t *testing.T) {
+	repoWith := &Repo{
+		FullName: "owner/repo",
+		Branch:   "main",
+		Tree:     []string{"AGENTS.md", "backend/", "www/"},
+	}
+	got := injectRepoContext("BASE", repoWith, "")
+	if !strings.Contains(got, "AGENTS.md") {
+		t.Errorf("prompt should mention AGENTS.md when it's in the tree: %q", got)
+	}
+	if !strings.Contains(got, "read it FIRST") {
+		t.Errorf("prompt should tell the agent to read AGENTS.md first: %q", got)
+	}
+
+	repoWithout := &Repo{
+		FullName: "owner/repo",
+		Branch:   "main",
+		Tree:     []string{"backend/", "www/"},
+	}
+	gotWithout := injectRepoContext("BASE", repoWithout, "")
+	if strings.Contains(gotWithout, "read it FIRST") {
+		t.Errorf("prompt should not mention AGENTS.md when it's not in the tree: %q", gotWithout)
+	}
+}
+
+// TestAgentPromptsMentionVerifyBeforeCommit verifies that both tier prompts
+// (weak/medium agentSystemNudge and strong agentSystemStrong) include the
+// verify-before-commit rule, so the agent runs the project's check/test command
+// before calling git_commit.
+func TestAgentPromptsMentionVerifyBeforeCommit(t *testing.T) {
+	if !strings.Contains(agentSystemNudge(), "Before committing, run the project's check") {
+		t.Errorf("agentSystemNudge should mention verify-before-commit")
+	}
+	if !strings.Contains(agentSystemStrong(), "Before committing, run the project's check") {
+		t.Errorf("agentSystemStrong should mention verify-before-commit")
+	}
+}
+
+// TestReadFileToolHasLineRangeParams verifies the read_file tool schema includes
+// optional start/end line-range parameters (1-indexed, inclusive) so the agent
+// can read a slice of a large file instead of getting a silently truncated
+// whole-file observation. The path param remains the only required one.
+func TestReadFileToolHasLineRangeParams(t *testing.T) {
+	tool := readFileTool()
+	props, ok := tool.Function.Parameters["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("readFileTool properties not a map")
+	}
+	if _, ok := props["start"]; !ok {
+		t.Errorf("readFileTool schema missing 'start' param")
+	}
+	if _, ok := props["end"]; !ok {
+		t.Errorf("readFileTool schema missing 'end' param")
+	}
+	req, _ := tool.Function.Parameters["required"].([]string)
+	if len(req) != 1 || req[0] != "path" {
+		t.Errorf("readFileTool required = %v, want [path] (start/end optional)", req)
+	}
+}
+
+// TestGitCommitToolMentionsVerify verifies the tightened git_commit description
+// tells the agent to run the project's check/test command before committing.
+func TestGitCommitToolMentionsVerify(t *testing.T) {
+	tool := gitCommitTool()
+	if !strings.Contains(tool.Function.Description, "check/test") {
+		t.Errorf("gitCommitTool description should mention verifying: %q", tool.Function.Description)
 	}
 }

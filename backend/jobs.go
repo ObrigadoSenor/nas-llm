@@ -93,7 +93,12 @@ type job struct {
 	// models, whose Ollama it cannot introspect; server models are re-checked
 	// via /api/show in supportsTools(). Drives the tool-capability guard below.
 	supportsTools bool
-	createdAt     int64
+	// feTier is the frontend-supplied capability tier (for local relay models
+	// whose Ollama the backend can't introspect). Empty → medium (the default).
+	// tier is the resolved tier, set once in runGeneration before the loop runs.
+	feTier    agentTier
+	tier      agentTier
+	createdAt int64
 
 	promptTokens     int // agent-mode: cumulative prompt tokens (observability)
 	completionTokens int // agent-mode: cumulative completion tokens (observability)
@@ -1266,7 +1271,7 @@ func (jm *jobManager) worker() {
 				_ = jm.store.saveCheckpoint(agentCheckpoint{
 					JobID: j.id, ConvID: j.convID, Email: j.email, Step: paused.step,
 					Transcript: paused.transcript, Model: j.model, Local: j.local,
-					SupportsTools: j.supportsTools, CreatedAt: ts,
+					SupportsTools: j.supportsTools, Tier: j.tier, CreatedAt: ts,
 				})
 			}
 			_ = jm.store.finalizeJob(j.id, "paused", "", ts)
@@ -1435,6 +1440,7 @@ func (s *server) runGeneration(j *job) error {
 	}
 
 	if j.agent {
+		j.tier = s.resolveAgentTier(j.model, j.local, j.feTier)
 		allow, sys := s.agentConfig(j)
 		repoID, _ := s.store.getConvRepoID(j.email, j.convID)
 		sshHosts, _ := s.store.listSSHHosts(j.email)
@@ -1582,7 +1588,7 @@ func (s *server) runGeneration(j *job) error {
 		if clarifyBudget < 0 {
 			clarifyBudget = 0
 		}
-		return s.runAgentLoop(ctx, mb, j.model, j.email, msgs, allow, sys, j.emitChunk, j.emitPhase, j.emitTool, j.emitQuestions, j.emitThought, j.emitClear, j.addUsage, repoID, toolExecRelay, j.isPauseRequested, j.setRoundCancel, resumeStep, clarifyBudget)
+		return s.runAgentLoop(ctx, mb, j.model, j.email, msgs, allow, sys, j.emitChunk, j.emitPhase, j.emitTool, j.emitQuestions, j.emitThought, j.emitClear, j.addUsage, repoID, toolExecRelay, j.isPauseRequested, j.setRoundCancel, resumeStep, clarifyBudget, j.tier)
 	}
 	if j.clarify {
 		// Cap back-to-back clarifying questions at MAX_CLARIFY_ROUNDS: once the
