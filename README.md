@@ -46,7 +46,14 @@ Chat UI: **`https://chat.selected.systems`** — a minimal streaming chat page (
 ├── backend/                Go service — owns every /api/* route
 │   ├── AGENTS.md           file-by-file map + the full /api/* route table
 │   ├── main.go             config struct, routes(), requireAuth
-│   ├── agent.go            agent mode: ReAct loop + tool registry
+│   ├── agent_loop.go       ReAct loop, tier-scaled guardrails, step budget
+│   ├── agent_tools.go      tool registry + single-source localToolDefs table
+│   ├── agent_prose.go      prose tool-call recovery + narration detectors
+│   ├── agent_compact.go    context compaction (summarize / truncate)
+│   ├── agent_eval.go       safe arithmetic evaluator (no eval/reflect)
+│   ├── agent_capture.go    opt-in per-round debug capture
+│   ├── agent_ssh.go        SSH tool schemas + host helpers
+│   ├── agent_prompt.go     system-prompt builders (tiered) + context injectors
 │   ├── jobs.go             background generation, job queue, SSE event hub
 │   ├── handlers.go         auth / conversation / folder / SSE handlers
 │   ├── models.go           model catalog, pulls, benchmarks
@@ -271,10 +278,10 @@ Env (`.env`, with safe defaults):
 
 The + menu has an **Agent** toggle (mutually exclusive with Web search and
 Clarify). When on, `/api/conversations/:id/generate` runs a general ReAct loop
-in the backend (`backend/agent.go`) over a small tool registry, instead of the
-single-purpose search/clarify loops. The agent can compose tools within one
-run — e.g. `web_search` then `calculator`, or `ask_user` then answer — which the
-mutually-exclusive toggles could not.
+in the backend (`agent_loop.go`) over a tool registry (`agent_tools.go`),
+instead of the single-purpose search/clarify loops. The agent can compose tools
+within one run — e.g. `web_search` then `calculator`, or `ask_user` then
+answer — which the mutually-exclusive toggles could not.
 
 Tools (each a schema + server-side executor):
 - **`web_search`** — the existing SearXNG meta-search (reused from `search.go`).
@@ -289,18 +296,20 @@ Tools (each a schema + server-side executor):
 - **`fetch_page`** — download a URL and read its text. **Off by default** (see
   guardrails below).
 
-Small-model guardrails (the N100/8 GB runs a 3B–8B model): a hard step budget
-(`MAX_AGENT_STEPS`, default 24; the model is warned at 80% of the budget to
-finish outstanding edits, and a narration re-prompt round does not consume a
-step), duplicate-(tool,args) detection that nudges the model to stop and answer,
-**error-as-observation** (a tool failure or a bad
-argument goes back to the model as an observation so it self-corrects instead of
-crashing the run), observation size capping, and **context compaction** (old tool
-results are truncated; when the transcript nears the context window, the oldest
-turns are summarized into one system message so a long multi-step run doesn't
-overflow 8–16k). Each run's tool-call trace (step, tool, args, result preview,
-duration) is streamed live to a steps drawer above the answer and persisted
-(`agent_steps` table + `jobs.prompt_tokens`/`completion_tokens` for analytics).
+Guardrails scale by **model capability** (see [Capability tier](#capability-tier)
+below). The N100/8 GB runs a 3B–8B model, so weak/medium models get the full
+small-model safety net: a hard step budget (`MAX_AGENT_STEPS`, default 24; the
+model is warned at 80% of the budget to finish outstanding edits, and a narration
+re-prompt round does not consume a step), duplicate-(tool,args) detection that
+nudges the model to stop and answer, **error-as-observation** (a tool failure or
+a bad argument goes back to the model as an observation so it self-corrects
+instead of crashing the run), observation size capping, and **context compaction**
+(old tool results are truncated; when the transcript nears the context window,
+the oldest turns are summarized into one system message — preserving which files
+were edited/created — so a long multi-step run doesn't overflow 8–16k). Each
+run's tool-call trace (step, tool, args, result preview, duration) is streamed
+live to a steps drawer above the answer and persisted (`agent_steps` table +
+`jobs.prompt_tokens`/`completion_tokens` for analytics).
 
 ### System prompt
 
@@ -314,10 +323,11 @@ The agent runs with a configurable system prompt, prepended as the first
    set from the UI or `PUT /api/agent/config`, read back with
    `GET /api/agent/config` (or `sqlite3 /data/nas-llm.db
    "SELECT value FROM settings WHERE key='agent_system'"`).
-3. **Built-in nudge** — when nothing is configured, `agentSystemNudge()` in
-   `backend/agent.go` supplies a lean default that injects today's date (so a
-   stale-cutoff model can reason about "today") and steers toward one or two
-   tool calls before answering.
+3. **Built-in nudge** — when nothing is configured, the tier selects the
+   built-in prompt in `agent_prompt.go`: `agentSystemNudge()` for weak/medium
+   models (injects today's date and steers toward a few tool calls), or
+   `agentSystemStrong()` for strong models (a leaner coding-agent prompt
+   without the small-model lecturing). See [Capability tier](#capability-tier).
 
 Configure it from the **Agent settings** entry at the bottom of the + menu
 (`/agent-settings` slash command): a system-prompt textarea (blank = the
@@ -329,7 +339,46 @@ is auto-appended to the prompt so the agent knows what it can recall.
 runs a bare streamed pass with no system message; Web search and Clarify use
 their own fixed, code-compiled nudges (`systemNudge()`, `clarifyNudgeText()`).
 A prompt saved in Agent settings never leaks into a normal chat turn. The
-resolution order and scope are pinned by `backend/agent_test.go`.
+resolution order and scope are pinned by `agent_test.go`.
+
+### Capability tier
+
+The agent's guardrails scale by model capability, so a capable 8B/14B model
+isn't taxed with the small-model safety net a 1.7B model needs. `resolveAgentTier`
+in `models.go` classifies each model run as one of three tiers:
+
+- **strong** — ≥7B tool-capable (e.g. `llama3.1:8b`, `qwen2.5:14b`). Gets a
+  lean prompt (`agentSystemStrong`), skips the narration guard / prose-recovery
+  / awaiting-fallback / `(format)` hint (strong models emit structured tool
+  calls reliably), gets a doubled step budget and a higher duplicate-call limit,
+  and is nudged to batch independent reads in one turn.
+- **medium** — 3–7B tool-capable (e.g. `qwen2.5:3b`), and the default for any
+  model the backend can't classify. Keeps the full guardrail suite.
+- **weak** — <3B tool-capable (e.g. `qwen3:1.7b`) or completion-only. Keeps
+  the full guardrail suite and the didactic `agentSystemNudge` prompt.
+
+Server models are classified from the curated catalog's `Params`/
+`Capabilities`; local (browser-relay) models trust a frontend-supplied
+`agentTier` field in the `/generate` request body (defaulting to medium when
+absent). The tier is persisted in the checkpoint for pause/resume.
+
+### Coding-agent conventions
+
+When the agent runs against a cloned repo (desktop sidecar), three nudges in
+the system prompt steer it toward the project's own conventions:
+
+- **Read `AGENTS.md` first.** If the repo's top-level tree contains
+  `AGENTS.md`, the prompt tells the agent to read it before editing — for
+  branch model, commit style, verification commands, and files to never touch.
+  A subdirectory's own `AGENTS.md` (e.g. `backend/AGENTS.md`) is called out
+  when an edit targets that path.
+- **Verify before committing.** Both tier prompts and the `git_commit` tool
+  description tell the agent to run the project's check/test command
+  (`make check`, `go test ./...`) and read any failures before committing.
+- **`read_file` line ranges.** `read_file` accepts optional `start`/`end`
+  (1-indexed, inclusive) to read a slice of a large file instead of getting a
+  silently truncated whole-file observation (the 4000-char cap). The sidecar
+  returns the range with line-number prefixes.
 
 ### Guardrails: `fetch_page` and the injection surface
 
