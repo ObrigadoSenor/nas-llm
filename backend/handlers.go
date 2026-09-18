@@ -1107,17 +1107,26 @@ func (s *server) handleAgentConfigPut(w http.ResponseWriter, r *http.Request) {
 
 // agentRunNeedsBrowser reports whether an agent run will relay local tools
 // through the browser and so is connection-bound: a repo-bound run (whose
-// localRepoTools are auto-appended) or a run whose effective allowlist contains
-// an ssh_* tool while the user has ≥1 configured SSH host. Used at job creation
-// (handleGenerate/handleResume) so the grace-period cancel only applies to runs
-// that actually need the browser; a server-model agent run with no local tools
-// stays detached and survives a disconnect.
+// localRepoTools are auto-appended), a run whose effective allowlist contains
+// a ui_* tool (the page itself executes those), or a run whose allowlist
+// contains an ssh_* tool while the user has ≥1 configured SSH host. Used at job
+// creation (handleGenerate/handleResume) so the grace-period cancel only
+// applies to runs that actually need the browser; a server-model agent run with
+// no local tools stays detached and survives a disconnect.
+//
+// This is why the ui_* tools are opt-in rather than in defaultAgentTools:
+// enabling one trades "survives the app closing" for UI awareness, and that is
+// the user's call to make.
 func (s *server) agentRunNeedsBrowser(email, convID, repoID string) bool {
 	if repoID != "" {
 		return true
 	}
+	allow := s.agentAllowlist(email, convID)
+	if containsAnyUITool(allow) {
+		return true
+	}
 	hosts, _ := s.store.listSSHHosts(email)
-	return len(hosts) > 0 && containsAnySSHTool(s.agentAllowlist(email, convID))
+	return len(hosts) > 0 && containsAnySSHTool(allow)
 }
 
 // --- SSH hosts (allowlist for the agent's ssh_* tools) ---------------------

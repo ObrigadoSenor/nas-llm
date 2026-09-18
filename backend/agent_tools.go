@@ -221,6 +221,13 @@ func (s *server) toolRegistry(email string) map[string]agentTool {
 	for _, d := range localToolDefs {
 		reg[d.Name] = agentTool{schema: d.Schema(), local: true}
 	}
+	// UI tools are local too, but the PAGE executes them (www/ui.js) rather
+	// than the desktop sidecar — see agent_ui.go. Registered unconditionally;
+	// they only reach the model when the user enables them in the allowlist
+	// (they are not in defaultAgentTools).
+	for _, d := range uiToolDefs {
+		reg[d.Name] = agentTool{schema: d.Schema(), local: true}
+	}
 	// SSH tools are local (the desktop sidecar runs them over ssh, using the
 	// user's ~/.ssh/config + keys) and opt-in: only registered when the user has
 	// ≥1 configured SSH host, with the host param as an enum of their aliases so
@@ -675,7 +682,9 @@ func localGitTools() []string {
 }
 
 // planWriteTools lists the write tools gated out during Plan mode (before the
-// plan is approved), derived from localToolDefs by filtering IsWrite tools.
+// plan is approved), derived from localToolDefs by filtering IsWrite tools,
+// plus the UI action tools (ui_click/ui_set_value): a plan-mode run may look
+// at the interface but not drive it until the plan is approved.
 // Used by jobs.go to filter the allowlist for a plan-mode run that hasn't been
 // approved yet.
 func planWriteTools() []string {
@@ -685,7 +694,7 @@ func planWriteTools() []string {
 			out = append(out, d.Name)
 		}
 	}
-	return out
+	return append(out, uiActionTools()...)
 }
 
 // localToolMetas is the UI-facing metadata for all local tools, derived from
@@ -695,6 +704,27 @@ func localToolMetas() []toolMeta {
 	out := make([]toolMeta, len(localToolDefs))
 	for i, d := range localToolDefs {
 		out[i] = toolMeta{Name: d.Name, Label: d.Label, Description: d.Desc}
+	}
+	return out
+}
+
+// filterRepoTools returns allow with every repo/workspace local tool removed
+// (the whole localToolDefs set, including the Tasks Pill tools). Used when no
+// workspace is bound but a toolExec relay exists anyway — a UI-only or SSH-only
+// run. Without it the model is offered read_file/run_command/todo_write whose
+// cue no executor can serve: the desktop sidecar errors on an empty repo, and
+// the plain browser UI (which only handles ui_*) never answers at all, stalling
+// the run until TOOL_EXEC_TIMEOUT. Filters in place, mirroring filterSSHTools.
+func filterRepoTools(allow []string) []string {
+	repoTool := make(map[string]bool, len(localToolDefs))
+	for _, d := range localToolDefs {
+		repoTool[d.Name] = true
+	}
+	out := allow[:0]
+	for _, t := range allow {
+		if !repoTool[t] {
+			out = append(out, t)
+		}
 	}
 	return out
 }
@@ -788,7 +818,9 @@ type toolMeta struct {
 // is included only when the server has it enabled (FETCH_PAGE_ENABLED); the ssh_*
 // tools are included only when the user has ≥1 configured SSH host, so the UI
 // never offers a tool the backend would reject. sshHosts is the user's alias
-// list (empty/nil hides the ssh tools).
+// list (empty/nil hides the ssh tools). The ui_* tools are always listed (their
+// executor is the page itself, which is always present) but off by default —
+// enabling one makes the run browser-bound, so it is the user's call.
 func availableTools(fetchPage bool, sshHosts []string) []toolMeta {
 	out := []toolMeta{
 		{Name: "web_search", Label: "Web search", Description: "Search the web for current facts via the internal SearXNG."},
@@ -802,6 +834,7 @@ func availableTools(fetchPage bool, sshHosts []string) []toolMeta {
 		out = append(out, toolMeta{Name: "fetch_page", Label: "Fetch page", Description: "Download a web page and read its text. Off by default (injection risk)."})
 	}
 	out = append(out, localToolMetas()...)
+	out = append(out, uiToolMetas()...)
 	if len(sshHosts) > 0 {
 		out = append(out, sshToolMetas()...)
 	}
@@ -867,18 +900,24 @@ func (s *server) fetchPage(ctx context.Context, rawurl string) (string, error) {
 // them self-correct on the next round.
 func validateToolArgs(t agentTool, argsJSON string) error {
 	args := strings.TrimSpace(argsJSON)
+	req, _ := t.schema.Function.Parameters["required"].([]string)
 	if args == "" {
+		// A tool with no required arguments (get_time, git_status, ui_snapshot,
+		// todo_read, …) is legitimately callable with nothing: an empty object
+		// satisfies its schema. Models are inconsistent about emitting "{}" vs
+		// "" for those, and rejecting "" burned a step on a correct call.
+		if len(req) == 0 {
+			return nil
+		}
 		return errors.New("no arguments were provided")
 	}
 	var obj map[string]any
 	if err := json.Unmarshal([]byte(args), &obj); err != nil {
 		return fmt.Errorf("arguments are not valid JSON: %s", err)
 	}
-	if req, ok := t.schema.Function.Parameters["required"].([]string); ok {
-		for _, k := range req {
-			if _, present := obj[k]; !present {
-				return fmt.Errorf("missing required argument \"%s\"", k)
-			}
+	for _, k := range req {
+		if _, present := obj[k]; !present {
+			return fmt.Errorf("missing required argument \"%s\"", k)
 		}
 	}
 	return nil

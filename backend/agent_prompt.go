@@ -13,6 +13,24 @@ func injectMemoryIndex(sys string, keys []string) string {
 		"Use memory_read only when a question needs something you previously stored; do not read speculatively."
 }
 
+// injectUIContext appends the UI-awareness block to the agent system prompt.
+// Applied when the effective allowlist contains a ui_* tool (see agent_ui.go).
+// It exists because the default behaviour of every model here is to disclaim
+// ("I'm unable to interact with the user interface") when asked about
+// something on screen — it has no idea it is running inside an app the user is
+// looking at. Appended rather than prepended so it composes with the repo /
+// workspace / plan blocks, which prepend. Keep the anchor phrase "cannot see
+// the interface" stable — agent_ui_test.go asserts on it.
+func injectUIContext(sys string) string {
+	return sys + "\n\nYou are running inside the nas-llm chat app, and the user is looking at its interface right now. " +
+		"When they ask about something they can see — a badge, a number, a button, a panel, an icon, \"what is this\", \"why is that highlighted\" — call ui_snapshot and answer from what it returns. " +
+		"Never tell the user you cannot see the interface or cannot access UI elements: you can, with ui_snapshot, ui_read, ui_click, and ui_set_value. " +
+		"A snapshot gives you labels, values, and state — not intent. When what a value MEANS isn't clear from its label or tooltip, find the code that sets it (grep, read_file) before explaining it, rather than guessing from the number alone. " +
+		"Refs belong to the snapshot that produced them and go stale as soon as the UI changes, so take a fresh snapshot before acting on one. " +
+		"Clicking and typing change what the user sees, so only touch what the request actually needs. " +
+		"Some controls are refused by design: you cannot approve or reject your own tool calls, and you cannot press Send — leave those to the user."
+}
+
 // injectPlanContext prepends a plan-mode block to the agent system prompt. When
 // the plan isn't approved yet, it tells the model to research with read-only tools
 // and produce a plan (not edit); when approved, it tells it the plan was approved

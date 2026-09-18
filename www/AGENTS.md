@@ -1,22 +1,24 @@
 # www/ — static browser chat UI
 
-Vanilla JS, no build step. Served as static files by Caddy (web) and bundled by Tauri (desktop). Five source files plus vendored libraries:
+Vanilla JS, no build step. Served as static files by Caddy (web) and bundled by Tauri (desktop). Six source files plus vendored libraries:
 
-- `index.html` (114 lines) — page shell, element IDs, script/link tags
-- `app.js` (2860 lines) — all application logic and state
-- `lib.js` (602 lines) — icons, markdown rendering, streaming renderer, agent-trace DOM builders
-- `styles.css` (530 lines) — full UI styling
+- `index.html` (123 lines) — page shell, element IDs, script/link tags
+- `app.js` (~3150 lines) — all application logic and state
+- `lib.js` (~850 lines) — icons, markdown rendering, streaming renderer, agent-trace DOM builders, command blocks
+- `ui.js` (~600 lines) — the agent's `ui_*` tools: DOM snapshot, read, click, set-value (see below)
+- `styles.css` (~530 lines) — full UI styling
 - `vendor/` — `highlight.min.js` + `highlight-github-dark.min.css` (highlight.js), `marked.esm.js`, `purify.es.mjs`
 
 ## Cache-bust rule — read this before editing any JS or CSS
 
-There is no build step, so cache-busting is manual query strings in **three** separate places. If you edit a file and don't bump its `?v=`, the change will not reach a cached browser.
+There is no build step, so cache-busting is manual query strings in **four** separate places. If you edit a file and don't bump its `?v=`, the change will not reach a cached browser.
 
 - **Editing `styles.css`** → bump the number in `index.html:9` (`<link … href="styles.css?v=…">`).
-- **Editing `app.js`** → bump the number in `index.html:112` (`<script type="module" src="app.js?v=…">`).
+- **Editing `app.js`** → bump the number in `index.html:121` (`<script type="module" src="app.js?v=…">`).
 - **Editing `lib.js`** → bump the number in the ES module import inside `app.js:3` (`import { … } from './lib.js?v=…'`). This is **not** in `index.html` — it's easy to miss.
+- **Editing `ui.js`** → bump the number in the ES module import inside `app.js:8` (`import { … } from './ui.js?v=…'`). Same trap as `lib.js`.
 
-Current values (as of this commit): `styles.css?v=48`, `app.js?v=52`, `lib.js?v=35`. Verify against the files before relying on these numbers.
+Current values (as of this commit): `styles.css?v=54`, `app.js?v=60`, `lib.js?v=38`, `ui.js?v=1`. Verify against the files before relying on these numbers.
 
 The desktop app has its own independent `?v=` constants for renderer assets it injects on top of this directory — see `desktop/AGENTS.md`.
 
@@ -32,7 +34,7 @@ The file is one top-level module with no submodules. Regions below are approxima
 - **Auth gate** (375-431) — `boot()` checks `/api/auth/me`; `showLogin`/`showApp`; `showApp` loads models, conversations, active jobs, opens the global stream; login/logout handlers.
 - **Models: loading & unified picker** (434-754) — `loadModels`; `reattachLocalModels`/`discoverLocalModels` (probes `localhost:11434/api/tags`); badge builders (`hostBadge`, `speedBadgeFor`, `capBadge`); the single drawer with `buildInstalledRow`/`buildLocalRow`; per-row ⋯ menu (`benchmarkRow`, `confirmRemoveRow`, `deleteRowModel`, `toggleDetails`); `renderModels`/`renderModelBanner`/`chooseModel`/`saveModelSelection`; `prefetchCaps`; keyboard nav.
 - **Sidebar & conversations** (756-1000) — `loadConversations`/`loadFolders`; `renderSidebar`/`renderFolder`/`renderConv` (drag-to-folder); row action menus (`openConvMenu`, `openFolderMenu`, `confirmInMenu`); `moveConversation`; inline rename; folder CRUD; `openConversation`; desktop bridge hooks (`nasllm:openConv`, `nasllm:refreshConvs`).
-- **Background generation & SSE** (1002-1388) — `loadActiveJobs`/`syncGenerating` (5s poll for sidebar spinners); `closeTail`/`resumeIfGenerating`; **local-model relay** (`relayLocalModelCall`, `postModelResponse`, `relayModelCallHeadless` — browser streams to `localhost:11434/v1/chat/completions`, POSTs result back); `showToast`/`finishJob`/`reloadIfOpen`; **global stream** `openGlobalStream`/`closeGlobalStream` (user-scoped multiplexed SSE at `/api/events`); **`tailJob`** (per-conversation SSE at `/api/conversations/{id}/events` — all event listeners live here).
+- **Background generation & SSE** (1002-1388) — `loadActiveJobs`/`syncGenerating` (5s poll for sidebar spinners); `closeTail`/`resumeIfGenerating`; **local-model relay** (`relayLocalModelCall`, `postModelResponse`, `relayModelCallHeadless` — browser streams to `localhost:11434/v1/chat/completions`, POSTs result back); `showToast`/`finishJob`/`reloadIfOpen`; **global stream** `openGlobalStream`/`closeGlobalStream` (user-scoped multiplexed SSE at `/api/events`); **`tailJob`** (per-conversation SSE at `/api/conversations/{id}/events` — all event listeners live here). Both streams carry a `toolExec` listener that forwards **only** `ui_*` cues to `ui.js` (`handleUIToolExec`, deduped by `jobId:step`); every other tool belongs to the desktop shim.
 - **Generation completion & chat CRUD** (1390-1419) — `onGenerationDone`; `newChat`; `deleteConversation`.
 - **Chat rendering** (1421-1583) — `bubbleError`; **`addMsg`** (the message DOM builder: thinking accordion, steps drawer, search evidence, bubble, meta row); `addCopyMsg`; `toolBadgeFor`/`openToolPopup` (finalized-answer tool popup); `rerenderChat`; `updateHeader`.
 - **`stream()` — the send function** (1585-1669) — slash-command parse; creates conversation on first turn (`POST /api/conversations`); enqueues job (`POST /…/generate`, handles 200/409); calls `tailJob`.
@@ -47,6 +49,16 @@ The file is one top-level module with no submodules. Regions below are approxima
 - **Agent settings** (2652-2707) — `openAgentPanel`/`loadAgentConfig`/`renderAgentTools`; save handler (`PUT /api/agent/config`).
 - **Slash commands** (2709-2857) — `COMMANDS` array (clear/delete/rename/stop/web/clarify/agent/models/plan/logout/help); `parseSlash`; popup render/keyboard nav; `runCommand`; `toggleExtra`; `confirmSlash`/`slashNote`.
 - **`boot()`** (2859) — entry point at the very end.
+
+## ui.js — the agent's view of this screen
+
+Implements the backend's `ui_*` tool family (`backend/agent_ui.go`) against the live DOM, so the agent can answer "what's that number next to the drawer icon?" instead of replying that it cannot see the interface. It lives in `www/` rather than the desktop bridge because the executor has to be the page itself — that is what makes the tools work on `chat.selected.systems` as well as in the desktop shell.
+
+- `isUITool(tool)` / `handleUIToolExec(convId, payload)` are the only exports; `app.js` calls them from both SSE streams.
+- `ui_snapshot` walks the visible DOM region by region (`login`/`sidebar`/`header`/`chat`/`composer`/`drawer`/`dialog`), emitting one line per control with a ref, role, label, and state. `#chat` is summarized, never serialized — it would swallow the backend's 4000-char observation cap on its own.
+- Refs are `#id` when the element has one, else `sN:eM`. Resolution is by element identity, so a ref survives until that node leaves the DOM; anything else comes back as a "stale, re-snapshot" error rather than clicking whatever moved into its place.
+- `ui_click`/`ui_set_value` are approval-gated (inline in the command block via `window.nasllm.blocks.requestApproval`, falling back to a small `.modal` prompt for a background chat), auto-approved when the conversation is, and **always** prompt for destructive-looking controls.
+- Hard refusals, independent of approval: the agent cannot press `#send`, and cannot touch any approve/reject control — its own approval overlays are excluded from snapshots entirely.
 
 ## lib.js vs app.js
 
@@ -80,11 +92,11 @@ All routes below are registered in `routes()` at `backend/main.go:234-281`.
 - `GET /api/agent/config`, `PUT /api/agent/config`
 
 **SSE event streams:**
-- `GET /api/events` — user-scoped multiplexed stream (opened once after auth by `openGlobalStream`). Event types switched on: `modelCall`, `done`, `joberror`. Used for background-chunk local relays and completion toasts/badges.
-- `GET /api/conversations/{id}/events` — per-conversation stream (opened by `tailJob`). Event types switched on: `reset`, `searches`, `search`, `questions`, `steps`, `tool`, `thoughts`, `thought`, `clear`, `modelCall`, `phase`, `chunk`, `done`, `joberror`. The terminal `done` carries no payload, so a paused agent run is distinguished from a finish/cancel by a follow-up `/job` fetch in the `done` handler (a `paused` status renders a Resume banner instead of reloading).
+- `GET /api/events` — user-scoped multiplexed stream (opened once after auth by `openGlobalStream`). Event types switched on: `modelCall`, `done`, `joberror`, `toolExec` (`ui_*` only). Used for background-chunk local relays, completion toasts/badges, and UI tools fired by a backgrounded chat.
+- `GET /api/conversations/{id}/events` — per-conversation stream (opened by `tailJob`). Event types switched on: `reset`, `searches`, `search`, `questions`, `steps`, `toolStart`, `tool`, `thoughts`, `thought`, `clear`, `modelCall`, `toolExec` (`ui_*` only), `phase`, `chunk`, `done`, `joberror`. The terminal `done` carries no payload, so a paused agent run is distinguished from a finish/cancel by a follow-up `/job` fetch in the `done` handler (a `paused` status renders a Resume banner instead of reloading).
 - `GET /api/models/pull/{jobId}/events` — pull progress stream (opened by `tailPull`). Event types: `reset`, `phase`, `progress`, `done`, `joberror`.
 
-Routes registered in the backend but **not** called by this page: `GET /api/health`, `GET /api/auth/verify` (email-link landing), `POST /api/chat/completions` (direct proxy, unused by the web UI which goes through `/generate`), `PUT /api/conversations/{id}` (this page uses PATCH), `POST /api/conversations/{id}/tool-response` and `GET|POST /api/repos` (desktop bridge only).
+Routes registered in the backend but **not** called by this page: `GET /api/health`, `GET /api/auth/verify` (email-link landing), `POST /api/chat/completions` (direct proxy, unused by the web UI which goes through `/generate`), `PUT /api/conversations/{id}` (this page uses PATCH), and `GET|POST /api/repos` (desktop bridge only). `POST /api/conversations/{id}/tool-response` is called from here too, but only by `ui.js` for `ui_*` results — every other tool's observation is posted by the desktop bridge.
 
 ## Desktop app reuse
 

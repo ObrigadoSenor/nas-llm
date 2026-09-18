@@ -1,6 +1,11 @@
 // nas-llm chat UI — app logic, split out of the old single-file index.html.
 // Imports UI helpers (icons, markdown rendering) from lib.js. No build step.
-import { icon, setIcon, renderMessage, escapeHtml, StreamRenderer, thinkingDots, renderSearchBlock, appendSearchEntry, showSearchPending, clearSearchPending, renderSourceLinks, appendSourceLinks, renderClarifyCard, renderAgentSteps, appendAgentStep, buildThoughtsWrap, renderThoughts, appendThought, setThoughtsSummary, isCommandTool, openBlock, appendBlock, closeBlock, isBlockStep, resetBlocks, installBlocksHook } from './lib.js?v=37';
+import { icon, setIcon, renderMessage, escapeHtml, StreamRenderer, thinkingDots, renderSearchBlock, appendSearchEntry, showSearchPending, clearSearchPending, renderSourceLinks, appendSourceLinks, renderClarifyCard, renderAgentSteps, appendAgentStep, buildThoughtsWrap, renderThoughts, appendThought, setThoughtsSummary, isCommandTool, openBlock, appendBlock, closeBlock, isBlockStep, resetBlocks, installBlocksHook } from './lib.js?v=38';
+// UI-awareness tools (ui_snapshot/ui_read/ui_click/ui_set_value). Unlike the
+// repo file tools — which the desktop sidecar executes — these act on THIS
+// page, so they live in www/ and work in the browser as well as the desktop
+// shell. See ui.js and www/AGENTS.md (contract 5).
+import { isUITool, handleUIToolExec } from './ui.js?v=1';
 
 installBlocksHook();
 // Streamed command output + exit, forwarded by the desktop renderer (the
@@ -1394,12 +1399,14 @@ async function relayModelCallHeadless(convId, call){
 // toolExec/phase/done/joberror for EVERY active job the caller owns, each
 // payload tagged with convId+jobId (contract 1). We open it once after auth
 // and use it only to (a) keep a backgrounded local-model relay running and
-// (b) fire completion toasts/badges for jobs finishing off-screen. toolExec is
-// intentionally not handled here — it belongs exclusively to the desktop
-// renderer's EventSource shim (contract 5), which wraps window.EventSource and
-// therefore already receives this same stream. If the route is missing (older
-// backend) or the connection keeps failing, back off and keep retrying: the
-// rest of the app already works with no background progress/notifications.
+// (b) fire completion toasts/badges for jobs finishing off-screen. Repo and ssh
+// toolExec cues are intentionally not handled here — they belong exclusively to
+// the desktop renderer's EventSource shim (contract 5), which wraps
+// window.EventSource and therefore already receives this same stream. The ui_*
+// tools are the one exception: their executor is this page, so www/ owns them
+// on both surfaces and the desktop shim skips them. If the route is missing
+// (older backend) or the connection keeps failing, back off and keep retrying:
+// the rest of the app already works with no background progress/notifications.
 let globalES=null;
 let globalRetryDelay=1000;
 let globalRetryTimer=null;
@@ -1432,6 +1439,15 @@ function openGlobalStream(){
     finishJob(d.convId, d.jobId, "error", d.error||null);
     reloadIfOpen(d.convId);
     loadConversations();
+  });
+  // A backgrounded chat's UI tool call still has to run — there is only one
+  // screen and it is this one. Unlike modelCall/done above we do NOT skip the
+  // foreground chat: handleUIToolExec dedupes by jobId+step across both
+  // streams, so whichever arrives first wins and the other is a no-op.
+  es.addEventListener("toolExec", e=>{
+    let d={}; try{ d=JSON.parse(e.data); }catch{ return; }
+    if(!d.jobId || !isUITool(d.tool)) return;
+    handleUIToolExec(d.convId, d);
   });
   es.onerror=()=>{
     es.close();
@@ -1495,6 +1511,13 @@ function tailJob(convId, jobId, bubble, initialAcc, searchWrap, srcLinks, initia
   es.addEventListener("thoughts", e=>{ let arr=[]; try{ arr=JSON.parse(e.data)||[]; }catch{} renderThoughts(thoughtsWrap, arr); if(arr&&arr.length){ if(!thoughtStart) thoughtStart=Date.now(); setThoughtsSummary(thoughtsDet,"Thinking",{streaming:true}); if(thoughtsDet) thoughtsDet.open=true; } });
   es.addEventListener("thought", e=>{ let t=""; try{ t=JSON.parse(e.data); }catch{} appendThought(thoughtsWrap, t); if(t!=null&&t!==""){ if(!thoughtStart) thoughtStart=Date.now(); setThoughtsSummary(thoughtsDet,"Thinking",{streaming:true}); if(thoughtsDet) thoughtsDet.open=true; } });
   es.addEventListener("clear", ()=>{ renderer.set(""); });
+  // UI tools act on this page, so www/ executes them on both surfaces; the
+  // desktop shim owns every other toolExec cue (repo/ssh → sidecar).
+  es.addEventListener("toolExec", e=>{
+    let d={}; try{ d=JSON.parse(e.data); }catch{ return; }
+    if(!d.jobId || !isUITool(d.tool)) return;
+    handleUIToolExec(d.convId||convId, d);
+  });
   // Local-model relay: the backend needs the visitor's Ollama to infer. Stream
   // the response into the bubble as it arrives, then POST the assembled result
   // back. The existing thoughts/clear handlers tolerate this ordering (a
