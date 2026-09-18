@@ -58,7 +58,7 @@ One checkout (the repo folder) is shared by all chats on a repo — no git workt
 `sidecar.rs:308-332` (`index_html`) reads `www/index.html`, injects a `<link>` for `desktop.css` before `</head>` and a `<script>` for `desktop.js` before `</body>`, then serves it. The `?v=` query strings on those URLs are **hardcoded literals in Rust source**:
 
 - `desktop.css?v=38` — `sidecar.rs:317`
-- `desktop.js?v=48` — `sidecar.rs:324`
+- `desktop.js?v=49` — `sidecar.rs:324`
 
 (These numbers go stale on every bump; always re-read the lines before quoting them.)
 
@@ -69,15 +69,15 @@ One checkout (the repo folder) is shared by all chats on a repo — no git workt
 3. Increment the `?v=` integer in the `desktop.js` (line ~324) or `desktop.css` (line ~317) `href`/`src` literal.
 4. Rebuild — `cargo check` / `tauri dev` picks up the Rust change.
 
-This is a cross-language coupling with no build-time check. The `www/` side has its own separate cache-bust locations (`www/index.html` for `styles.css`/`app.js`, plus `lib.js` versioned in an ES module import) — those are documented in `www/AGENTS.md`, not here.
+This is a cross-language coupling with no build-time check. The `www/` side has its own separate cache-bust locations (`www/index.html` for `styles.css`/`app.js`, plus `lib.js` and `ui.js` versioned in ES module imports) — those are documented in `www/AGENTS.md`, not here.
 
 ## desktop.js section map
 
 - `1-56` — Header, utilities (`$`, `sid`, `el`), **Ollama fetch shim**: rewrites `localhost:11434` calls to same-origin `/__ollama/*` before `app.js` runs.
-- `58-110` — **toolExec SSE shim**: wraps `window.EventSource` so every stream gets a `toolExec` listener; on receipt, POSTs the tool call to `/__sidecar/repos/exec` and the observation back to `/api/conversations/:id/tool-response`. Dedupes by `jobId:step`.
+- `58-110` — **toolExec SSE shim**: wraps `window.EventSource` so every stream gets a `toolExec` listener; on receipt, POSTs the tool call to `/__sidecar/repos/exec` and the observation back to `/api/conversations/:id/tool-response`. Dedupes by `jobId:step`. **`ui_*` tools are skipped here** — they act on the page, not the sidecar, so `www/ui.js` owns them (it has to: the plain browser UI needs them and has no sidecar). It listens on this same EventSource, so the early return is what keeps them from running twice. See `www/AGENTS.md`.
 - `112-253` — **Settings overlay**: `buildOverlay` assembles backend URL, magic-link sign-in, Ollama panel, updates section.
 - `255-339` — **In-app updater UI** (`addUpdatesSection`): `tauriInvoke` for version/check/install; listens to `update://progress` events.
-- `341-410` — **Tool execution** (`runToolExec`): approval-gated write tools; `AUTO_APPROVE_TOOLS` set at `:363` covers `write_file`/`edit_file`/`move_path`/`apply_patch`/`run_command`/`git_commit`/`git_push` (NOT `delete_path`/`create_pr`/`merge_pr` — those always prompt); `COMMAND_TOOLS` at `:367` renders a Warp-style block for all of these; threads `runCommandTimeoutMs` from the toolExec payload to the sidecar; posts observations to the backend.
+- `341-410` — **Tool execution** (`runToolExec`): returns immediately for `ui_*` (defensive — the shim already filters them); approval-gated write tools; `AUTO_APPROVE_TOOLS` set at `:363` covers `write_file`/`edit_file`/`move_path`/`apply_patch`/`run_command`/`git_commit`/`git_push` (NOT `delete_path`/`create_pr`/`merge_pr` — those always prompt); `COMMAND_TOOLS` at `:367` renders a Warp-style block for all of these; threads `runCommandTimeoutMs` from the toolExec payload to the sidecar; posts observations to the backend.
 - `412-553` — **Approval dialog**: FIFO queue (`pumpApprovalQueue`), reusable overlay re-wired per call, colored diff renderer (`renderDiff`).
 - `555-574` — **Tauri IPC helpers** (`tauriInvoke`, `tauriListen`): the only IPC in the app; everything else is same-origin HTTP.
 - `576-638` — **Native notifications** (job completion) + `pickFolder` (native directory picker via `plugin:dialog`).

@@ -265,7 +265,10 @@ function truncateArgs(s) {
 // compact step row so a run doesn't become a wall of blocks. Live blocks are
 // driven by the window.nasllm.blocks hook (open on toolStart, append on
 // streamed output, close on exit/result, requestApproval for inline Approve/Reject).
-const COMMAND_TOOLS = new Set(['run_command','apply_patch','git_commit','git_push','create_pr','ssh_run']);
+// ui_click/ui_set_value are command-shaped too: they change what the user sees
+// and are approval-gated, so they get a block (with its inline Approve/Reject)
+// rather than a compact row. The read-only ui_snapshot/ui_read stay rows.
+const COMMAND_TOOLS = new Set(['run_command','apply_patch','git_commit','git_push','create_pr','ssh_run','ui_click','ui_set_value']);
 export function isCommandTool(tool){ return COMMAND_TOOLS.has(tool); }
 
 // DOM-side cap so a chatty command can't grow the page unbounded (keep last ~64KB).
@@ -274,7 +277,7 @@ const ANSI_RE = /\x1b\[[0-9;?]*[ -\/]*[@-~]/g;
 function stripAnsi(s){ return String(s||'').replace(ANSI_RE, ''); }
 
 function toolLabel(tool){
-  return ({ run_command:'Run command', apply_patch:'Apply patch', git_commit:'Commit', git_push:'Push', create_pr:'Open PR', ssh_run:'SSH run' })[tool] || tool;
+  return ({ run_command:'Run command', apply_patch:'Apply patch', git_commit:'Commit', git_push:'Push', create_pr:'Open PR', ssh_run:'SSH run', ui_click:'Click', ui_set_value:'Type' })[tool] || tool;
 }
 function commandTarget(tool, args){
   try{
@@ -284,6 +287,8 @@ function commandTarget(tool, args){
     if(tool==='git_commit') return v.message||'';
     if(tool==='create_pr') return v.title||'';
     if(tool==='ssh_run') return (v.host ? v.host+': ' : '')+(v.command||'');
+    if(tool==='ui_click') return v.ref||'';
+    if(tool==='ui_set_value') return (v.ref||'')+' = '+(v.value||'');
   }catch{}
   return '';
 }
@@ -472,6 +477,8 @@ function stepArgSummary(tool, args){
       case 'ssh_read': return v.path ? ((v.host ? v.host+':' : '')+v.path) : '';
       case 'ssh_list': return (v.host ? v.host+':' : '')+(v.path||'');
       case 'ssh_grep': return v.pattern ? ((v.host ? v.host+':' : '')+v.pattern+(v.path ? ' in '+v.path : '')) : '';
+      case 'ui_snapshot': return (v.area && v.area!=='all') ? v.area : '';
+      case 'ui_read': return v.ref||'';
       default: return '';
     }
   }catch{ return ''; }

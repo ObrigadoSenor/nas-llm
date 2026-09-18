@@ -89,6 +89,11 @@ function el(tag, cls, text) {
     es.addEventListener("toolExec", async (e) => {
       let d = {}; try { d = JSON.parse(e.data); } catch { return; }
       if (!d.jobId || !d.tool) return;
+      // ui_* tools (ui_snapshot/ui_read/ui_click/ui_set_value) act on the page
+      // itself, not the sidecar, so www/ui.js owns them — it has to, since the
+      // plain browser UI needs them too and has no sidecar. It listens on this
+      // same EventSource, so returning here is what stops them running twice.
+      if (d.tool.startsWith("ui_")) return;
       const key = d.jobId + ":" + (d.step ?? 0);
       if (inFlightToolExec.has(key)) return;   // another stream already picked this round up
       inFlightToolExec.add(key);
@@ -614,6 +619,9 @@ async function sidExec(endpoint, execBody) {
 }
 
 async function runToolExec(convId, d) {
+  // Defensive: ui_* never reaches here (the shim returns early) because the
+  // sidecar has no executor for it — www/ui.js runs it against the DOM.
+  if (d.tool.startsWith("ui_")) return;
   const autoApproved = !!(d.autoApprove && AUTO_APPROVE_TOOLS.has(d.tool));
   const key = d.jobId + ":" + (d.step ?? 0);
   const isSsh = d.tool.startsWith("ssh_");

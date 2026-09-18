@@ -241,6 +241,12 @@ type toolExecPayload struct {
 	// and passes host so the sidecar resolves it via ~/.ssh/config. Empty for
 	// repo file tools, which keep using Repo/Branch.
 	Host string `json:"host,omitempty"`
+	// Target is the UI surface a ui_* tool acts on — always "app" (the chat
+	// app's own interface) today. Empty for repo/ssh tools, which route on
+	// Repo/Host instead. The field exists from day one so adding a second
+	// target later (e.g. a dev-server preview) is a renderer change, not a
+	// change to this contract. See agent_ui.go.
+	Target string `json:"target,omitempty"`
 	// AutoApprove is the conversation's effective auto-approve setting for write
 	// tools (write_file/edit_file/move_path/apply_patch/run_command/git_commit/
 	// git_push). When true the renderer runs those tools without an approval
@@ -405,13 +411,15 @@ func (j *job) clearPendingModelCall() {
 // working tree; see toolExecPayload); host is the SSH alias for ssh_* tools
 // ("" for repo file tools). runCommandTimeoutMs carries the backend's
 // RUN_COMMAND_TIMEOUT so the sidecar enforces it for run_command/ssh_run
-// (0 = sidecar default).
+// (0 = sidecar default). The ui_* target is stamped here rather than passed in
+// (uiTargetFor): it is derived from the tool name, so no caller has to know
+// about it.
 func (j *job) emitToolExec(step int, tool, args, repo, branch, host string, autoApprove bool, runCommandTimeoutMs int) {
 	// Open the command block the moment the tool starts — before the relay cue
 	// fires — so streamed output has a block to land in. (Read-only tools get a
 	// toolStart too; the UI only opens a block for command-shaped tools.)
 	j.emitToolStart(step, tool, args)
-	payload := toolExecPayload{ConvID: j.convID, JobID: j.id, Step: step, Tool: tool, Args: args, Repo: repo, Branch: branch, Host: host, AutoApprove: autoApprove, RunCommandTimeoutMs: runCommandTimeoutMs}
+	payload := toolExecPayload{ConvID: j.convID, JobID: j.id, Step: step, Tool: tool, Args: args, Repo: repo, Branch: branch, Host: host, Target: uiTargetFor(tool), AutoApprove: autoApprove, RunCommandTimeoutMs: runCommandTimeoutMs}
 	b, _ := json.Marshal(payload)
 	j.mu.Lock()
 	j.pendingToolExecPayload = &payload
@@ -1452,6 +1460,15 @@ func (s *server) runGeneration(j *job) error {
 			allow = filterSSHTools(allow)
 		}
 		sshEnabled := len(sshHosts) > 0 && containsAnySSHTool(allow)
+		// UI tools (ui_snapshot/ui_read/ui_click/ui_set_value) are executed by the
+		// page itself, so they need the toolExec relay but no repo and no host —
+		// this is what makes them work in a plain, non-repo chat. The prompt block
+		// goes on here too: without it the model disclaims ("I'm unable to
+		// interact with the user interface") instead of taking a snapshot.
+		uiEnabled := containsAnyUITool(allow)
+		if uiEnabled {
+			sys = injectUIContext(sys)
+		}
 
 		var repo *Repo
 		if repoID != "" {
@@ -1467,6 +1484,14 @@ func (s *server) runGeneration(j *job) error {
 				}
 			}
 		}
+		// No workspace bound, but the relay exists (a UI-only or SSH-only run):
+		// drop the repo file/git/todo tools. runAgentLoop's own "local tool with
+		// no relay" guard used to cover this, but the relay is no longer
+		// repo-implied — offering them now would hand the model tools whose cue
+		// nothing can serve.
+		if repo == nil {
+			allow = filterRepoTools(allow)
+		}
 		// Plan mode: when the conversation is in plan mode, inject the plan
 		// context. If the plan hasn't been approved yet, gate write tools out so
 		// the agent researches with read-only tools and emits a plan for the
@@ -1480,7 +1505,7 @@ func (s *server) runGeneration(j *job) error {
 		}
 
 		var toolExecRelay func(context.Context, int, string, string) toolOutcome
-		if repo != nil || sshEnabled {
+		if repo != nil || sshEnabled || uiEnabled {
 			// Resolve the conversation's effective auto-approve once for this run;
 			// the renderer uses it to skip the approval dialog for write tools
 			// (delete_path/create_pr/merge_pr/ssh_run always prompt regardless).
@@ -1517,6 +1542,11 @@ func (s *server) runGeneration(j *job) error {
 					if !sshHostAllowed(sshHosts, host) {
 						return toolOutcome{observation: "Unknown SSH host: " + host + ". Use one of your configured hosts: " + sshHostList(sshHosts) + ".", preview: "unknown host", isError: true}
 					}
+				} else if isUITool(tool) {
+					// UI tools carry neither repo nor host: emitToolExec stamps the
+					// target and the page executes against its own DOM. Leaving repo
+					// unset keeps a repo-bound chat's ui_* call from looking like a
+					// sidecar file-tool call to the renderer.
 				} else if repo != nil {
 					repoName = repo.FullName
 					branch = conv.RepoBranch
