@@ -45,7 +45,7 @@ The cookie jar is persisted to `<app-data>/nas-llm-desktop/session.json`; the ba
 - `GET/POST /__sidecar/ollama/{status,start,stop}` — local Ollama lifecycle.
 - `ANY /__ollama/*path` — `proxy_ollama` (`:835`): same-origin proxy to `localhost:11434`, strips browser `Origin`/`Referer` (Ollama 403s them).
 
-GitHub/repos routes are in `github.rs` `router()` (merged into the same axum app at `main.rs:148`): `/__sidecar/github/{status,connect,disconnect,repos}` and `/__sidecar/repos/{local,add-local,create-workspace,init-git,open-in,undo-last,scan-local,clone,refresh,open,exec,exec/stream,diff,revert,changelog,ship,set-folder,create-branch,state,branches,checkout,commit,create-pr,prs,merge-pr}`.
+GitHub/repos routes are in `github.rs` `router()` (merged into the same axum app at `main.rs:148`): `/__sidecar/github/{status,connect,disconnect,repos}` and `/__sidecar/repos/{local,add-local,create-workspace,init-git,open-in,undo-last,scan-local,clone,refresh,sync-main,open,exec,exec/stream,diff,revert,changelog,ship,set-folder,create-branch,state,branches,checkout,delete-branch,commit,create-pr,prs,merge-pr}`. `refresh` and `sync-main` both run `git fetch origin` + `git merge origin/<default>` (sync-from-main) — never `git pull`, which failed on tracking-less agent branches. `repos_state` also returns `defaultBranch`/`mainAhead`/`mainBehind` (vs `origin/<default>`) so the UI can show "N behind main".
 
 `open-in` opens a workspace in an external app (editor/Finder/terminal); `undo-last` restores the newest recovery snapshot for a non-git workspace (the non-git analog of `revert`). `repos_exec` snapshots the workspace tree before each approved write tool on a non-git workspace (into `<data_dir>/snapshots/<name>/`) so `undo-last` can restore it.
 
@@ -57,8 +57,8 @@ One checkout (the repo folder) is shared by all chats on a repo — no git workt
 
 `sidecar.rs:308-332` (`index_html`) reads `www/index.html`, injects a `<link>` for `desktop.css` before `</head>` and a `<script>` for `desktop.js` before `</body>`, then serves it. The `?v=` query strings on those URLs are **hardcoded literals in Rust source**:
 
-- `desktop.css?v=22` — `sidecar.rs:317`
-- `desktop.js?v=30` — `sidecar.rs:324`
+- `desktop.css?v=38` — `sidecar.rs:317`
+- `desktop.js?v=48` — `sidecar.rs:324`
 
 (These numbers go stale on every bump; always re-read the lines before quoting them.)
 

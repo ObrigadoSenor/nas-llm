@@ -362,6 +362,13 @@
 .ds-branch-badge { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; flex: none; padding: 1px 6px; border-radius: 4px; }
 .ds-branch-cur { color: #8ab4f8; }
 .ds-branch-remote { color: #c39bd3; background: #2a2330; }
+.ds-branch-default { color: #6b707a; background: #1b1f27; }
+/* Trash button on a deletable branch row (local, non-current, non-default). */
+.ds-branch-del {
+  flex: none; background: transparent; border: 0; color: #6b707a;
+  font-size: 14px; line-height: 1; cursor: pointer; padding: 2px 6px; border-radius: 6px;
+}
+.ds-branch-del:hover { color: #e87060; background: #2a1614; }
 
 /* --- Ship changes wizard (Phase 6) --- */
 #dsShipVersion, #dsShipMessage {
@@ -406,6 +413,13 @@
 .ds-aa-chip.on { color: var(--accent); }
 .ds-aa-chip.off { color: var(--muted-dim); }
 .ds-aa-chip:hover { text-decoration: underline; }
+/* vs-main state chip in the composer status line: where this branch sits
+   relative to origin/<default>. "behind" is clickable (sync from main). */
+.ds-vs-main { padding: 0 2px; user-select: none; }
+.ds-vs-main.ok { color: var(--ok); }
+.ds-vs-main.ahead { color: var(--accent); }
+.ds-vs-main.behind { color: #e0a86a; cursor: pointer; }
+.ds-vs-main.behind:hover { text-decoration: underline; }
 
 /* --- Sidebar chat rows: title + branch under it --- */
 .ds-repo-chat-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
