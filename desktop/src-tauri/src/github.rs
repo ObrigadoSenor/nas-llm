@@ -236,28 +236,136 @@ async fn git_clone(
     Ok(())
 }
 
-async fn git_pull(path: &Path, token: &str) -> Result<String, String> {
-    // Pull uses the remote URL already configured in the clone (which carries
-    // the token), so no URL rewrite is needed; scrub anyway for safety.
+// git_fetch runs `git fetch origin` in <path>. Uses the repo's configured origin
+// (a clone's origin carries the token; a linked repo uses SSH keys / credential
+// helper), so the token is only used to scrub any captured output.
+async fn git_fetch(path: &Path, token: &str) -> Result<(), String> {
     let out = tokio::process::Command::new("git")
         .arg("-C")
         .arg(path)
-        .arg("pull")
-        .arg("--ff-only")
+        .arg("fetch")
+        .arg("origin")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
         .await
         .map_err(|e| format!("could not run git: {e}"))?;
-    let combined = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
     if !out.status.success() {
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
         return Err(scrub(combined.trim().to_string(), token));
     }
-    Ok(scrub(combined.trim().to_string(), token))
+    Ok(())
+}
+
+// SyncResult carries the human-readable sync outcome and the post-sync
+// ahead/behind counts vs origin/<default>.
+struct SyncResult {
+    output: String,
+    ahead: usize,
+    behind: usize,
+}
+
+// git_sync_from_main brings the latest of the repo's default branch into the
+// current branch: `git fetch origin`, then `git merge origin/<default>`. A plain
+// merge fast-forwards when possible and creates a merge commit if the branches
+// diverged — it never rewrites history or loses work, and unlike `git pull` it
+// needs no upstream tracking, so it works on tracking-less agent branches.
+// `--allow-unrelated-histories` is passed so a workspace that was `git init`'d
+// locally and then linked to a remote with its own history can still sync (for
+// shared-history repos the flag is a no-op). Dirty work-in-progress is
+// auto-stashed around the merge (tagged nasllm:<current_branch>, mirroring
+// ensure_folder_on_branch) so a dirty folder never blocks the sync; the stash is
+// popped on a successful merge and, on a pop conflict, kept with the conflict
+// text surfaced. On a merge conflict the stash stays parked (the tree is in a
+// conflicted merge state) and the merge error is returned. Returns
+// Ok(SyncResult) (incl. "Already up to date with main"), Err when there is no
+// remote, origin/<default> is missing after fetch, or fetch/merge/stash fails.
+async fn git_sync_from_main(path: &Path, token: &str) -> Result<SyncResult, String> {
+    if git_remote_url(path).await.is_none() {
+        return Err("no remote configured — nothing to sync from".to_string());
+    }
+    let default = git_default_branch(path).await;
+    let upstream = format!("origin/{default}");
+    git_fetch(path, token).await?;
+    if !git_has_ref(path, &format!("refs/remotes/origin/{default}")).await {
+        return Err(format!("origin/{default} not found after fetch — cannot sync from main"));
+    }
+    let current = git_branch(path).await;
+    let tag = format!("nasllm:{current}");
+    let dirty = git_dirty_count(path).await > 0;
+    let behind_before = git_rev_count(path, &format!("HEAD..{upstream}")).await;
+    if behind_before == 0 {
+        let ahead = git_rev_count(path, &format!("{upstream}..HEAD")).await;
+        return Ok(SyncResult { output: "Already up to date with main".to_string(), ahead, behind: 0 });
+    }
+    // Detect unrelated histories (no common ancestor): a workspace git-init'd
+    // locally then linked to a remote. The merge below allows them; note it in
+    // the outcome so the user knows a merge commit combined two separate roots.
+    let unrelated = !git_has_merge_base(path, "HEAD", &upstream).await;
+    if dirty {
+        git_stash_push(path, &tag).await?;
+    }
+    let merge = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("merge")
+        .arg(&upstream)
+        .arg("--no-edit")
+        .arg("--allow-unrelated-histories")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("git merge: {e}"))?;
+    if !merge.status.success() {
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&merge.stdout),
+            String::from_utf8_lossy(&merge.stderr)
+        );
+        let msg = scrub(combined.trim().to_string(), token);
+        // Leave the stash parked: the tree is in a conflicted merge state. The
+        // user resolves or `git merge --abort`, then `git stash pop` to restore.
+        return Err(if msg.is_empty() { format!("git merge {upstream} failed") } else { msg });
+    }
+    let merge_text = scrub(
+        format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&merge.stdout),
+            String::from_utf8_lossy(&merge.stderr)
+        )
+        .trim()
+        .to_string(),
+        token,
+    );
+    let ahead = git_rev_count(path, &format!("{upstream}..HEAD")).await;
+    let behind = git_rev_count(path, &format!("HEAD..{upstream}")).await;
+    let unit = if behind_before == 1 { "commit" } else { "commits" };
+    let outcome = if merge_text.contains("Fast-forward") {
+        format!("Fast-forwarded {behind_before} {unit} from main")
+    } else if merge_text.contains("Merge made by") {
+        format!("Merged {behind_before} {unit} from main")
+    } else {
+        format!("Synced {behind_before} {unit} from main")
+    };
+    let outcome = if unrelated {
+        format!("{outcome} (unrelated histories — combined two separate roots)")
+    } else {
+        outcome
+    };
+    let output = if dirty {
+        match git_stash_pop_tagged(path, &tag).await {
+            Ok(()) => outcome,
+            Err(e) => format!("{outcome}\n⚠ stash pop conflict: {e}"),
+        }
+    } else {
+        outcome
+    };
+    Ok(SyncResult { output, ahead, behind })
 }
 
 async fn git_branch(path: &Path) -> String {
@@ -814,6 +922,22 @@ async fn git_has_ref(path: &Path, reff: &str) -> bool {
         .arg("rev-parse")
         .arg("--verify")
         .arg(reff)
+        .output()
+        .await;
+    matches!(out, Ok(o) if o.status.success())
+}
+
+// git_has_merge_base reports whether <a> and <b> share a common ancestor (i.e.
+// `git merge-base a b` succeeds). Used by git_sync_from_main to detect unrelated
+// histories (a workspace git-init'd locally then linked to a remote) so the
+// outcome message can note the merge combined two separate roots.
+async fn git_has_merge_base(path: &Path, a: &str, b: &str) -> bool {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("merge-base")
+        .arg(a)
+        .arg(b)
         .output()
         .await;
     matches!(out, Ok(o) if o.status.success())
@@ -1399,19 +1523,42 @@ async fn repos_clone(State(st): State<AppState>, Json(body): Json<CloneBody>) ->
 async fn repos_refresh(State(st): State<AppState>, Json(body): Json<NameBody>) -> Response {
     let name = body.name.trim().to_string();
     if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
-    // Always pull the folder (one checkout shared by chats on a repo; the
-    // folder tracks the active chat's branch). The branch field is accepted
-    // for shape compat but ignored.
+    // Sync the folder from main (git fetch origin + git merge origin/<default>).
+    // This replaces the old `git pull --ff-only`, which failed with "There is no
+    // tracking information for the current branch" on tracking-less agent
+    // branches. One checkout is shared by chats on a repo; the folder tracks the
+    // active chat's branch, and syncing from main brings main's latest into
+    // whatever branch the folder is on. The branch field is accepted for shape
+    // compat but ignored.
     let dest = match resolve_repo(&st.data_dir, &name) {
         Some(p) => p,
         None => return json_err("not found locally", StatusCode::NOT_FOUND),
     };
-    // The token is only used to scrub captured output; pull uses the repo's
-    // configured origin (a cloned repo's origin carries the token; a linked
-    // repo uses the user's SSH keys / credential helper).
+    // The token is only used to scrub captured output; fetch/merge use the
+    // repo's configured origin (a cloned repo's origin carries the token; a
+    // linked repo uses the user's SSH keys / credential helper).
     let token = token_get().unwrap_or_default();
-    match git_pull(&dest, &token).await {
-        Ok(msg) => json_ok(&serde_json::json!({ "ok": true, "output": msg })),
+    match git_sync_from_main(&dest, &token).await {
+        Ok(r) => json_ok(&serde_json::json!({ "ok": true, "output": r.output, "ahead": r.ahead, "behind": r.behind })),
+        Err(e) => json_err(&e, StatusCode::BAD_GATEWAY),
+    }
+}
+
+// repos_sync_main is the explicit "Sync from main" entry point: git fetch
+// origin + git merge origin/<default> into the folder's current branch. Same
+// semantics as repos_refresh (which now also calls git_sync_from_main); exposed
+// as its own route so the UI can label and call it distinctly from the legacy
+// "refresh" name. Returns {ok, output, ahead, behind}.
+async fn repos_sync_main(State(st): State<AppState>, Json(body): Json<NameBody>) -> Response {
+    let name = body.name.trim().to_string();
+    if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
+    let dest = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_err("not found locally", StatusCode::NOT_FOUND),
+    };
+    let token = token_get().unwrap_or_default();
+    match git_sync_from_main(&dest, &token).await {
+        Ok(r) => json_ok(&serde_json::json!({ "ok": true, "output": r.output, "ahead": r.ahead, "behind": r.behind })),
         Err(e) => json_err(&e, StatusCode::BAD_GATEWAY),
     }
 }
@@ -1495,11 +1642,12 @@ async fn repos_branches(State(st): State<AppState>, Json(body): Json<NameBody>) 
         None => return json_err("not found locally", StatusCode::NOT_FOUND),
     };
     let (current, branches) = git_branches(&dest).await;
+    let default_branch = git_default_branch(&dest).await;
     let entries: Vec<serde_json::Value> = branches
         .into_iter()
         .map(|(n, remote)| serde_json::json!({ "name": n, "remote": remote }))
         .collect();
-    json_ok(&serde_json::json!({ "ok": true, "current": current, "branches": entries }))
+    json_ok(&serde_json::json!({ "ok": true, "current": current, "default": default_branch, "branches": entries }))
 }
 
 #[derive(Deserialize)]
@@ -1562,6 +1710,103 @@ async fn repos_checkout(State(st): State<AppState>, Json(body): Json<CheckoutBod
             json_ok(&serde_json::json!({ "ok": false, "error": if msg.is_empty() { "git checkout failed".into() } else { msg } }))
         }
         Err(e) => json_err(&format!("git checkout failed: {e}"), StatusCode::BAD_GATEWAY),
+    }
+}
+
+#[derive(Deserialize)]
+struct DeleteBranchBody {
+    repo: String,
+    branch: String,
+}
+
+// git_delete_branch deletes <branch> from the repo at <path>. Refuses the
+// default branch and an empty name; if the folder is currently on <branch>, it
+// refuses when dirty ("commit or stash changes on this branch first") and
+// otherwise switches to the default branch first. Runs `git branch -D`
+// (force-delete: agent branches are often unmerged scratch sessions, so a plain
+// `git branch -d` would refuse). Returns Ok(true) when it switched the folder to
+// the default branch, Ok(false) when it deleted without switching, Err(msg) on
+// refusal/failure. Extracted from repos_delete_branch so the logic is testable
+// without an AppState. No git worktrees exist in the current model.
+async fn git_delete_branch(path: &Path, branch: &str) -> Result<bool, String> {
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return Err("branch is required".to_string());
+    }
+    let default_branch = git_default_branch(path).await;
+    if branch == default_branch {
+        return Err(format!("cannot delete the default branch ({default_branch})"));
+    }
+    let current = git_branch(path).await;
+    let mut switched = false;
+    if current == branch {
+        // Refuse to delete the branch the folder is on while it's dirty — a
+        // checkout would carry/lose the edits. A clean tree is switched to the
+        // default branch first.
+        if git_dirty_count(path).await > 0 {
+            return Err("commit or stash changes on this branch first".to_string());
+        }
+        let co = tokio::process::Command::new("git")
+            .arg("-C").arg(path)
+            .arg("checkout").arg(&default_branch)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output().await;
+        match co {
+            Ok(o) if o.status.success() => switched = true,
+            Ok(o) => {
+                let msg = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                return Err(if msg.is_empty() { format!("could not switch to {default_branch} before delete") } else { msg });
+            }
+            Err(e) => return Err(format!("git checkout: {e}")),
+        }
+    }
+    // Force-delete: agent branches are frequently unmerged scratch sessions, so
+    // a plain `git branch -d` would refuse.
+    let del = tokio::process::Command::new("git")
+        .arg("-C").arg(path)
+        .arg("branch").arg("-D").arg(branch)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output().await;
+    match del {
+        Ok(o) if o.status.success() => Ok(switched),
+        Ok(o) => {
+            let msg = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            Err(if msg.is_empty() { "git branch -D failed".to_string() } else { msg })
+        }
+        Err(e) => Err(format!("git branch: {e}")),
+    }
+}
+
+// repos_delete_branch deletes a local branch from a connected repo. Delegates
+// the git logic to git_delete_branch; on a switch (folder was on the deleted
+// branch) it refreshes the registry + re-pushes repo context so the sidebar /
+// agent loop see the default branch. Returns {ok, branch} / {ok:false, error}.
+// Re-implemented from ai/delete-branches-minimal-navbar.md (the original was
+// not in main).
+async fn repos_delete_branch(State(st): State<AppState>, Json(body): Json<DeleteBranchBody>) -> Response {
+    let name = body.repo.trim().to_string();
+    if !repo_use_git(&st.data_dir, &name) { return git_not_enabled(); }
+    let branch = body.branch.trim().to_string();
+    let dest = match resolve_repo(&st.data_dir, &name) {
+        Some(p) => p,
+        None => return json_err("not found locally", StatusCode::NOT_FOUND),
+    };
+    match git_delete_branch(&dest, &branch).await {
+        Ok(switched) => {
+            if switched {
+                let br = git_branch(&dest).await;
+                let head = git_head(&dest).await;
+                let tree = top_level_tree(&dest);
+                if let Some(rec) = load_registry(&st.data_dir).into_iter().find(|r| r.full_name == name) {
+                    upsert_registry(&st.data_dir, &RepoRecord { branch: br.clone(), ..rec });
+                }
+                let _ = push_repo_context(&st, &name, &dest, &br, &head, &tree).await;
+            }
+            json_ok(&serde_json::json!({ "ok": true, "branch": branch }))
+        }
+        Err(e) => json_ok(&serde_json::json!({ "ok": false, "error": e })),
     }
 }
 
@@ -5088,8 +5333,11 @@ struct StateQuery {
 }
 
 // repos_state returns the live git state for a repo in one call: current
-// branch, dirty file count, ahead/behind vs origin/<branch>, and whether a
-// remote is configured. ahead/behind are 0/0 when the upstream ref is absent.
+// branch, dirty file count, ahead/behind vs origin/<branch>, ahead/behind vs
+// origin/<default> (so the UI can show "N behind main" on a tracking-less agent
+// branch), the default branch name, and whether a remote is configured. Counts
+// are 0/0 when the relevant ref is absent (e.g. a tracking-less agent branch has
+// no origin/<branch>, but still has origin/<default> after a fetch).
 async fn repos_state(State(st): State<AppState>, Query(q): Query<StateQuery>) -> Response {
     let name = q.name.trim().to_string();
     // Non-git workspace: no branch/dirty/ahead/behind/remote. The UI hides the
@@ -5101,6 +5349,9 @@ async fn repos_state(State(st): State<AppState>, Query(q): Query<StateQuery>) ->
             "dirty": 0,
             "ahead": 0,
             "behind": 0,
+            "defaultBranch": "",
+            "mainAhead": 0,
+            "mainBehind": 0,
             "hasRemote": false,
             "useGit": false,
         }));
@@ -5124,12 +5375,29 @@ async fn repos_state(State(st): State<AppState>, Query(q): Query<StateQuery>) ->
     } else {
         (0, 0)
     };
+    // vs-main: ahead/behind vs origin/<default>. Meaningful on every branch
+    // (including tracking-less agent branches, which have no origin/<branch>
+    // but do have origin/<default> after a fetch). When the folder IS on the
+    // default branch, these equal ahead/behind above.
+    let default_branch = git_default_branch(&dest).await;
+    let main_upstream = format!("origin/{default_branch}");
+    let (main_ahead, main_behind) = if git_has_ref(&dest, &main_upstream).await {
+        (
+            git_rev_count(&dest, &format!("{main_upstream}..HEAD")).await,
+            git_rev_count(&dest, &format!("HEAD..{main_upstream}")).await,
+        )
+    } else {
+        (0, 0)
+    };
     json_ok(&serde_json::json!({
         "name": name,
         "branch": branch,
         "dirty": dirty,
         "ahead": ahead,
         "behind": behind,
+        "defaultBranch": default_branch,
+        "mainAhead": main_ahead,
+        "mainBehind": main_behind,
         "hasRemote": has_remote,
         "useGit": true,
     }))
@@ -5592,6 +5860,7 @@ pub fn router(state: AppState) -> Router {
         .route("/__sidecar/repos/scan-local", post(repos_scan_local))
         .route("/__sidecar/repos/clone", post(repos_clone))
         .route("/__sidecar/repos/refresh", post(repos_refresh))
+        .route("/__sidecar/repos/sync-main", post(repos_sync_main))
         .route("/__sidecar/repos/open", post(repos_open))
         .route("/__sidecar/repos/exec", post(repos_exec))
         .route("/__sidecar/repos/exec/stream", post(repos_exec_stream))
@@ -5606,6 +5875,7 @@ pub fn router(state: AppState) -> Router {
         .route("/__sidecar/repos/state", get(repos_state))
         .route("/__sidecar/repos/branches", post(repos_branches))
         .route("/__sidecar/repos/checkout", post(repos_checkout))
+        .route("/__sidecar/repos/delete-branch", post(repos_delete_branch))
         .route("/__sidecar/repos/commit", post(repos_commit))
         .route("/__sidecar/repos/create-pr", post(repos_create_pr))
         .route("/__sidecar/repos/prs", get(repos_prs))
@@ -6232,6 +6502,244 @@ mod tests {
         // The stash was consumed by the clean pop.
         let tagged = git_stash_list_tagged(root).await;
         assert!(!tagged.iter().any(|s| s == &format!("nasllm:{branch_a}")), "A's stash should be popped: {tagged:?}");
+    }
+
+    // init_test_repo_with_origin builds on init_test_repo: creates a bare
+    // "origin" the working repo points at via `git remote add origin`, pushes
+    // the default branch, and sets origin's HEAD so git_default_branch
+    // (origin/HEAD) resolves after a fetch. Returns (work_dir, origin_dir).
+    // Used by the sync-from-main tests (git_sync_from_main fetches from origin).
+    async fn init_test_repo_with_origin() -> (tempfile::TempDir, tempfile::TempDir) {
+        let work = init_test_repo().await;
+        let root = work.path();
+        let origin = tempfile::tempdir().unwrap();
+        let _ = tokio::process::Command::new("git")
+            .arg("init").arg("--bare").arg("-q").arg(origin.path())
+            .output().await.unwrap();
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(root).arg("remote").arg("add").arg("origin")
+            .arg(origin.path()).output().await.unwrap();
+        let branch = git_branch(root).await;
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(root).arg("push").arg("-q").arg("origin")
+            .arg(&branch).output().await.unwrap();
+        // Point the bare origin's HEAD at the branch so `git fetch` populates
+        // refs/remotes/origin/HEAD → origin/<branch> (git_default_branch reads it).
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(origin.path()).arg("symbolic-ref").arg("HEAD")
+            .arg(format!("refs/heads/{branch}")).output().await.unwrap();
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(root).arg("fetch").arg("-q").arg("origin").output().await.unwrap();
+        (work, origin)
+    }
+
+    // Helper: commit a new file on the current branch and push it to origin so
+    // origin/<default> advances by one commit.
+    async fn advance_origin_default(root: &Path, default: &str, name: &str) {
+        std::fs::write(root.join(name), "main\n").unwrap();
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(root).arg("add").arg("-A").output().await.unwrap();
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(root).arg("commit").arg("-q").arg("-m").arg("from main")
+            .output().await.unwrap();
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(root).arg("push").arg("-q").arg("origin").arg(default)
+            .output().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn git_sync_from_main_fast_forwards_behind_branch() {
+        let (work, _origin) = init_test_repo_with_origin().await;
+        let root = work.path();
+        let default = git_branch(root).await; // main or master
+
+        // Cut a tracking-less agent branch from the default (mirrors
+        // ensure_folder_on_branch's `git switch -c`). No upstream is set, so the
+        // old `git pull --ff-only` would have failed — sync-from-main must not.
+        let agent = "agent/sync-ff";
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(root).arg("switch").arg("-c").arg(agent)
+            .output().await.unwrap();
+        assert_eq!(git_branch(root).await, agent);
+
+        // Advance origin/default by one commit, then return to the agent branch
+        // (now behind by 1).
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(root).arg("switch").arg(&default).output().await.unwrap();
+        advance_origin_default(root, &default, "from-main.txt").await;
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(root).arg("switch").arg(agent).output().await.unwrap();
+        assert!(!root.join("from-main.txt").exists(), "agent branch should not have from-main.txt yet");
+
+        // Sync from main: fetch + fast-forward (agent is an ancestor of
+        // origin/default). Verifies the tracking-less branch syncs without error.
+        let r = git_sync_from_main(root, "").await.expect("sync failed");
+        assert!(r.output.contains("Fast-forwarded 1 commit from main"), "output: {}", r.output);
+        assert_eq!(r.behind, 0, "should be 0 behind after sync");
+        assert_eq!(git_branch(root).await, agent, "should still be on the agent branch");
+        assert!(root.join("from-main.txt").exists(), "from-main.txt should be present after fast-forward");
+    }
+
+    #[tokio::test]
+    async fn git_sync_from_main_auto_stashes_dirty_wip() {
+        let (work, _origin) = init_test_repo_with_origin().await;
+        let root = work.path();
+        let default = git_branch(root).await;
+        let agent = "agent/sync-stash";
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(root).arg("switch").arg("-c").arg(agent)
+            .output().await.unwrap();
+        // Advance origin/default by one commit, return to the agent branch.
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(root).arg("switch").arg(&default).output().await.unwrap();
+        advance_origin_default(root, &default, "from-main.txt").await;
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(root).arg("switch").arg(agent).output().await.unwrap();
+
+        // Dirty the agent branch with an uncommitted edit to a tracked file.
+        std::fs::write(root.join("f.txt"), "a\nb\nDIRTY\n").unwrap();
+        assert!(git_dirty_count(root).await > 0, "agent should be dirty before sync");
+
+        // Sync from main: dirty WIP is auto-stashed, the branch fast-forwards,
+        // then the stash pops back — the WIP must survive the sync.
+        let r = git_sync_from_main(root, "").await.expect("sync failed");
+        assert_eq!(r.behind, 0, "should be 0 behind after sync");
+        assert!(root.join("from-main.txt").exists(), "from-main.txt should be present");
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "a\nb\nDIRTY\n",
+            "dirty WIP should be restored by the stash pop"
+        );
+        assert!(git_dirty_count(root).await > 0, "f.txt should still be dirty vs the new HEAD");
+    }
+
+    #[tokio::test]
+    async fn git_delete_branch_refuses_default_dirty_and_deletes() {
+        let work = init_test_repo().await;
+        let root = work.path();
+        let default = git_branch(root).await; // main or master
+
+        // Refuse the default branch.
+        let r = git_delete_branch(root, &default).await;
+        assert!(r.is_err(), "deleting the default branch should refuse");
+        assert!(r.unwrap_err().contains("default branch"), "wrong refusal reason");
+
+        // Refuse a dirty current branch.
+        let agent = "agent/del";
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(root).arg("switch").arg("-c").arg(agent).output().await.unwrap();
+        std::fs::write(root.join("f.txt"), "a\nb\nDIRTY\n").unwrap();
+        let r = git_delete_branch(root, agent).await;
+        assert!(r.is_err(), "deleting a dirty current branch should refuse");
+        assert!(r.unwrap_err().contains("commit or stash"), "wrong refusal reason");
+
+        // Revert the dirty edit, then sit on a second agent branch and delete the
+        // first (non-current) → Ok(false), no switch.
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(root).arg("checkout").arg("--").arg("f.txt").output().await.unwrap();
+        let other = "agent/del-other";
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(root).arg("switch").arg("-c").arg(other).output().await.unwrap();
+        let switched = git_delete_branch(root, agent).await.expect("non-current delete should succeed");
+        assert!(!switched, "should not have switched (agent was not current)");
+        assert!(!git_has_ref(root, &format!("refs/heads/{agent}")).await, "agent branch should be gone");
+
+        // Delete the CURRENT (clean) branch → switches to default first, Ok(true).
+        let switched = git_delete_branch(root, other).await.expect("current clean delete should succeed");
+        assert!(switched, "should have switched to the default branch");
+        assert_eq!(git_branch(root).await, default, "should be on the default branch after deleting current");
+        assert!(!git_has_ref(root, &format!("refs/heads/{other}")).await, "other branch should be gone");
+    }
+
+    // init_test_repo_with_unrelated_origin creates a workspace with its own
+    // local history (init_test_repo) and a separate bare "origin" populated by
+    // a DIFFERENT repo with its own DISTINCT root commit (a different tree, so
+    // the root commit hash differs even if the author timestamp collides), so
+    // the workspace's main and origin/main share no common ancestor. Advances
+    // origin/main with a unique file (remote-only.txt) so the sync brings it
+    // over. Mirrors a workspace that was `git init`'d locally then linked to a
+    // remote with its own history.
+    async fn init_test_repo_with_unrelated_origin() -> (tempfile::TempDir, tempfile::TempDir) {
+        let work = init_test_repo().await; // own root: f.txt = "a\nb\n" committed
+        // Build the remote side with a DISTINCT root (different file content +
+        // message) so its root commit hash cannot match the workspace's, even
+        // when both commits land in the same second.
+        let remote_side = tempfile::tempdir().unwrap();
+        let rp = remote_side.path();
+        let env = [
+            ("GIT_AUTHOR_NAME", "T"),
+            ("GIT_AUTHOR_EMAIL", "t@t"),
+            ("GIT_COMMITTER_NAME", "T"),
+            ("GIT_COMMITTER_EMAIL", "t@t"),
+        ];
+        let mut init = tokio::process::Command::new("git");
+        init.arg("-C").arg(rp).arg("init").arg("-q");
+        for (k, v) in env { init.env(k, v); }
+        let _ = init.output().await.unwrap();
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(rp).arg("config").arg("user.name").arg("T").output().await.unwrap();
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(rp).arg("config").arg("user.email").arg("t@t").output().await.unwrap();
+        // Unique filename so the unrelated merge doesn't collide with the
+        // workspace's f.txt (an add/add conflict). The remote root carries
+        // remote-root.txt; the workspace carries f.txt — no overlap.
+        std::fs::write(rp.join("remote-root.txt"), "remote-root\n").unwrap();
+        let mut add = tokio::process::Command::new("git");
+        add.arg("-C").arg(rp).arg("add").arg("-A");
+        for (k, v) in env { add.env(k, v); }
+        let _ = add.output().await.unwrap();
+        let mut commit = tokio::process::Command::new("git");
+        commit.arg("-C").arg(rp).arg("commit").arg("-q").arg("-m").arg("remote root");
+        for (k, v) in env { commit.env(k, v); }
+        let _ = commit.output().await.unwrap();
+        let origin = tempfile::tempdir().unwrap();
+        let _ = tokio::process::Command::new("git")
+            .arg("init").arg("--bare").arg("-q").arg(origin.path())
+            .output().await.unwrap();
+        let rbranch = git_branch(rp).await;
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(rp).arg("push").arg("-q").arg(origin.path())
+            .arg(&rbranch).output().await.unwrap();
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(origin.path()).arg("symbolic-ref").arg("HEAD")
+            .arg(format!("refs/heads/{rbranch}")).output().await.unwrap();
+        // Advance origin/main with a file that exists only on the remote side.
+        std::fs::write(rp.join("remote-only.txt"), "from origin\n").unwrap();
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(rp).arg("add").arg("-A").output().await.unwrap();
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(rp).arg("commit").arg("-q").arg("-m").arg("remote only")
+            .output().await.unwrap();
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(rp).arg("push").arg("-q").arg(origin.path()).arg(&rbranch)
+            .output().await.unwrap();
+        // Link the workspace to origin and fetch (no shared ancestry).
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(work.path()).arg("remote").arg("add").arg("origin")
+            .arg(origin.path()).output().await.unwrap();
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(work.path()).arg("fetch").arg("-q").arg("origin").output().await.unwrap();
+        (work, origin)
+    }
+
+    #[tokio::test]
+    async fn git_sync_from_main_merges_unrelated_histories() {
+        let (work, _origin) = init_test_repo_with_unrelated_origin().await;
+        let root = work.path();
+        let default = git_branch(root).await;
+        // Sanity: the workspace and origin/main share no common ancestor.
+        assert!(!git_has_merge_base(root, "HEAD", &format!("origin/{default}")).await, "should be unrelated");
+        assert!(!root.join("remote-only.txt").exists(), "remote-only file not yet present");
+
+        // Sync from main: --allow-unrelated-histories lets the merge succeed
+        // instead of "refusing to merge unrelated histories". A merge commit
+        // combines the two roots; remote-only.txt comes over.
+        let r = git_sync_from_main(root, "").await.expect("sync of unrelated histories should succeed");
+        assert!(r.output.contains("unrelated histories"), "output should note unrelated: {}", r.output);
+        assert!(root.join("remote-only.txt").exists(), "remote-only.txt should be merged in");
+        assert_eq!(git_branch(root).await, default, "should still be on the workspace's default branch");
+        // f.txt (present on both sides, identical) is intact.
+        assert_eq!(std::fs::read_to_string(root.join("f.txt")).unwrap(), "a\nb\n");
     }
 }
 

@@ -1590,6 +1590,9 @@ function renderComposerStatus() {
   const s = railState || {};
   const noGit = s.useGit === false;
   const chatBranch = noGit ? "" : ((railConv && railConv.repoBranch) || s.branch || "");
+  const mainBehind = noGit ? 0 : (s.mainBehind || 0);
+  const mainAhead = noGit ? 0 : (s.mainAhead || 0);
+  const mainName = noGit ? "" : (s.defaultBranch || "main");
   status.innerHTML = "";
   status.appendChild(document.createTextNode(railRepo));
   if (noGit) {
@@ -1602,9 +1605,28 @@ function renderComposerStatus() {
       chip.onclick = (e) => { e.stopPropagation(); if (railConvId) openChatBranchPicker(railConvId, railRepo, chatBranch); };
       status.appendChild(chip);
     }
+    // vs-main state: where this branch sits relative to origin/<default>.
+    // Meaningful on every branch (incl. tracking-less agent branches, which
+    // have no origin/<branch> but do have origin/<default>). "Behind" is
+    // clickable to sync from main in one step.
+    status.appendChild(document.createTextNode(" · "));
+    const mainChip = el("span", "ds-vs-main " + (mainBehind > 0 ? "behind" : (mainAhead > 0 ? "ahead" : "ok")));
+    if (mainBehind > 0 && mainAhead > 0) {
+      mainChip.textContent = "↑" + mainAhead + " ↓" + mainBehind + " vs main";
+      mainChip.title = "↑" + mainAhead + " ahead, ↓" + mainBehind + " behind " + mainName + ". Sync from main to merge in the latest.";
+    } else if (mainBehind > 0) {
+      mainChip.textContent = "↓" + mainBehind + " behind main";
+      mainChip.title = "This branch is " + mainBehind + " commit" + (mainBehind === 1 ? "" : "s") + " behind " + mainName + ". Click to sync from main.";
+      mainChip.style.cursor = "pointer";
+      mainChip.onclick = (e) => { e.stopPropagation(); syncFromMain(railRepo); };
+    } else if (mainAhead > 0) {
+      mainChip.textContent = "↑" + mainAhead + " ahead of main";
+      mainChip.title = mainAhead + " commit" + (mainAhead === 1 ? "" : "s") + " on this branch not in " + mainName + ".";
+    } else {
+      mainChip.textContent = "up to date with main";
+    }
+    status.appendChild(mainChip);
     if (s.dirty) status.appendChild(document.createTextNode(" · ●" + s.dirty + " dirty"));
-    if (s.ahead) status.appendChild(document.createTextNode(" · ↑" + s.ahead));
-    if (s.behind) status.appendChild(document.createTextNode(" · ↓" + s.behind));
     if (s.hasRemote === false) status.appendChild(document.createTextNode(" · no remote"));
     // Auto-sync toggle: fast-forward the session branch when origin advances.
     // Git workspaces only; reflects the global autoSync flag.
@@ -1634,9 +1656,10 @@ function renderComposerStatus() {
     tip.push("no git (plain folder — file tools only)");
   } else {
     if (chatBranch) tip.push("branch: " + chatBranch + " (click ⎇ to change)");
+    if (mainBehind > 0) tip.push(mainBehind + " behind " + mainName + " (click ↓ to sync from main)");
+    else if (mainAhead > 0) tip.push(mainAhead + " ahead of " + mainName);
+    else tip.push("up to date with " + mainName);
     if (s.dirty) tip.push(s.dirty + " uncommitted/modified files (●)");
-    if (s.ahead) tip.push(s.ahead + " commits ahead of origin (↑)");
-    if (s.behind) tip.push(s.behind + " commits behind origin (↓)");
     if (s.hasRemote === false) tip.push("no remote configured");
   }
   if (!noGit) tip.push(autoSync ? "auto-sync on (auto fast-forward when behind)" : "auto-sync off (click ↻ to toggle)");
@@ -1684,13 +1707,17 @@ async function refreshRailState() {
     // right tree. Skip if a pull is already in flight.
     const s = railState;
     const chatBranch = (railConv && railConv.repoBranch) || s.branch || "";
-    if (autoSync && s.useGit !== false && s.behind > 0 && chatBranch && !autoSyncInFlight) {
+    // Auto-sync: when the session branch is behind main and the toggle is on,
+    // sync from main (git fetch + git merge origin/<default>). Git workspaces
+    // only; triggered by mainBehind (vs main), which is meaningful on every
+    // branch including tracking-less agent branches. Skip if a sync is in flight.
+    if (autoSync && s.useGit !== false && (s.mainBehind || 0) > 0 && chatBranch && !autoSyncInFlight) {
       autoSyncInFlight = true;
       try {
-        await sid("repos/refresh", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: railRepo, branch: chatBranch }) });
+        await sid("repos/sync-main", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: railRepo }) });
       } catch {}
       autoSyncInFlight = false;
-      // Re-poll so the rail reflects the fast-forwarded state immediately.
+      // Re-poll so the rail reflects the synced state immediately.
       const r2 = await sid("repos/state?name=" + encodeURIComponent(railRepo));
       if (r2.ok && r2.data) { railState = r2.data; renderComposerStatus(); }
     }
@@ -1939,18 +1966,55 @@ async function deleteRepoChat(c) {
   try { window.dispatchEvent(new CustomEvent("nasllm:refreshConvs")); } catch {}
 }
 
-// pullRepo runs `git pull --ff-only` on a connected repo and refreshes the list.
-async function pullRepo(r) {
-  const res = await sid("repos/refresh", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: r.name }) });
+// syncFromMain runs "Sync from main" (git fetch origin + git merge
+// origin/<default>) on a connected repo and toasts the outcome. Replaces the
+// old pullRepo, which called `git pull --ff-only` and failed with "There is no
+// tracking information for the current branch" on tracking-less agent branches.
+// Accepts a repo object ({name}) or a full_name string.
+async function syncFromMain(r) {
+  const name = (r && typeof r === "object") ? (r.name || "") : String(r || "");
+  const res = await sid("repos/sync-main", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
   const d = (res && res.data) || {};
   if (d.ok) {
-    // Show a success toast so a pull (especially "Already up to date") isn't
-    // silent and mistaken for "did nothing".
-    flashDsOk((d.output && d.output.trim()) ? d.output.trim() : ("Pulled " + r.name + " ✓"));
+    flashDsOk((d.output && d.output.trim()) ? d.output.trim() : ("Synced " + name + " ✓"));
   } else {
-    flashDsErr("Pull failed: " + (d.error || res.status || "unknown error"));
+    flashDsErr("Sync failed: " + (d.error || res.status || "unknown error"));
   }
   refreshLocal();
+  refreshRailState();
+}
+
+// deleteBranch force-deletes a local branch and moves any chats on it back to
+// the default branch. Confirms first; PATCHes every conversation whose repo
+// matches and repoBranch === branch to the default, then calls
+// /repos/delete-branch. On success re-renders the picker/rail/sidebar; the
+// default branch and the current branch are protected server-side too.
+async function deleteBranch(repoName, branch, defaultBranch) {
+  const ok = await dsConfirm("Delete branch \"" + branch + "\"?", "This force-deletes the local branch. Chats on it fall back to " + (defaultBranch || "the default branch") + ".");
+  if (!ok) return;
+  await loadWorkspaceMaps();
+  const repo = railMaps.repoByFullName.get(repoName);
+  const repoId = repo && repo.id;
+  if (repoId) {
+    for (const [cid, c] of railMaps.convById) {
+      if (c && c.repoId === repoId && c.repoBranch === branch) {
+        try { await fetch("/api/conversations/" + encodeURIComponent(cid), { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repoBranch: defaultBranch || "" }) }); } catch {}
+      }
+    }
+  }
+  const res = await sid("repos/delete-branch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repo: repoName, branch }) });
+  const d = (res && res.data) || {};
+  if (d.ok) {
+    flashDsOk("Deleted ⎇ " + branch);
+    if (railConv && railConv.repoBranch === branch) railConv.repoBranch = defaultBranch || "";
+    renderComposerStatus();
+    refreshLocal();
+    refreshRailState();
+    const ov = $("dsBranchOverlay"); if (ov) ov.classList.remove("open");
+    const ov2 = $("dsChatBranchOverlay"); if (ov2) ov2.classList.remove("open");
+  } else {
+    flashDsErr("Could not delete: " + (d.error || res.status || "unknown"));
+  }
 }
 
 // enableGit promotes a non-git workspace to git-enabled in place via
@@ -1999,8 +2063,9 @@ function repoMenu(r, anchor) {
     add("Enable git", "git init in place and start tracking with git", () => enableGit(r));
   } else {
     add("New chat from branch…", "Start a session cut from an existing branch instead of the default", () => openBaseBranchPicker(r));
-    add("Pull", "git pull --ff-only", () => pullRepo(r));
+    add("Sync from main", "git fetch origin + git merge origin/<default> — bring main's latest into this branch", () => syncFromMain(r));
     add("Branch…", "Switch to a different branch (local or remote)", () => openBranchPicker(r));
+    add("Delete branch…", "Delete a local agent branch (the default branch is protected)", () => openBranchPicker(r, "delete"));
     add("Ship…", "Versioned release (changelog + commit/push)", () => openShipChanges(r));
   }
   document.body.appendChild(menu);
@@ -2058,13 +2123,16 @@ function openConnectMenu(anchor) {
 }
 
 // openBranchPicker shows an overlay listing the repo's local AND remote-only
-// branches (current one highlighted). Clicking a local branch runs git checkout;
-// clicking a remote-only one runs git checkout -t origin/<branch> (creates a
-// local tracking branch). On success it refreshes the sidebar + composer rail.
+// branches (current + default highlighted). In "switch" mode (default) clicking
+// a row checks it out (local: git checkout; remote-only: git checkout -t
+// origin/<branch>); a trash button on each local, non-current, non-default row
+// deletes it via deleteBranch. In "delete" mode (mode === "delete") the title is
+// "Delete branch" and rows don't switch on click — the trash is the only action.
 // A dirty tree that would be overwritten is refused by git — the error surfaces
 // as a toast so the user knows to commit/stash first.
-async function openBranchPicker(r) {
+async function openBranchPicker(r, mode) {
   const repoName = r.name;
+  const deleteMode = mode === "delete";
   let overlay = $("dsBranchOverlay");
   let list;
   if (!overlay) {
@@ -2072,10 +2140,11 @@ async function openBranchPicker(r) {
     overlay.id = "dsBranchOverlay";
     overlay.setAttribute("role", "dialog");
     overlay.setAttribute("aria-modal", "true");
-    overlay.setAttribute("aria-label", "Switch branch");
+    overlay.setAttribute("aria-label", deleteMode ? "Delete branch" : "Switch branch");
     const card = el("div", "ds-card");
     const head = el("div", "ds-head");
-    head.appendChild(el("h2", null, "Switch branch"));
+    const h2 = el("h2", null, deleteMode ? "Delete branch" : "Switch branch"); h2.id = "dsBranchTitle";
+    head.appendChild(h2);
     const sub = el("span", "ds-note", repoName);
     head.appendChild(sub);
     const x = el("button", "ds-x"); x.textContent = "×"; x.title = "Close"; x.setAttribute("aria-label", "Close");
@@ -2090,6 +2159,7 @@ async function openBranchPicker(r) {
     overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
   } else {
     list = $("dsBranchList");
+    const h2 = $("dsBranchTitle"); if (h2) h2.textContent = deleteMode ? "Delete branch" : "Switch branch";
   }
   list.innerHTML = "";
   list.appendChild(el("div", "ds-note", "Loading branches…"));
@@ -2100,17 +2170,30 @@ async function openBranchPicker(r) {
   if (!res.ok || !d.ok) { list.appendChild(el("div", "ds-note", "Could not load branches: " + (d.error || res.status || "unknown"))); return; }
   const branches = d.branches || [];
   const current = d.current || "";
+  const defaultBranch = d.default || "";
   if (!branches.length) { list.appendChild(el("div", "ds-note", "No branches found.")); return; }
+  if (deleteMode) list.appendChild(el("div", "ds-note", "Trash a branch to delete it. The default branch is protected."));
   branches.forEach((b) => {
     const bname = typeof b === "string" ? b : (b.name || "");
     const isRemote = typeof b === "object" && !!b.remote;
     const isCur = bname === current;
+    const isDefault = bname === defaultBranch;
     const row = el("div", "ds-branch-item" + (isCur ? " current" : ""));
     row.title = isCur ? "Current branch" : (isRemote ? "Checkout & track origin/" + bname : "Checkout " + bname);
     row.appendChild(el("span", "ds-branch-name", bname));
     if (isCur) row.appendChild(el("span", "ds-branch-badge ds-branch-cur", "current"));
     else if (isRemote) row.appendChild(el("span", "ds-branch-badge ds-branch-remote", "remote"));
-    if (!isCur) {
+    if (isDefault) row.appendChild(el("span", "ds-branch-badge ds-branch-default", "default"));
+    // Trash: local, non-current, non-default branches only. stopPropagation so
+    // it doesn't trigger the row's switch handler (switch mode).
+    if (!isRemote && !isCur && !isDefault) {
+      const trash = el("button", "ds-branch-del", "🗑");
+      trash.title = "Delete branch " + bname;
+      trash.setAttribute("aria-label", "Delete branch " + bname);
+      trash.onclick = (e) => { e.stopPropagation(); deleteBranch(repoName, bname, defaultBranch); };
+      row.appendChild(trash);
+    }
+    if (!isCur && !deleteMode) {
       row.onclick = async () => {
         row.style.opacity = ".5";
         const cr = await sid("repos/checkout", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repo: repoName, branch: bname, remote: isRemote }) });
@@ -2274,17 +2357,29 @@ async function openChatBranchPicker(convId, repoName, currentBranch) {
   list.innerHTML = "";
   if (!res.ok || !d.ok) { list.appendChild(el("div", "ds-note", "Could not load branches: " + (d.error || res.status || "unknown"))); return; }
   const branches = d.branches || [];
+  const defaultBranch = d.default || "";
   if (!branches.length) { list.appendChild(el("div", "ds-note", "No branches found.")); }
   branches.forEach((b) => {
     const bname = typeof b === "string" ? b : (b.name || "");
     if (!bname) return;
     const isRemote = typeof b === "object" && !!b.remote;
     const isCur = bname === currentBranch;
+    const isDefault = bname === defaultBranch;
     const row = el("div", "ds-branch-item" + (isCur ? " current" : ""));
     row.title = isCur ? "This chat's current branch" : (isRemote ? "Track & switch this chat to origin/" + bname : "Switch this chat to " + bname);
     row.appendChild(el("span", "ds-branch-name", bname));
     if (isCur) row.appendChild(el("span", "ds-branch-badge ds-branch-cur", "current"));
     else if (isRemote) row.appendChild(el("span", "ds-branch-badge ds-branch-remote", "remote"));
+    if (isDefault) row.appendChild(el("span", "ds-branch-badge ds-branch-default", "default"));
+    // Trash: local, non-current, non-default branches. stopPropagation so it
+    // doesn't trigger the row's switch handler.
+    if (!isRemote && !isCur && !isDefault) {
+      const trash = el("button", "ds-branch-del", "🗑");
+      trash.title = "Delete branch " + bname;
+      trash.setAttribute("aria-label", "Delete branch " + bname);
+      trash.onclick = (e) => { e.stopPropagation(); deleteBranch(repoName, bname, defaultBranch); };
+      row.appendChild(trash);
+    }
     if (!isCur) row.onclick = () => switchChatBranch(overlay, bname, isRemote);
     list.appendChild(row);
   });
@@ -2946,11 +3041,12 @@ function buildSessionCard() {
   pChanges.appendChild(commitRow);
   const commitOut = el("div", "ds-note"); commitOut.id = "dsSessionCommitOut";
   pChanges.appendChild(commitOut);
-  // Secondary actions as quiet links (Revert, Ship a release).
+  // Secondary actions as quiet links (Sync from main, Revert, Ship a release).
   const secondary = el("div", "ds-session-secondary");
+  const syncBtn = el("button", "ds-session-link", "Sync from main");
   const revertBtn = el("button", "ds-session-link", "Revert all changes");
   const shipBtn = el("button", "ds-session-link", "Ship a release…");
-  secondary.appendChild(revertBtn); secondary.appendChild(shipBtn);
+  secondary.appendChild(syncBtn); secondary.appendChild(revertBtn); secondary.appendChild(shipBtn);
   pChanges.appendChild(secondary);
   const noGitNote = el("div", "ds-note ds-session-nogit"); noGitNote.id = "dsSessionNoGit"; noGitNote.style.display = "none";
   noGitNote.textContent = "This workspace isn't under git, so commit, push, branches, and pull requests aren't available. Enable git to start tracking changes.";
@@ -2960,7 +3056,7 @@ function buildSessionCard() {
   const undoBtn = el("button", "ds-btn ds-btn-ghost ds-session-link", "Undo last write"); undoBtn.id = "dsSessionUndoLast"; undoBtn.style.display = "none";
   pChanges.appendChild(undoBtn);
   panels.appendChild(pChanges);
-  overlay._gitControls = { tabPR, tabMerge, applyBtn, actionSelect, revertBtn, msgInput, noGitNote, enableGitBtn, undoBtn };
+  overlay._gitControls = { tabPR, tabMerge, applyBtn, actionSelect, revertBtn, msgInput, noGitNote, enableGitBtn, undoBtn, syncBtn };
   enableGitBtn.onclick = () => { if (overlay._repo) enableGit({ name: overlay._repo, path: "" }); };
   undoBtn.onclick = () => { if (overlay._repo) undoLastWrite(overlay._repo); };
   // — Pull request —
@@ -3025,6 +3121,7 @@ function buildSessionCard() {
   mergeBtn.onclick = () => overlay._mergePR();
   revertBtn.onclick = () => overlay._revert();
   shipBtn.onclick = () => overlay._ship();
+  syncBtn.onclick = () => { if (overlay._repo) syncFromMain(overlay._repo); };
 }
 
 async function loadSessionPanel(repoName, branch) {
@@ -3059,6 +3156,7 @@ async function loadSessionPanel(repoName, branch) {
       gc.noGitNote.style.display = "";
       gc.enableGitBtn.style.display = "";
       gc.undoBtn.style.display = "";
+      gc.syncBtn.style.display = "none";
     }
     overlay.querySelectorAll(".ds-btn-approve").forEach((b) => { b.disabled = true; b.title = "No git."; });
     return;
@@ -3076,6 +3174,7 @@ async function loadSessionPanel(repoName, branch) {
     gc.noGitNote.style.display = "none";
     gc.enableGitBtn.style.display = "none";
     gc.undoBtn.style.display = "none";
+    gc.syncBtn.style.display = "";
   }
   const diffBody = { name: repoName }; if (branch) diffBody.branch = branch;
   const dr = await sid("repos/diff", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(diffBody) });
@@ -3083,9 +3182,14 @@ async function loadSessionPanel(repoName, branch) {
   if (sub) {
     const segs = [repoName];
     if (sd.branch) segs.push("⎇ " + sd.branch);
+    const mBehind = sd.mainBehind || 0;
+    const mAhead = sd.mainAhead || 0;
+    const mName = sd.defaultBranch || "main";
+    if (mBehind > 0 && mAhead > 0) segs.push("↑" + mAhead + " ↓" + mBehind + " vs " + mName);
+    else if (mBehind > 0) segs.push("↓" + mBehind + " behind " + mName);
+    else if (mAhead > 0) segs.push("↑" + mAhead + " ahead of " + mName);
+    else segs.push("up to date with " + mName);
     if (sd.dirty) segs.push("●" + sd.dirty);
-    if (sd.ahead) segs.push("↑" + sd.ahead);
-    if (sd.behind) segs.push("↓" + sd.behind);
     if (sd.hasRemote === false) segs.push("no remote");
     sub.textContent = segs.join(" · ");
   }
