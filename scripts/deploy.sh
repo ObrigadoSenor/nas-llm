@@ -22,7 +22,14 @@ REMOTE_DIR="${DOCKER_VOLUME}/docker/nas-llm"
 REMOTE="${NAS_USER}@${NAS_HOST}"
 
 echo "==> Syncing stack to ${REMOTE}:${REMOTE_DIR}"
-ssh "$REMOTE" "mkdir -p ${REMOTE_DIR}/ollama ${REMOTE_DIR}/caddy/data ${REMOTE_DIR}/caddy/config ${REMOTE_DIR}/backend/data"
+# Ensure data volumes exist, then clear stale source so files removed from the
+# repo don't linger on the NAS. tar -xf only writes entries present in the
+# archive, so a deleted agent.go survived next to the new agent_loop.go /
+# agent_compact.go / agent_eval.go / agent_capture.go and redeclared their
+# symbols, failing the build. Mirror www, searxng, and backend's source fresh
+# each deploy; preserve backend/data (SQLite volume) — ollama/ and caddy
+# {data,config}/ are never in the tar, so they're untouched.
+ssh "$REMOTE" "mkdir -p ${REMOTE_DIR}/ollama ${REMOTE_DIR}/caddy/data ${REMOTE_DIR}/caddy/config ${REMOTE_DIR}/backend/data && rm -rf ${REMOTE_DIR}/www ${REMOTE_DIR}/searxng && find ${REMOTE_DIR}/backend -mindepth 1 -maxdepth 1 ! -name data -exec rm -rf -- {} +"
 # UGOS Pro ships a restricted rsync wrapper (ug_start_server) that rejects
 # /volume1/docker paths, so pipe the files over plain SSH with tar instead.
 tar -cf - -C "$ROOT_DIR" docker-compose.yml Caddyfile .env www backend searxng \
